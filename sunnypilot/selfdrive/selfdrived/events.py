@@ -70,9 +70,9 @@ def speed_limit_pre_active_alert(CP: car.CarParams, CS: car.CarState, sm: messag
   else:
     if IS_MICI:
       if set_speed_conv < speed_limit_final_last_conv:
-        alert_1_str = f"Press + to confirm {speed_limit_final_last_conv} {speed_unit} speed limit"
+        alert_1_str = f"{speed_limit_final_last_conv} {speed_unit} Press + to confirm"
       elif set_speed_conv > speed_limit_final_last_conv:
-        alert_1_str = f"Press - to confirm {speed_limit_final_last_conv} {speed_unit} speed limit"
+        alert_1_str = f"{speed_limit_final_last_conv} {speed_unit} Press - to confirm"
     else:
       alert_size = AlertSize.none
 
