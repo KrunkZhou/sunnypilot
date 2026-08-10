@@ -35,6 +35,10 @@ class BaseMapData(ABC):
     pass
 
   @abstractmethod
+  def get_current_speed_limit_source(self) -> str:
+    pass
+
+  @abstractmethod
   def get_next_speed_limit_and_distance(self) -> tuple[float, float]:
     pass
 
@@ -52,6 +56,7 @@ class BaseMapData(ABC):
 
     live_map_data.speedLimitValid = bool(MAX_SPEED_LIMIT > speed_limit > 0)
     live_map_data.speedLimit = speed_limit
+    live_map_data.speedLimitSource = self.get_current_speed_limit_source()
     live_map_data.speedLimitAheadValid = bool(MAX_SPEED_LIMIT > next_speed_limit > 0)
     live_map_data.speedLimitAhead = next_speed_limit
     live_map_data.speedLimitAheadDistance = next_speed_limit_distance

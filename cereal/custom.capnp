@@ -444,6 +444,13 @@ struct LiveMapDataSP @0xf416ec09499d9d19 {
   speedLimitAhead @3 :Float32;
   speedLimitAheadDistance @4 :Float32;
   roadName @5 :Text;
+  speedLimitSource @6 :SpeedLimitSource;
+
+  enum SpeedLimitSource {
+    none @0;
+    osm @1;
+    ontario @2;
+  }
 }
 
 struct ModelDataV2SP @0xa1680744031fdb2d {

@@ -86,15 +86,10 @@ def test_lookup_returns_unavailable_outside_matching_distance(database_path):
 class FakeParams:
   def __init__(self, osm_speed_limit):
     self.osm_speed_limit = osm_speed_limit
-    self.values = {}
 
   def get(self, key):
     assert key == "MapSpeedLimit"
     return self.osm_speed_limit
-
-  def put(self, key, value):
-    self.values[key] = value
-
 
 class FakeSpeedLimitDatabase:
   def __init__(self, speed_limit):
@@ -117,5 +112,5 @@ def test_ontario_database_has_priority_then_osm_fallback(database_limit, osm_lim
   map_data.mem_params = FakeParams(osm_limit)
 
   assert map_data.get_current_speed_limit() == pytest.approx(expected)
-  expected_source = "ON" if database_limit else "OSM" if osm_limit else ""
-  assert map_data.mem_params.values["MapSpeedLimitSource"] == expected_source
+  expected_source = "ontario" if database_limit else "osm" if osm_limit else "none"
+  assert map_data.get_current_speed_limit_source() == expected_source
