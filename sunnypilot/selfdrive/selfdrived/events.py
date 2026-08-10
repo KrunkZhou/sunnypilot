@@ -4,12 +4,9 @@ Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
 This file is part of sunnypilot and is licensed under the MIT License.
 See the LICENSE.md file in the root directory for more details.
 """
-import platform
-
 import cereal.messaging as messaging
 from cereal import log, car, custom
 from openpilot.common.constants import CV
-from openpilot.common.params import Params
 from openpilot.sunnypilot.selfdrive.selfdrived.events_base import EventsBase, Priority, ET, Alert, \
   NoEntryAlert, ImmediateDisableAlert, EngagementAlert, NormalPermanentAlert, AlertCallbackType, wrong_car_mode_alert
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit import PCM_LONG_REQUIRED_MAX_SET_SPEED, CONFIRM_SPEED_THRESHOLD
@@ -21,22 +18,12 @@ VisualAlert = car.CarControl.HUDControl.VisualAlert
 AudibleAlert = car.CarControl.HUDControl.AudibleAlert
 AudibleAlertSP = custom.SelfdriveStateSP.AudibleAlert
 EventNameSP = custom.OnroadEventSP.EventName
-SpeedLimitSource = custom.LongitudinalPlanSP.SpeedLimit.Source
 
 
 # get event name from enum
 EVENT_NAME_SP = {v: k for k, v in EventNameSP.schema.enumerants.items()}
 
 IS_MICI = HARDWARE.get_device_type() == 'mici'
-MEM_PARAMS = Params("/dev/shm/params") if platform.system() != "Darwin" else Params()
-
-
-def get_speed_limit_source_label(source: custom.LongitudinalPlanSP.SpeedLimit.Source, map_source: str | None) -> str:
-  if source == SpeedLimitSource.car:
-    return "CAR"
-  if source == SpeedLimitSource.map:
-    return map_source if map_source in ("ON", "OSM") else "OSM"
-  return ""
 
 
 def speed_limit_adjust_alert(CP: car.CarParams, CS: car.CarState, sm: messaging.SubMaster, metric: bool, soft_disable_time: int, personality) -> Alert:
@@ -72,9 +59,6 @@ def speed_limit_pre_active_alert(CP: car.CarParams, CS: car.CarState, sm: messag
   speed_unit = "km/h" if metric else "mph"
   alert_1_str = ""
   alert_size = AlertSize.small
-  resolver_source = sm['longitudinalPlanSP'].speedLimit.resolver.source
-  source_label = get_speed_limit_source_label(resolver_source, MEM_PARAMS.get("MapSpeedLimitSource"))
-  source_suffix = f" | {source_label}" if source_label else ""
 
   if CP.openpilotLongitudinalControl and CP.pcmCruise:
     # PCM long
@@ -86,9 +70,9 @@ def speed_limit_pre_active_alert(CP: car.CarParams, CS: car.CarState, sm: messag
   else:
     if IS_MICI:
       if set_speed_conv < speed_limit_final_last_conv:
-        alert_1_str = f"{speed_limit_final_last_conv} {speed_unit} ? Press + | {source_suffix}"
+        alert_1_str = f"{speed_limit_final_last_conv} {speed_unit} ? Press +"
       elif set_speed_conv > speed_limit_final_last_conv:
-        alert_1_str = f"{speed_limit_final_last_conv} {speed_unit} ? Press - | {source_suffix}"
+        alert_1_str = f"{speed_limit_final_last_conv} {speed_unit} ? Press -"
     else:
       alert_size = AlertSize.none
 
