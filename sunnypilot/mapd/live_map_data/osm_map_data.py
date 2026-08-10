@@ -44,7 +44,13 @@ class OsmMapData(BaseMapData):
 
   def get_current_speed_limit(self) -> float:
     database_speed_limit = self.speed_limit_database.lookup(self.last_position, self.last_bearing)
-    return database_speed_limit or float(self.mem_params.get("MapSpeedLimit") or 0.0)
+    if database_speed_limit:
+      self.mem_params.put("MapSpeedLimitSource", "ON")
+      return database_speed_limit
+
+    osm_speed_limit = float(self.mem_params.get("MapSpeedLimit") or 0.0)
+    self.mem_params.put("MapSpeedLimitSource", "OSM" if osm_speed_limit else "")
+    return osm_speed_limit
 
   def get_current_road_name(self) -> str:
     return str(self.mem_params.get("RoadName") or "")
