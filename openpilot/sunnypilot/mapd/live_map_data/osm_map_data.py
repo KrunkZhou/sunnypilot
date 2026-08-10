@@ -11,13 +11,15 @@ import platform
 from openpilot.cereal import log
 from openpilot.common.params import Params
 from openpilot.sunnypilot.mapd.live_map_data.base_map_data import BaseMapData
+from openpilot.sunnypilot.mapd.live_map_data.speed_limit_database import SpeedLimitDatabase
 from openpilot.sunnypilot.navd.helpers import Coordinate
 
 
 class OsmMapData(BaseMapData):
-  def __init__(self):
+  def __init__(self, speed_limit_database: SpeedLimitDatabase | None = None):
     super().__init__()
     self.mem_params = Params("/dev/shm/params") if platform.system() != "Darwin" else self.params
+    self.speed_limit_database = speed_limit_database or SpeedLimitDatabase()
 
   def update_location(self) -> None:
     location = self.sm['liveLocationKalman']
@@ -41,7 +43,8 @@ class OsmMapData(BaseMapData):
     self.mem_params.put("LastGPSPosition", json.dumps(params), block=True)
 
   def get_current_speed_limit(self) -> float:
-    return float(self.mem_params.get("MapSpeedLimit") or 0.0)
+    database_speed_limit = self.speed_limit_database.lookup(self.last_position, self.last_bearing)
+    return database_speed_limit or float(self.mem_params.get("MapSpeedLimit") or 0.0)
 
   def get_current_road_name(self) -> str:
     return str(self.mem_params.get("RoadName") or "")
