@@ -11,8 +11,8 @@ SpeedLimitSource = custom.LongitudinalPlanSP.SpeedLimit.Source
 
 
 @pytest.mark.parametrize(("source", "map_source", "expected"), [
-  (SpeedLimitSource.map, "ontario", "ON"),
-  (SpeedLimitSource.map, "osm", "OSM"),
+  (SpeedLimitSource.map, "ON", "ON"),
+  (SpeedLimitSource.map, "OSM", "OSM"),
   (SpeedLimitSource.map, None, "OSM"),
   (SpeedLimitSource.car, None, "CAR"),
   (SpeedLimitSource.none, "ON", ""),
@@ -21,12 +21,22 @@ def test_speed_limit_source_label(source, map_source, expected):
   assert get_speed_limit_source_label(source, map_source) == expected
 
 
+class FakeParams:
+  def __init__(self, source):
+    self.source = source
+
+  def get(self, key):
+    assert key == "MapSpeedLimitSource"
+    return self.source
+
+
 @pytest.mark.parametrize(("set_speed", "source", "button"), [
-  (10.0, "ontario", "+"),
-  (30.0, "osm", "-"),
+  (10.0, "ON", "+"),
+  (30.0, "OSM", "-"),
 ])
 def test_pre_active_alert_appends_source_after_button(monkeypatch, set_speed, source, button):
   monkeypatch.setattr(events, "IS_MICI", True)
+  monkeypatch.setattr(events, "MEM_PARAMS", FakeParams(source))
   car_params = SimpleNamespace(openpilotLongitudinalControl=False, pcmCruise=False)
   car_state = SimpleNamespace(vCruiseCluster=0.0)
   sub_master = {
@@ -35,10 +45,8 @@ def test_pre_active_alert_appends_source_after_button(monkeypatch, set_speed, so
       speedLimitFinalLast=20.0,
       source=SpeedLimitSource.map,
     ))),
-    "liveMapDataSP": SimpleNamespace(speedLimitSource=source),
   }
 
   alert = events.speed_limit_pre_active_alert(car_params, car_state, sub_master, True, 0, None)
 
-  expected_source = "ON" if source == "ontario" else "OSM"
-  assert alert.alert_text_1 == f"72 km/h ? Press {button} | {expected_source}"
+  assert alert.alert_text_1 == f"72 km/h ? Press {button} | {source}"

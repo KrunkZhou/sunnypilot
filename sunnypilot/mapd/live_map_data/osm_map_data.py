@@ -20,7 +20,6 @@ class OsmMapData(BaseMapData):
     super().__init__()
     self.mem_params = Params("/dev/shm/params") if platform.system() != "Darwin" else self.params
     self.speed_limit_database = speed_limit_database or SpeedLimitDatabase()
-    self.speed_limit_source = "none"
 
   def update_location(self) -> None:
     location = self.sm['liveLocationKalman']
@@ -46,15 +45,12 @@ class OsmMapData(BaseMapData):
   def get_current_speed_limit(self) -> float:
     database_speed_limit = self.speed_limit_database.lookup(self.last_position, self.last_bearing)
     if database_speed_limit:
-      self.speed_limit_source = "ontario"
+      self.mem_params.put("MapSpeedLimitSource", "ON")
       return database_speed_limit
 
     osm_speed_limit = float(self.mem_params.get("MapSpeedLimit") or 0.0)
-    self.speed_limit_source = "osm" if osm_speed_limit else "none"
+    self.mem_params.put("MapSpeedLimitSource", "OSM" if osm_speed_limit else "")
     return osm_speed_limit
-
-  def get_current_speed_limit_source(self) -> str:
-    return self.speed_limit_source
 
   def get_current_road_name(self) -> str:
     return str(self.mem_params.get("RoadName") or "")
