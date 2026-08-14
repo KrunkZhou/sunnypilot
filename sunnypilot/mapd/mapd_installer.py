@@ -98,7 +98,7 @@ class MapdInstallManager:
       self._spinner.update(f"Waiting for internet connection... [{retries}/{max_retries}]")
       time.sleep(2)
       try:
-        _ = urlopen('https://sentry.io', timeout=10)
+        _ = urlopen('https://github.com', timeout=10)
         return True
       except Exception as e:
         print(f'Wait for internet failed: {e}')

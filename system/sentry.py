@@ -16,6 +16,7 @@ from openpilot.system.version import get_build_metadata, get_version
 from openpilot.sunnypilot.sunnylink.api import UNREGISTERED_SUNNYLINK_DONGLE_ID
 
 CRASHES_DIR = Paths.crash_log_root()
+SENTRY_ENABLED = False
 
 
 class SentryProject(Enum):
@@ -27,6 +28,8 @@ class SentryProject(Enum):
 
 def report_tombstone(fn: str, message: str, contents: str) -> None:
   cloudlog.error({'tombstone': message})
+  if not SENTRY_ENABLED:
+    return
 
   with sentry_sdk.configure_scope() as scope:
     set_user()
@@ -41,6 +44,8 @@ def capture_exception(*args, **kwargs) -> None:
 
   try:
     save_exception(traceback.format_exc())
+    if not SENTRY_ENABLED:
+      return
 
     set_user()
     sentry_sdk.capture_exception(*args, **kwargs)
@@ -73,6 +78,9 @@ def save_exception(content: str) -> None:
 
 
 def capture_fingerprint_mock() -> None:
+  if not SENTRY_ENABLED:
+    return
+
   try:
     set_user()
     message = "car doesn't match any fingerprints"
@@ -83,6 +91,9 @@ def capture_fingerprint_mock() -> None:
 
 
 def capture_fingerprint(candidate: str, car_name: str) -> None:
+  if not SENTRY_ENABLED:
+    return
+
   try:
     set_user()
     sentry_sdk.set_tag("carFingerprint", candidate)
@@ -96,10 +107,14 @@ def capture_fingerprint(candidate: str, car_name: str) -> None:
 
 
 def set_tag(key: str, value: str) -> None:
+  if not SENTRY_ENABLED:
+    return
   sentry_sdk.set_tag(key, value)
 
 
 def set_user() -> None:
+  if not SENTRY_ENABLED:
+    return
   dongle_id, git_username, _ = get_properties()
   sentry_sdk.set_user({"id": dongle_id, "name": git_username})
 
@@ -115,6 +130,10 @@ def get_properties() -> tuple[str, str, str]:
 
 
 def init(project: SentryProject) -> bool:
+  if not SENTRY_ENABLED:
+    cloudlog.info("Sentry disabled")
+    return False
+
   build_metadata = get_build_metadata()
 
   env = build_metadata.channel_type
