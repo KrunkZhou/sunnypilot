@@ -98,12 +98,12 @@ msgid "Back"
 msgstr "뒤로"
 
 #: openpilot/selfdrive/ui/widgets/prime.py
-msgid "Become a comma prime member at connect.comma.ai"
-msgstr "connect.comma.ai에서 comma prime 회원이 되세요"
+msgid "Become a comma prime member at connect.krunk.cn"
+msgstr "connect.krunk.cn에서 comma prime 회원이 되세요"
 
 #: openpilot/selfdrive/ui/widgets/pairing_dialog.py
-msgid "Bookmark connect.comma.ai to your home screen to use it like an app"
-msgstr "connect.comma.ai를 홈 화면에 추가하여 앱처럼 사용하세요"
+msgid "Bookmark connect.krunk.cn to your home screen to use it like an app"
+msgstr "connect.krunk.cn를 홈 화면에 추가하여 앱처럼 사용하세요"
 
 #: openpilot/selfdrive/ui/layouts/settings/device.py
 msgid "CHANGE"
@@ -343,8 +343,8 @@ msgid "GOOD"
 msgstr "양호"
 
 #: openpilot/selfdrive/ui/widgets/pairing_dialog.py
-msgid "Go to https://connect.comma.ai on your phone"
-msgstr "휴대폰에서 https://connect.comma.ai 에 접속하세요"
+msgid "Go to https://connect.krunk.cn on your phone"
+msgstr "휴대폰에서 https://connect.krunk.cn 에 접속하세요"
 
 #: openpilot/selfdrive/ui/layouts/sidebar.py
 msgid "HIGH"
@@ -474,8 +474,8 @@ msgstr "장치를 귀하의 comma 계정에 페어링하세요"
 
 #: openpilot/selfdrive/ui/layouts/settings/device.py
 #: openpilot/selfdrive/ui/widgets/setup.py
-msgid "Pair your device with comma connect (connect.comma.ai) and claim your comma prime offer."
-msgstr "장치를 comma connect(connect.comma.ai)와 페어링하고 comma 프라임 혜택을 받으세요."
+msgid "Pair your device with comma connect (connect.krunk.cn) and claim your comma prime offer."
+msgstr "장치를 comma connect(connect.krunk.cn)와 페어링하고 comma 프라임 혜택을 받으세요."
 
 #: openpilot/selfdrive/ui/widgets/setup.py
 msgid "Please connect to Wi-Fi to complete initial pairing"
