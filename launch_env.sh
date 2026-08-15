@@ -23,4 +23,4 @@ export STAGING_ROOT="/data/safe_staging"
 
 export API_HOST="https://connect.krunk.cn"
 export ATHENA_HOST="wss://connect.krunk.cn"
-export CONNECT_HOST="https://connect.krunk.cn"
+export CONNECT_HOST="https://connect-web.krunk.cn"
