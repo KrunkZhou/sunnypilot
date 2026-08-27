@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Protocol
 
 from openpilot.common.basedir import BASEDIR
-from openpilot.system.hardware.hw import Paths
+from openpilot.common.hardware.hw import Paths
 
 
 SPEED_LIMIT_DATABASE_NAME = "ontario_speed_limits.sqlite"
