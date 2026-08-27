@@ -17,14 +17,20 @@ from openpilot.common.swaglog import cloudlog
 
 from openpilot.sunnypilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlannerSP
 
-J_CRUISE_VALS = [1.6, 1.2, 0.8, 0.6]
-J_CRUISE_BP = [0., 10.0, 25., 40.]
+A_CRUISE_MAX_VALS = [2.0, 2.0, 1.95, 1.60, 1.30, 1.05, 0.75]
+A_CRUISE_MAX_BP = [0., 5., 10., 15., 20., 25., 40.]
+J_CRUISE_VALS = [2.0, 2.0, 1.95, 1.60, 1.30, 1.05, 0.75]
+J_CRUISE_BP = [0., 5., 10., 15., 20., 25., 40.]
 A_CRUISE_MIN = -0.5
 CONTROL_N_T_IDX = ModelConstants.T_IDXS[:CONTROL_N]
 
 
+def get_max_accel(v_ego):
+  return np.interp(v_ego, A_CRUISE_MAX_BP, A_CRUISE_MAX_VALS)
+
+
 def get_cruise_accel(v_cruise, v_ego, a_cruise_prev, dt):
-  target_accel = np.clip(v_cruise - v_ego, A_CRUISE_MIN, ACCEL_MAX)
+  target_accel = np.clip(v_cruise - v_ego, A_CRUISE_MIN, min(ACCEL_MAX, get_max_accel(v_ego)))
   j_cruise = np.interp(v_ego, J_CRUISE_BP, J_CRUISE_VALS)
   target_accel = float(np.clip(target_accel, a_cruise_prev - j_cruise * dt, a_cruise_prev + j_cruise * dt))
 
