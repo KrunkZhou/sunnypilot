@@ -17,9 +17,9 @@ from openpilot.common.swaglog import cloudlog
 
 from openpilot.sunnypilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlannerSP
 
-A_CRUISE_MAX_VALS = [1.6, 1.2, 0.8, 0.6]
-A_CRUISE_MAX_BP = [0., 10.0, 25., 40.]
-J_CRUISE_VALS = [1.6, 1.2, 0.8, 0.6]
+A_CRUISE_MAX_VALS = [2.0, 2.0, 1.95, 1.60, 1.30, 1.05, 0.75]
+A_CRUISE_MAX_BP = [0., 5., 10., 15., 20., 25., 40.]
+J_CRUISE_VALS = [2.0, 2.0, 1.95, 1.60, 1.30, 1.05, 0.75]
 A_CRUISE_MIN = -1.2
 CONTROL_N_T_IDX = ModelConstants.T_IDXS[:CONTROL_N]
 ALLOW_THROTTLE_THRESHOLD = 0.4
