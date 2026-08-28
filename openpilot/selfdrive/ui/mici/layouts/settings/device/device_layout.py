@@ -3,6 +3,7 @@ import pyray as rl
 from collections.abc import Callable
 from typing import Union
 
+from openpilot.common.api.comma_connect import CONNECT_DOMAIN
 from openpilot.common.basedir import BASEDIR
 from openpilot.common.params import Params
 from openpilot.common.time_helpers import system_time_valid
@@ -103,7 +104,7 @@ class PairBigButton(BigButton):
     self._comma_icon = gui_app.texture("icons_mici/settings/comma_icon.png", 33, 60)
     self._provider_icons = {provider: gui_app.texture(f"icons_mici/settings/device/paired_{provider}.png", 64, 64)
                            for provider in ("github", "google", "apple")}
-    super().__init__("pair to connect", "connect.comma.ai", self._comma_icon)
+    super().__init__("pair to connect", CONNECT_DOMAIN, self._comma_icon)
 
   def _update_state(self):
     super()._update_state()
@@ -120,7 +121,7 @@ class PairBigButton(BigButton):
     else:
       self.set_icon(self._comma_icon)
       self.set_text("pair to connect")
-      self.set_value("connect.comma.ai")
+      self.set_value(CONNECT_DOMAIN)
 
   def _draw_subtitle(self, rect: rl.Rectangle):
     if self._show_commacare:
