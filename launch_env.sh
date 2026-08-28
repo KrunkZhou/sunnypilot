@@ -20,3 +20,7 @@ if [ -z "$AGNOS_VERSION" ]; then
 fi
 
 export STAGING_ROOT="/data/safe_staging"
+
+export API_HOST="https://rtzapi.krunk.cn"
+export ATHENA_HOST="wss://rtzapi.krunk.cn"
+export CONNECT_HOST="https://rtz.krunk.cn"
