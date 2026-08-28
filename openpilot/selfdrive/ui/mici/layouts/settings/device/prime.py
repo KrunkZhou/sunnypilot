@@ -2,6 +2,7 @@ import pyray as rl
 import time
 
 from openpilot.common.api import Api
+from openpilot.common.api.comma_connect import CONNECT_HOST, CONNECT_DOMAIN
 from openpilot.common.swaglog import cloudlog
 from openpilot.common.params import Params
 from openpilot.selfdrive.ui.mici.widgets.button import BigButton, GreyBigButton
@@ -86,8 +87,8 @@ class PrimeManagementScroller(NavScroller):
 
   def _get_prime_url(self) -> str:
     if dongle_id := self._params.get("DongleId"):
-      return f"https://connect.comma.ai/{dongle_id}/prime"
-    return "https://connect.comma.ai"
+      return f"{CONNECT_HOST}/{dongle_id}/prime"
+    return CONNECT_HOST
 
   def _update_state(self):
     super()._update_state()
@@ -124,7 +125,7 @@ class PrimeScroller(NavScroller):
       self._scroller.scroll_indicator_start_after = self._qr
       self._scroller.add_widgets([
         self._qr,
-        GreyBigButton("finish setup", "scan QR code or visit connect.comma.ai",
+        GreyBigButton("finish setup", f"scan QR code or visit {CONNECT_DOMAIN}",
                       gui_app.texture("icons_mici/settings/device/green_settings.png", 64, 64)),
         GreyBigButton("", "connect lets you review recent driving footage and bookmark events."),
       ])
@@ -136,7 +137,7 @@ class PrimeScroller(NavScroller):
     except Exception as e:
       cloudlog.warning(f"Failed to get pairing token: {e}")
       token = ""
-    return f"https://connect.comma.ai/?pair={token}"
+    return f"{CONNECT_HOST}/?pair={token}"
 
   def _update_layout_rects(self):
     super()._update_layout_rects()
