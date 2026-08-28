@@ -100,6 +100,8 @@ class NetworkIcon(Widget):
     self._net_strength = max(0, min(5, strength.raw + 1)) if strength.raw > 0 else 0
 
   def _render(self, _):
+    # Cellular networkType requires an established modem data link, not just signal.
+    cellular_data_connected = self._net_type in (NetworkType.cell2G, NetworkType.cell3G, NetworkType.cell4G, NetworkType.cell5G)
     if self._net_type == NetworkType.wifi:
       # There is no 1
       draw_net_txt = {0: self._wifi_none_txt,
@@ -107,7 +109,7 @@ class NetworkIcon(Widget):
                       3: self._wifi_medium_txt,
                       4: self._wifi_full_txt,
                       5: self._wifi_full_txt}.get(self._net_strength, self._wifi_low_txt)
-    elif self._net_type in (NetworkType.cell2G, NetworkType.cell3G, NetworkType.cell4G, NetworkType.cell5G):
+    elif cellular_data_connected:
       draw_net_txt = {0: self._cell_none_txt,
                       2: self._cell_low_txt,
                       3: self._cell_medium_txt,
@@ -124,6 +126,8 @@ class NetworkIcon(Widget):
       draw_y -= (self._wifi_slash_txt.height - self._wifi_none_txt.height) / 2
 
     rl.draw_texture_ex(draw_net_txt, rl.Vector2(draw_x, draw_y), 0.0, 1.0, rl.Color(255, 255, 255, int(255 * 0.9)))
+    if cellular_data_connected:
+      rl.draw_circle_v(rl.Vector2(self._rect.x + 8, self._rect.y + 9), 4, rl.Color(0, 200, 100, 255))
 
 
 class MiciHomeLayout(Widget):
