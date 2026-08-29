@@ -5,11 +5,12 @@ import platform
 from opendbc.car.structs import car
 from openpilot.cereal import custom
 from openpilot.common.params import Params
-from openpilot.common.hardware import PC, COMMA_HARDWARE
+from openpilot.common.hardware import PC, COMMA_HARDWARE, HARDWARE
 from openpilot.system.manager.process import PythonProcess, NativeProcess, DaemonProcess
 from openpilot.common.hardware.hw import Paths
 
 from openpilot.sunnypilot.mapd.mapd_manager import MAPD_PATH
+from openpilot.sunnypilot.sms_forwarder import is_supported_device
 
 from openpilot.sunnypilot.models.helpers import get_active_model_runner
 from openpilot.sunnypilot.sunnylink.utils import sunnylink_need_register, sunnylink_ready, use_sunnylink_uploader
@@ -100,6 +101,9 @@ def uploader_ready(started: bool, params: Params, CP: car.CarParams) -> bool:
 
   return always_run(started, params, CP)
 
+def sms_forwarder_ready(started: bool, params: Params, CP: car.CarParams) -> bool:
+  return is_supported_device(HARDWARE.get_device_type())
+
 def or_(*fns):
   return lambda *args: operator.or_(*(fn(*args) for fn in fns))
 
@@ -149,6 +153,7 @@ procs = [
   PythonProcess("radard", "openpilot.selfdrive.controls.radard", only_onroad),
   PythonProcess("hardwared", "openpilot.system.hardware.hardwared", always_run),
   PythonProcess("modem", "openpilot.common.hardware.comma.modem", always_run, enabled=COMMA_HARDWARE),
+  PythonProcess("sms_forwarder", "openpilot.sunnypilot.sms_forwarder.__main__", sms_forwarder_ready, enabled=COMMA_HARDWARE),
   PythonProcess("tombstoned", "openpilot.system.tombstoned", always_run, enabled=not PC),
   PythonProcess("updated", "openpilot.system.updated.updated", only_offroad, enabled=not PC),
   PythonProcess("uploader", "openpilot.system.loggerd.uploader", uploader_ready),
