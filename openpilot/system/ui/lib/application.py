@@ -28,6 +28,7 @@ _DEFAULT_FPS = int(os.getenv("FPS", {'tizi': 20}.get(HARDWARE.get_device_type(),
 FPS_LOG_INTERVAL = 5  # Seconds between logging FPS drops
 FPS_DROP_THRESHOLD = 0.9  # FPS drop threshold for triggering a warning
 FPS_CRITICAL_THRESHOLD = 0.5  # Critical threshold for triggering strict actions
+FRAME_CAPTURE_IDLE_TIMEOUT = 2.0
 MOUSE_THREAD_RATE = 140  # touch controller runs at 140Hz
 MAX_TOUCH_SLOTS = 2
 TOUCH_HISTORY_TIMEOUT = 3.0  # Seconds before touch points fade out
@@ -225,6 +226,14 @@ class GuiApplication(GuiApplicationExt):
     self._scaled_height += self._scaled_height % 2
 
     self._render_texture: rl.RenderTexture | None = None
+    self._render_texture_base_required = False
+    self._frame_capture_texture: rl.RenderTexture | None = None
+    self._frame_capture_active: Callable[[], bool] | None = None
+    self._frame_capture_due: Callable[[], bool] | None = None
+    self._frame_capture_callback: Callable[[bytes, int, int], None] | None = None
+    self._frame_capture_max_width = 0
+    self._last_frame_capture_request = float("-inf")
+    self._frame_capture_retry_at = 0.0
     self._burn_in_shader: rl.Shader | None = None
     self._ffmpeg_proc: subprocess.Popen | None = None
     self._ffmpeg_queue: queue.Queue | None = None
@@ -277,6 +286,51 @@ class GuiApplication(GuiApplicationExt):
   def request_close(self):
     self._window_close_requested = True
 
+  def configure_frame_capture(self, active: Callable[[], bool], due: Callable[[], bool],
+                              callback: Callable[[bytes, int, int], None], max_width: int) -> None:
+    """Register a latest-frame consumer. GPU access remains on the render thread."""
+    if max_width <= 0:
+      raise ValueError("frame capture max_width must be positive")
+    self._frame_capture_active = active
+    self._frame_capture_due = due
+    self._frame_capture_callback = callback
+    self._frame_capture_max_width = max_width
+
+  def _load_render_texture(self, width: int, height: int) -> rl.RenderTexture:
+    texture = rl.load_render_texture(width, height)
+    try:
+      if texture is None or texture.id == 0 or texture.texture.id == 0 or texture.texture.width <= 0 or texture.texture.height <= 0:
+        raise RuntimeError("render texture allocation failed")
+      rl.set_texture_filter(texture.texture, rl.TextureFilter.TEXTURE_FILTER_BILINEAR)
+      return texture
+    except Exception:
+      if texture is not None:
+        rl.unload_render_texture(texture)
+      raise
+
+  def _release_frame_capture_textures(self) -> None:
+    if self._frame_capture_texture is not None:
+      rl.unload_render_texture(self._frame_capture_texture)
+      self._frame_capture_texture = None
+    if self._render_texture is not None and not self._render_texture_base_required:
+      rl.unload_render_texture(self._render_texture)
+      self._render_texture = None
+
+  def _update_frame_capture_textures(self, capture_active: bool, now: float) -> None:
+    if capture_active:
+      self._last_frame_capture_request = now
+      if now < self._frame_capture_retry_at:
+        return
+      if self._render_texture is None:
+        self._render_texture = self._load_render_texture(self._scaled_width, self._scaled_height)
+
+      if self._scaled_width > self._frame_capture_max_width and self._frame_capture_texture is None:
+        capture_height = max(2, round(self._scaled_height * self._frame_capture_max_width / self._scaled_width))
+        capture_height += capture_height % 2
+        self._frame_capture_texture = self._load_render_texture(self._frame_capture_max_width, capture_height)
+    elif now - self._last_frame_capture_request >= FRAME_CAPTURE_IDLE_TIMEOUT:
+      self._release_frame_capture_textures()
+
   def init_window(self, title: str, fps: int = _DEFAULT_FPS):
     with self._startup_profile_context():
       def _close(sig, frame):
@@ -293,11 +347,11 @@ class GuiApplication(GuiApplicationExt):
       rl.init_window(self._scaled_width, self._scaled_height, title)
 
       needs_render_texture = self._scale != 1.0 or BURN_IN_MODE or RECORD
+      self._render_texture_base_required = needs_render_texture
       if self._scale != 1.0:
         rl.set_mouse_scale(1 / self._scale, 1 / self._scale)
       if needs_render_texture:
-        self._render_texture = rl.load_render_texture(self._scaled_width, self._scaled_height)
-        rl.set_texture_filter(self._render_texture.texture, rl.TextureFilter.TEXTURE_FILTER_BILINEAR)
+        self._render_texture = self._load_render_texture(self._scaled_width, self._scaled_height)
 
       if RECORD:
         output_fps = fps * RECORD_SPEED
@@ -575,6 +629,10 @@ class GuiApplication(GuiApplicationExt):
       rl.unload_render_texture(self._render_texture)
       self._render_texture = None
 
+    if self._frame_capture_texture is not None:
+      rl.unload_render_texture(self._frame_capture_texture)
+      self._frame_capture_texture = None
+
     if self._burn_in_shader:
       rl.unload_shader(self._burn_in_shader)
       self._burn_in_shader = None
@@ -605,6 +663,24 @@ class GuiApplication(GuiApplicationExt):
       while not (self._window_close_requested or rl.window_should_close()):
         frame_start = time.monotonic()
 
+        capture_active = False
+        capture_due = False
+        if self._frame_capture_active is not None and self._frame_capture_due is not None:
+          try:
+            capture_active = self._frame_capture_active()
+            capture_due = capture_active and frame_start >= self._frame_capture_retry_at and self._frame_capture_due()
+          except Exception:
+            cloudlog.exception("Frame capture scheduling failed")
+            self._frame_capture_retry_at = frame_start + 5.0
+        try:
+          self._update_frame_capture_textures(capture_active, frame_start)
+        except Exception:
+          cloudlog.exception("Frame capture texture update failed")
+          self._release_frame_capture_textures()
+          self._frame_capture_retry_at = frame_start + 5.0
+          capture_due = False
+        render_offscreen = self._render_texture is not None and (self._render_texture_base_required or capture_due)
+
         if PC:
           # Thread is not used on PC, need to manually add mouse events
           self._mouse._handle_mouse_event()
@@ -615,19 +691,21 @@ class GuiApplication(GuiApplicationExt):
           self._last_mouse_event = self._mouse_events[-1]
 
         # Skip rendering when screen is off
-        if not self._should_render:
+        if not self._should_render and not capture_due:
           if PC:
             rl.poll_input_events()
           time.sleep(1 / self._target_fps)
           yield False, 0.0, 0.0
           continue
 
-        if self._render_texture:
+        drawing_to_display = False
+        if render_offscreen:
           rl.begin_texture_mode(self._render_texture)
           rl.clear_background(rl.BLACK)
         else:
           rl.begin_drawing()
           rl.clear_background(rl.BLACK)
+          drawing_to_display = True
 
         if self._scale != 1.0:
           rl.rl_push_matrix()
@@ -648,34 +726,81 @@ class GuiApplication(GuiApplicationExt):
         if self._scale != 1.0:
           rl.rl_pop_matrix()
 
-        if self._render_texture:
+        capture_texture = None
+        if render_offscreen:
           rl.end_texture_mode()
-          rl.begin_drawing()
-          rl.clear_background(rl.BLACK)
-          src_rect = rl.Rectangle(0, 0, float(self._scaled_width), -float(self._scaled_height))
-          dst_rect = rl.Rectangle(0, 0, float(self._scaled_width), float(self._scaled_height))
-          texture = self._render_texture.texture
-          if texture:
-            if BURN_IN_MODE and self._burn_in_shader:
-              rl.begin_shader_mode(self._burn_in_shader)
-              rl.draw_texture_pro(texture, src_rect, dst_rect, rl.Vector2(0, 0), 0.0, rl.WHITE)
-              rl.end_shader_mode()
-            else:
-              rl.draw_texture_pro(texture, src_rect, dst_rect, rl.Vector2(0, 0), 0.0, rl.WHITE)
 
-        if self._show_fps:
-          rl.draw_fps(10, 10)
+          capture_texture = self._render_texture
+          if capture_due and self._frame_capture_texture is not None:
+            rl.begin_texture_mode(self._frame_capture_texture)
+            rl.clear_background(rl.BLACK)
+            capture_src = rl.Rectangle(0, 0, float(self._scaled_width), -float(self._scaled_height))
+            capture_dst = rl.Rectangle(0, 0, float(self._frame_capture_texture.texture.width),
+                                       float(self._frame_capture_texture.texture.height))
+            rl.draw_texture_pro(self._render_texture.texture, capture_src, capture_dst, rl.Vector2(0, 0), 0.0, rl.WHITE)
+            rl.end_texture_mode()
+            capture_texture = self._frame_capture_texture
 
-        if self._show_touches:
-          self._draw_touch_points()
+          if self._should_render:
+            rl.begin_drawing()
+            rl.clear_background(rl.BLACK)
+            src_rect = rl.Rectangle(0, 0, float(self._scaled_width), -float(self._scaled_height))
+            dst_rect = rl.Rectangle(0, 0, float(self._scaled_width), float(self._scaled_height))
+            texture = self._render_texture.texture
+            if texture:
+              if BURN_IN_MODE and self._burn_in_shader:
+                rl.begin_shader_mode(self._burn_in_shader)
+                rl.draw_texture_pro(texture, src_rect, dst_rect, rl.Vector2(0, 0), 0.0, rl.WHITE)
+                rl.end_shader_mode()
+              else:
+                rl.draw_texture_pro(texture, src_rect, dst_rect, rl.Vector2(0, 0), 0.0, rl.WHITE)
+            drawing_to_display = True
 
-        if self._show_mouse_coords:
-          self._draw_mouse_coordinates(gui_app.font(FontWeight.SEMI_BOLD))
+        if drawing_to_display:
+          if self._show_fps:
+            rl.draw_fps(10, 10)
 
-        if self._grid_size > 0:
-          self._draw_grid()
+          if self._show_touches:
+            self._draw_touch_points()
 
-        rl.end_drawing()
+          if self._show_mouse_coords:
+            self._draw_mouse_coordinates(gui_app.font(FontWeight.SEMI_BOLD))
+
+          if self._grid_size > 0:
+            self._draw_grid()
+
+          if capture_active:
+            indicator_width = 72 if not self.big_ui() else 140
+            indicator_height = 30 if not self.big_ui() else 52
+            indicator_rect = rl.Rectangle(self._scaled_width - indicator_width - 10, 10, indicator_width, indicator_height)
+            rl.draw_rectangle_rounded(indicator_rect, 0.4, 8, rl.Color(180, 20, 20, 230))
+            rl.draw_text_ex(self.font(FontWeight.BOLD), "LIVE", rl.Vector2(indicator_rect.x + 12, indicator_rect.y + 5),
+                            18 if not self.big_ui() else 34, 0.0, rl.WHITE)
+
+          rl.end_drawing()
+
+        if capture_due and capture_texture is not None and self._frame_capture_callback is not None:
+          image = None
+          try:
+            image = rl.load_image_from_texture(capture_texture.texture)
+            if (
+              image is None
+              or image.data == rl.ffi.NULL
+              or image.width != capture_texture.texture.width
+              or image.height != capture_texture.texture.height
+              or image.width <= 0
+              or image.height <= 0
+            ):
+              raise RuntimeError("frame capture readback failed")
+            data_size = image.width * image.height * 4
+            data = bytes(rl.ffi.buffer(image.data, data_size))
+            self._frame_capture_callback(data, image.width, image.height)
+          except Exception:
+            cloudlog.exception("Frame capture failed")
+            self._frame_capture_retry_at = time.monotonic() + 5.0
+          finally:
+            if image is not None:
+              rl.unload_image(image)
 
         if RECORD:
           image = rl.load_image_from_texture(self._render_texture.texture)

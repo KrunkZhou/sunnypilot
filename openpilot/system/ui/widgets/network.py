@@ -108,6 +108,9 @@ class NetworkUI(Widget):
   def _set_current_panel(self, panel: PanelType):
     self._current_panel = panel
 
+  def add_advanced_widget(self, widget: Widget) -> None:
+    self._advanced_panel.add_widget(widget)
+
 
 class AdvancedNetworkSettings(Widget):
   def __init__(self, wifi_manager: WifiManager):
@@ -165,6 +168,9 @@ class AdvancedNetworkSettings(Widget):
     ]
 
     self._scroller = Scroller(items, line_separator=True, spacing=0)
+
+  def add_widget(self, widget: Widget) -> None:
+    self._scroller.add_widget(widget)
 
   def _on_network_updated(self, networks: list[Network]):
     self._tethering_action.set_enabled(True)

@@ -19,6 +19,11 @@ def update_translations():
       if filename.endswith(".py"):
         files.append(os.path.relpath(os.path.join(root, filename), BASEDIR))
 
+  files.extend([
+    os.path.relpath(os.path.join(str(UI_DIR), "sunnypilot", "layouts", "settings", "network.py"), BASEDIR),
+    os.path.relpath(os.path.join(str(UI_DIR), "sunnypilot", "ui_streamer_dialog.py"), BASEDIR),
+  ])
+
   # Extract translatable strings and generate .pot template
   entries = extract_strings(files, BASEDIR)
   generate_pot(entries, POT_FILE)

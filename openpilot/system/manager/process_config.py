@@ -1,6 +1,7 @@
 import os
 import operator
 import platform
+import time
 
 from opendbc.car.structs import car
 from openpilot.cereal import custom
@@ -11,11 +12,38 @@ from openpilot.common.hardware.hw import Paths
 
 from openpilot.sunnypilot.mapd.mapd_manager import MAPD_PATH
 from openpilot.sunnypilot.sms_forwarder import is_supported_device
+from openpilot.sunnypilot.ui_streamer import RestartBackoff, UIStreamerConfig
 
 from openpilot.sunnypilot.models.helpers import get_active_model_runner
 from openpilot.sunnypilot.sunnylink.utils import sunnylink_need_register, sunnylink_ready, use_sunnylink_uploader
 
 WEBCAM = os.getenv("USE_WEBCAM") is not None
+UI_STREAMER_CONFIG = UIStreamerConfig()
+
+class RestartingPythonProcess(PythonProcess):
+  """Restart this optional service if it exits while its run condition remains true."""
+
+  def __init__(self, *args, **kwargs):
+    super().__init__(*args, **kwargs)
+    self._restart_backoff = RestartBackoff()
+
+  def start(self) -> None:
+    now = time.monotonic()
+    if self.proc is not None and self.proc.exitcode is not None:
+      self._restart_backoff.note_exit(now)
+      super().stop()
+    if self.proc is None and not self._restart_backoff.ready(now):
+      return
+    starting = self.proc is None
+    super().start()
+    if starting and self.proc is not None:
+      self._restart_backoff.note_started(now)
+
+  def stop(self, *args, **kwargs):
+    result = super().stop(*args, **kwargs)
+    if self.proc is None:
+      self._restart_backoff.reset()
+    return result
 
 def driverview(started: bool, params: Params, CP: car.CarParams) -> bool:
   return started or params.get_bool("IsDriverViewEnabled")
@@ -59,6 +87,9 @@ def qcomgps(started: bool, params: Params, CP: car.CarParams) -> bool:
 
 def always_run(started: bool, params: Params, CP: car.CarParams) -> bool:
   return True
+
+def ui_streamer_ready(started: bool, params: Params, CP: car.CarParams) -> bool:
+  return UI_STREAMER_CONFIG.enabled()
 
 def only_onroad(started: bool, params: Params, CP: car.CarParams) -> bool:
   return started
@@ -130,6 +161,7 @@ procs = [
 
   PythonProcess("sensord", "openpilot.system.sensord.sensord", only_onroad, enabled=not PC),
   PythonProcess("ui", "openpilot.selfdrive.ui.ui", always_run),
+  RestartingPythonProcess("screenstreamd", "openpilot.sunnypilot.ui_streamer.screenstreamd", ui_streamer_ready),
   PythonProcess("soundd", "openpilot.selfdrive.ui.soundd", driverview),
   PythonProcess("locationd", "openpilot.selfdrive.locationd.locationd", only_onroad),
   NativeProcess("_pandad", "openpilot/selfdrive/pandad", ["./pandad"], always_run, enabled=False),
