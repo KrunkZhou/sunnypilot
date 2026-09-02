@@ -16,7 +16,7 @@ class SettingsBigButton(BigButton):
 
 
 class SettingsLayout(NavScroller):
-  def __init__(self, network_panel=None):
+  def __init__(self):
     super().__init__()
     self._params = Params()
 
@@ -24,7 +24,7 @@ class SettingsLayout(NavScroller):
     toggles_btn = SettingsBigButton("toggles", "", gui_app.texture("icons_mici/settings.png", 64, 64))
     toggles_btn.set_click_callback(lambda: gui_app.push_widget(toggles_panel))
 
-    network_panel = network_panel or NetworkLayoutMici()
+    network_panel = NetworkLayoutMici()
     network_btn = SettingsBigButton("network", "", gui_app.texture("icons_mici/settings/network/wifi_strength_full.png", 76, 56))
     network_btn.set_click_callback(lambda: gui_app.push_widget(network_panel))
 
