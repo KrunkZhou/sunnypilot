@@ -14,6 +14,7 @@ from openpilot.sunnypilot.sms_forwarder import is_supported_device
 
 from openpilot.sunnypilot.models.helpers import get_active_model_runner
 from openpilot.sunnypilot.sunnylink.utils import sunnylink_need_register, sunnylink_ready, use_sunnylink_uploader
+from openpilot.system.sentryd.runtime import capture_lease_active, runtime_enabled
 
 WEBCAM = os.getenv("USE_WEBCAM") is not None
 
@@ -69,6 +70,18 @@ def only_offroad(started: bool, params: Params, CP: car.CarParams) -> bool:
 def livestream(started: bool, params: Params, CP: car.CarParams) -> bool:
   return params.get_bool("IsLiveStreaming")
 
+def sentry_supported() -> bool:
+  return HARDWARE.get_device_type() == "mici"
+
+def sentry_offroad(started: bool, params: Params, CP: car.CarParams) -> bool:
+  return not started and sentry_supported()
+
+def sentry_sensor(started: bool, params: Params, CP: car.CarParams) -> bool:
+  return started or (sentry_supported() and runtime_enabled())
+
+def sentry_capture(started: bool, params: Params, CP: car.CarParams) -> bool:
+  return sentry_supported() and capture_lease_active()
+
 def use_copyparty(started, params, CP: car.CarParams) -> bool:
   return bool(params.get_bool("EnableCopyparty"))
 
@@ -118,7 +131,7 @@ procs = [
   NativeProcess("stream_encoderd", "openpilot/system/loggerd", ["./encoderd", "--stream"], or_(livestream, notcar)),
   PythonProcess("logmessaged", "openpilot.system.logmessaged", always_run),
 
-  NativeProcess("camerad", "openpilot/system/camerad", ["./camerad"], or_(driverview, livestream), enabled=not WEBCAM),
+  NativeProcess("camerad", "openpilot/system/camerad", ["./camerad"], or_(driverview, or_(livestream, sentry_capture)), enabled=not WEBCAM),
   PythonProcess("webcamerad", "openpilot.system.camerad.webcam.camerad", driverview, enabled=WEBCAM),
   PythonProcess("proclogd", "openpilot.system.proclogd", only_onroad, enabled=platform.system() != "Darwin"),
   PythonProcess("journald", "openpilot.system.journald", only_onroad, platform.system() != "Darwin"),
@@ -128,7 +141,8 @@ procs = [
   PythonProcess("modeld", "openpilot.selfdrive.modeld.modeld", and_(only_onroad, is_stock_model)),
   PythonProcess("dmonitoringmodeld", "openpilot.selfdrive.modeld.dmonitoringmodeld", driverview, enabled=(WEBCAM or not PC)),
 
-  PythonProcess("sensord", "openpilot.system.sensord.sensord", only_onroad, enabled=not PC),
+  PythonProcess("sensord", "openpilot.system.sensord.sensord", sentry_sensor, enabled=not PC),
+  PythonProcess("sentryd", "openpilot.system.sentryd.sentryd", sentry_offroad, enabled=COMMA_HARDWARE),
   PythonProcess("ui", "openpilot.selfdrive.ui.ui", always_run),
   PythonProcess("soundd", "openpilot.selfdrive.ui.soundd", driverview),
   PythonProcess("locationd", "openpilot.selfdrive.locationd.locationd", only_onroad),
