@@ -6,6 +6,7 @@ import openpilot.cereal.messaging as messaging
 from openpilot.cereal.visionipc import VisionStreamType
 from msgq.visionipc import VisionIpcClient
 from openpilot.common.realtime import DT_MDL
+from openpilot.system.sentryd.runtime import CameraOperationLock
 
 
 VISION_STREAMS = {
@@ -46,6 +47,14 @@ def extract_image(buf):
 
 
 def get_snapshots(frame="narrowRoadCameraState", front_frame="cabinCameraState"):
+  # Snapshot capture and parked Sentry capture both consume camera frames and
+  # must not overlap. The non-blocking process-wide lock fails fast instead of
+  # allowing a caller to wait behind a potentially stale camera operation.
+  with CameraOperationLock():
+    return _get_snapshots_locked(frame, front_frame)
+
+
+def _get_snapshots_locked(frame, front_frame):
   sockets = [s for s in (frame, front_frame) if s is not None]
   sm = messaging.SubMaster(sockets)
   vipc_clients = {s: VisionIpcClient("camerad", VISION_STREAMS[s], True) for s in sockets}
