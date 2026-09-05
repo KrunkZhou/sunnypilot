@@ -84,6 +84,8 @@ def gpiochip_get_ro_value_fd(label: str, gpiochip_id: int, pin: int) -> int:
   rq.label = label.encode('utf-8')[:31] + b'\0'
 
   fd = os.open(f"/dev/gpiochip{gpiochip_id}", os.O_RDONLY)
-  fcntl.ioctl(fd, GPIO_GET_LINEEVENT_IOCTL, rq)
-  os.close(fd)
+  try:
+    fcntl.ioctl(fd, GPIO_GET_LINEEVENT_IOCTL, rq)
+  finally:
+    os.close(fd)
   return int(rq.fd)

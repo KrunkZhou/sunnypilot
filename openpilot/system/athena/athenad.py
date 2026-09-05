@@ -824,6 +824,7 @@ def getNetworkMetered() -> bool:
 @dispatcher.add_method
 def startStream(sdp: str, enabled: bool) -> dict:
   from openpilot.system.webrtc.helpers import StreamRequestBody, post_stream_request, wait_for_webrtcd
+  from openpilot.system.sentryd.runtime import CameraOperationLock, capture_lease_active
   params = Params()
   bridge_services_in = []
 
@@ -837,11 +838,18 @@ def startStream(sdp: str, enabled: bool) -> dict:
   if params.get_bool("IsOffroad"):
     # manager owns camerad/stream_encoderd/webrtcd; flip the param and let it bring them up.
     # webrtcd clears IsLiveStreaming when the session ends
-    params.put_bool("IsLiveStreaming", True)
+    try:
+      with CameraOperationLock():
+        if capture_lease_active():
+          raise RuntimeError("camera is busy taking a Sentry Mode capture")
+        params.put_bool("IsLiveStreaming", True, block=True)
+    except BlockingIOError as exc:
+      raise RuntimeError("camera is busy taking a Sentry Mode capture") from exc
     # wait for webrtcd end points to wake up
     try:
       wait_for_webrtcd()
     except TimeoutError:
+      params.put_bool("IsLiveStreaming", False, block=True)
       cloudlog.event("athena.startStream.webrtcd_offroad_start_timeout", error=True)
       raise
 
