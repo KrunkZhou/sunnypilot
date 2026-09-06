@@ -3,6 +3,7 @@ import sys
 import time
 import signal
 import struct
+import queue
 import threading
 import requests
 import urllib.parse
@@ -17,6 +18,7 @@ from openpilot.common.swaglog import cloudlog
 from openpilot.common.hardware import COMMA_HARDWARE
 from openpilot.common.gpio import gpio_init, gpio_set
 from openpilot.common.hardware.comma.pins import GPIO
+from openpilot.system.ubloxd.assistnow import AssistNowClient, MGAInjector, Session, UARTAssistance, UbxStream, download, parse_assistance
 
 UBLOX_TTY = "/dev/ttyHS0"
 
@@ -43,9 +45,9 @@ def add_ubx_checksum(msg: bytes) -> bytes:
     B = (B + A) % 256
   return msg + bytes([A, B])
 
-def get_assistnow_messages() -> list[bytes]:
+def get_assistnow_messages(token: str | None = None) -> list[bytes]:
   params = Params()
-  if token := params.get('AssistNowToken'):
+  if token := token or params.get('AssistNowToken'):
     cloudlog.warning("Downloading AssistNow data directly from u-blox")
     r = requests.get("https://online-live2.services.u-blox.com/GetOnlineData.ashx", params=urllib.parse.urlencode({
       'token': token,
@@ -60,16 +62,7 @@ def get_assistnow_messages() -> list[bytes]:
     raise RuntimeError("Neither AssistNowToken nor DongleId is configured")
 
   r.raise_for_status()
-  dat = r.content
-
-  # split up messages
-  msgs = []
-  while len(dat) > 0:
-    assert dat[:2] == b"\xB5\x62"
-    msg_len = 6 + (dat[5] << 8 | dat[4]) + 2
-    msgs.append(dat[:msg_len])
-    dat = dat[msg_len:]
-  return msgs
+  return parse_assistance(r.content)
 
 
 class TTYPigeon:
@@ -108,6 +101,21 @@ class TTYPigeon:
       time.sleep(0.001)
 
   def send_with_ack(self, dat: bytes, ack: bytes = UBLOX_ACK, nack: bytes = UBLOX_NACK) -> None:
+    if ack == UBLOX_ASSIST_ACK:
+      # Initialization's time injection also needs a correlated, successful MGA
+      # acknowledgement. Downloaded batches use the nonblocking main loop below.
+      injector = MGAInjector([dat], time.monotonic())
+      stream = UbxStream()
+      while not injector.done:
+        for frame in stream.feed(self.receive()):
+          injector.feed(frame)
+        if message := injector.poll(time.monotonic()):
+          self.send(message)
+        if not injector.done:
+          time.sleep(0.001)
+      if injector.error:
+        raise TimeoutError(injector.error)
+      return
     self.send(dat)
     self.wait_for_ack(ack, nack)
 
@@ -238,7 +246,10 @@ def init_pigeon(pigeon: TTYPigeon) -> bool:
           30,
           0
         ))
-        pigeon.send_with_ack(msg, ack=UBLOX_ASSIST_ACK)
+        try:
+          pigeon.send_with_ack(msg, ack=UBLOX_ASSIST_ACK)
+        except TimeoutError:
+          cloudlog.warning("failed to initialize receiver time; continuing without time assistance")
 
       cloudlog.warning("Pigeon GPS on!")
       break
@@ -279,38 +290,58 @@ def run_receiving(duration: int = 0):
 
   start_time = time.monotonic()
   last_almanac_save = time.monotonic()
-  assist_attempted = False
-  assist_messages = None
+  assist_sessions: queue.Queue[Session | None] = queue.Queue(maxsize=1)
+
+  def download_session(session: Session) -> None:
+    sm = messaging.SubMaster(['deviceState'])
+    params = Params()
+    token = params.get('AssistNowToken')
+    direct_fetch = (lambda: get_assistnow_messages(token)) if token else None
+
+    def network_ready() -> bool:
+      sm.update(1000)
+      return system_time_valid() and sm['deviceState'].networkType != log.DeviceState.NetworkType.none
+
+    def make_client() -> AssistNowClient:
+      if not (dongle_id := params.get('DongleId')):
+        raise RuntimeError("DongleId is not configured")
+      return AssistNowClient(Api(dongle_id), dongle_id)
+
+    download(session, make_client, direct_fetch, network_ready, cloudlog.warning)
 
   def download_assistnow() -> None:
-    nonlocal assist_messages
-    sm = messaging.SubMaster(['deviceState'])
-    while assist_messages is None:
-      sm.update(1000)
-      if system_time_valid() and sm['deviceState'].networkType != log.DeviceState.NetworkType.none:
-        try:
-          assist_messages = get_assistnow_messages()
-        except Exception:
-          cloudlog.warning("failed to get AssistNow messages")
-      time.sleep(10.)
+    # One HTTP worker serializes requests across receiver initializations. Only
+    # the newest pending session is retained if the UART repeatedly resets.
+    while (session := assist_sessions.get()) is not None:
+      if not session.cancelled.is_set():
+        download_session(session)
+
+  def replace_pending(session: Session | None) -> None:
+    try:
+      if pending := assist_sessions.get_nowait():
+        pending.cancelled.set()
+    except queue.Empty:
+      pass
+    assist_sessions.put_nowait(session)
+
+  def start_assistance() -> tuple[Session, UARTAssistance]:
+    session = Session()
+    replace_pending(session)
+    return session, UARTAssistance(session)
+
   threading.Thread(target=download_assistnow, daemon=True).start()
+  assist_session, assistance = start_assistance()
 
   while (duration == 0) or (time.monotonic() - start_time < duration):
-    if assist_messages is not None and not assist_attempted:
-      assist_attempted = True
-      try:
-        for msg in assist_messages:
-          pigeon.send_with_ack(msg, ack=UBLOX_ASSIST_ACK)
-        cloudlog.warning("AssistNow messages sent")
-      except Exception:
-        cloudlog.warning("failed to send AssistNow messages")
-
     dat = pigeon.receive()
     if len(dat) > 0:
-      if dat[0] == 0x00:
+      # A fragmented response can begin with zero-valued payload bytes. Let the
+      # assistance decoder finish it instead of resetting during identification.
+      if dat[0] == 0x00 and not assistance.busy and not assistance.partial_frame:
         cloudlog.warning("received invalid data from ublox, re-initing!")
+        assist_session.cancelled.set()
         init(pigeon)
-        assist_attempted = False
+        assist_session, assistance = start_assistance()
         continue
 
       # send out to socket
@@ -318,13 +349,26 @@ def run_receiving(duration: int = 0):
       msg.ubloxRaw = dat[:]
       pm.send('ubloxRaw', msg)
 
-      # save almanac every 5 minutes
-      if (time.monotonic() - last_almanac_save) > 60*5:
-        save_almanac(pigeon)
-        last_almanac_save = time.monotonic()
-    else:
+    outgoing, status = assistance.update(dat, time.monotonic())
+    for message in outgoing:
+      try:
+        pigeon.send(message)
+      except Exception:
+        assistance.send_failed()
+        cloudlog.warning("failed to send GPS assistance message")
+        break
+    for message in status:
+      cloudlog.warning(message)
+
+    # Do not consume probe or MGA acknowledgements while saving the almanac.
+    if dat and not assistance.busy and (time.monotonic() - last_almanac_save) > 60*5:
+      save_almanac(pigeon)
+      last_almanac_save = time.monotonic()
+    if not dat:
       # prevent locking up a CPU core if ublox disconnects
       time.sleep(0.001)
+  assist_session.cancelled.set()
+  replace_pending(None)
 
 
 def main():
