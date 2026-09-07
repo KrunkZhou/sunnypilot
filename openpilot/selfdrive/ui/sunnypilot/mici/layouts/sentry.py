@@ -37,13 +37,9 @@ DOOR_PAUSE_HELP = (
 LOCK_DETECTION_HELP = (
   "Optional, off by default: infer lock/unlock from indicator flashes while parked on a validated Audi MQB CAN profile. " +
   "This is a heuristic, not a verified door-lock signal; vehicle behavior can differ. " +
-  "One qualifying flash infers locked and starts 90 seconds of arming immediately, without checking door closure. " +
-  "This bypasses the driver-exit and five-minute door waits. " +
-  "Open doors or loss of the door receiver do not reset this lock timer. " +
+  "One qualifying flash infers locked and starts 90 seconds of arming after all doors and the trunk close. " +
   "Two qualifying flashes infer unlocked and pause all automatic motion and door captures for 60 minutes. " +
-  "After that hour, all doors and the trunk must be observed closed before a new 90-second arming timer; reopening resets that timer. " +
   "Hazard flashes are ignored. Restarting during an unlock pause restarts the full 60 minutes. " +
-  "Restarting during lock-triggered arming starts a fresh 90 seconds without checking doors. " +
   "Manual tests and queued uploads continue during the pause."
 )
 LOCK_DETECTION_STATES = ("flash_classifying", "unlock_paused", "lock_waiting_for_doors")

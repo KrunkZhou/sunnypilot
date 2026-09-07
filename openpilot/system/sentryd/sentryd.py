@@ -287,11 +287,6 @@ class SentryMode:
   def _flash_blocks_automatic(self) -> bool:
     return self._flash_classifying() or self.pending_lock_control is not None or self.lock_control != "none"
 
-  def _lock_rearm_requires_doors(self) -> bool:
-    # A recognized lock starts arming immediately. Only automatic rearming
-    # after the unlock pause still waits for an observed all-closed state.
-    return self.lock_control == "rearm" and self.last_lock_inference != "locked"
-
   def _request_lock_control(self, state: str, inferred: str | None, now: float, *, clear_door_pause: bool = True) -> None:
     # Publish the in-memory hold before the fallible transaction. Retries never
     # restart a countdown; only a newly recognized unlock or daemon restart does.
@@ -340,7 +335,7 @@ class SentryMode:
       if self.pending_lock_control is not None:
         return False
     if self.lock_control == "rearm":
-      if self._lock_rearm_requires_doors() and (self.door_previous is None or self.door_previous or not self.door_queue_drained):
+      if self.door_previous is None or self.door_previous or not self.door_queue_drained:
         self.lock_arm_started_at = None
         self.arm_started_at = None
         self.state = "lock_waiting_for_doors"
@@ -385,16 +380,14 @@ class SentryMode:
       generation = getattr(self.door_source, "generation", 0)
       if generation != self.door_generation:
         self.door_previous = None
-        if self._lock_rearm_requires_doors():
-          self.lock_arm_started_at = None
+        self.lock_arm_started_at = None
         if self.door_generation is not None and self.door_paused:
           self.door_closed_at = None
         self.door_generation = generation
     except (OSError, RuntimeError, ValueError) as exc:
       samples = []
       self.door_previous = None
-      if self._lock_rearm_requires_doors():
-        self.lock_arm_started_at = None
+      self.lock_arm_started_at = None
       self.flash_detector.reset(require_quiet=True)
       self.flash_result = None
       if self.door_paused:
@@ -408,7 +401,7 @@ class SentryMode:
       opened = sample.open_doors
       newly_open = opened - self.door_previous if self.door_previous is not None else frozenset()
       self.door_previous = opened
-      if opened and self._lock_rearm_requires_doors():
+      if opened and self.lock_control == "rearm":
         self.lock_arm_started_at = None
         self.arm_started_at = None
       if newly_open and self._monitoring_ready(now, ignore_flash=True):
@@ -1050,7 +1043,7 @@ class SentryMode:
     elif self._flash_classifying():
       state = "classifying"
     elif self.lock_control == "rearm":
-      state = "waiting_for_doors" if self._lock_rearm_requires_doors() and self.lock_arm_started_at is None else "arming"
+      state = "waiting_for_doors" if self.lock_arm_started_at is None else "arming"
     elif self.light_error or self.flash_detector.error:
       state = "unavailable"
     else:
@@ -1065,7 +1058,7 @@ class SentryMode:
                                   max(0.0, self.arm_started_at + ARM_DELAY_SECONDS - now)
                                   if self.lock_control == "rearm" and self.arm_started_at is not None else None),
       "error": ((self.door_error or "Waiting for fresh door/trunk CAN data.")
-                if self._lock_rearm_requires_doors() and self.door_previous is None else
+                if self.lock_control == "rearm" and self.door_previous is None else
                 self.light_error or self.flash_detector.error) if self.config.infer_lock_from_flashes else None,
     }
 

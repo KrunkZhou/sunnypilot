@@ -182,7 +182,7 @@ def test_unlock_expiry_requires_all_closed_then_full_ninety_seconds(lock_mode):
 
 
 @pytest.mark.parametrize("previous_gate", ("unlock_pause", "door_pause", "driver_exit"))
-def test_single_flash_overrides_other_parking_waits_with_immediate_arming(lock_mode, previous_gate):
+def test_single_flash_overrides_other_parking_waits_with_closed_door_arming(lock_mode, previous_gate):
   mode = lock_mode
   if previous_gate == "unlock_pause":
     flashes(mode, 2)
@@ -206,120 +206,36 @@ def test_single_flash_overrides_other_parking_waits_with_immediate_arming(lock_m
   assert mode.state == "armed" and mode.lock_control == "none"
 
 
-def begin_rearm(mode, inferred):
-  if inferred == "locked":
-    recognized = flashes(mode, 1)
-  else:
-    recognized = flashes(mode, 2) + UNLOCK_PAUSE_SECONDS
-    observe(mode, recognized, DoorSample(False, recognized))
-  assert mode.lock_control == "rearm" and mode.lock_arm_started_at == recognized
-  return recognized
-
-
-@pytest.mark.parametrize("inferred", ("locked", "unlocked"))
-def test_reopening_only_resets_unlock_expiry_arming_and_normal_can_sleep_resets_neither(lock_mode, inferred):
-  mode = lock_mode
-  recognized = begin_rearm(mode, inferred)
-  opened = recognized + 45.0
-  observe(mode, opened, DoorSample(False, opened, passenger_open=True))
-  assert mode.lock_arm_started_at == (recognized if inferred == "locked" else None)
-  assert mode.state == ("arming" if inferred == "locked" else "lock_waiting_for_doors")
-  closed = opened + 0.1
-  observe(mode, closed, DoorSample(False, closed))
-  started = recognized if inferred == "locked" else closed
-  mode.door_source.error = "No fresh door CAN samples"
-  mode.door_source.light_error = "No fresh indicator CAN samples"
-  send_sample(mode, started + ARM_DELAY_SECONDS - 0.001, 0.1)
-  assert mode.lock_arm_started_at == started and mode.lock_control == "rearm"
-  send_sample(mode, started + ARM_DELAY_SECONDS + 1e-9, 0.2)
-  assert mode.state == "armed" and mode.lock_control == "none"
-
-
-@pytest.mark.parametrize("inferred", ("locked", "unlocked"))
-@pytest.mark.parametrize("interruption", ("generation", "receiver_error"))
-def test_door_receiver_interruption_only_resets_unlock_expiry_arming(lock_mode, monkeypatch, inferred, interruption):
-  mode = lock_mode
-  recognized = begin_rearm(mode, inferred)
-  original = mode.door_source.poll
-  if interruption == "generation":
-    mode.door_source.generation += 1
-  else:
-    def receiver_error(*_args, **_kwargs):
-      raise OSError("door CAN receiver unavailable")
-    monkeypatch.setattr(mode.door_source, "poll", receiver_error)
-  send_sample(mode, recognized + 45, 0.0)
-  assert mode.door_previous is None
-  assert mode.lock_arm_started_at == (recognized if inferred == "locked" else None)
-  monkeypatch.setattr(mode.door_source, "poll", original)
-  send_sample(mode, recognized + 50, 0.0)
-  assert mode.lock_arm_started_at == (recognized if inferred == "locked" else None)
-  assert mode.door_previous is None  # Receiver recovery is not an observed close.
-  send_sample(mode, recognized + ARM_DELAY_SECONDS + 1e-9, 0.0)
-  if inferred == "locked":
-    assert mode.state == "armed" and mode.lock_control == "none"
-  else:
-    assert mode.state == "lock_waiting_for_doors" and mode.lock_control == "rearm"
-    at = mode.clock() + 0.1
-    observe(mode, at, DoorSample(False, at))
-    assert mode.lock_arm_started_at == at
-
-
-@pytest.mark.parametrize("door_status", ("missing", "stale", "driver_open", "trunk_open"))
-def test_recognized_lock_starts_ninety_seconds_without_any_closed_door_check(lock_mode, door_status):
-  mode = lock_mode
-  mode.config = replace(mode.config, wait_for_driver_exit=True)
-  mode.config_store.config = mode.config
-  mode.driver_exit_completed = False
-  start = round(mode.clock() + 0.02, 9)
-  recognized = round(start + 4.7, 9)
-  if door_status in ("missing", "stale"):
-    mode.door_previous = None
-    mode.door_source.error = "Door CAN samples are unavailable" if door_status == "missing" else "Door CAN samples are stale"
-    doors = ()
-  else:
-    doors = (DoorSample(door_status == "driver_open", recognized, trunk_open=door_status == "trunk_open"),)
-  light_batch(mode, start, recognized, [(2.3, 2.7)], doors=doors)
-  assert mode.last_lock_inference == "locked" and mode.lock_arm_started_at == recognized
-  assert mode.state == "arming" and mode.state_error is None
-  assert mode.driver_exit_completed and mode.active_event_id is None
-  assert mode._lock_status(recognized)["state"] == "arming"
-  assert mode._lock_status(recognized)["error"] is None
-  assert "error" not in mode.last_status
-  send_sample(mode, recognized + ARM_DELAY_SECONDS - 0.001, 0.1)
-  assert mode.state == "arming" and mode.lock_arm_started_at == recognized
-  assert mode._lock_status(mode.clock())["state"] == "arming"
-  assert "door" not in (mode._lock_status(mode.clock())["error"] or "").lower()
-  send_sample(mode, recognized + ARM_DELAY_SECONDS + 1e-9, 0.2)
-  assert mode.state == "armed" and mode.lock_control == "none"
-  assert mode.store.get_lock_control() == ("none", None)
-  assert mode.active_event_id is None and not mode.capture_queue
-
-
-def test_lock_arming_ignores_door_edges_but_ordinary_door_events_resume_after_arming(lock_mode):
+def test_door_reopening_resets_lock_arming_but_normal_can_sleep_does_not(lock_mode):
   mode = lock_mode
   recognized = flashes(mode, 1)
-  observe(mode, recognized + 30, DoorSample(True, recognized + 30))
-  observe(mode, recognized + 40, DoorSample(False, recognized + 40))
-  assert mode.lock_arm_started_at == recognized
-  assert mode.store.connection.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
-  send_sample(mode, recognized + ARM_DELAY_SECONDS + 1e-9, 0.0)
-  assert mode.state == "armed"
-  opened = mode.clock() + 0.1
-  observe(mode, opened, DoorSample(False, opened, trunk_open=True))
-  assert mode.door_paused and mode.store.get_door_pause()
-  finish_door_pairs(mode)
-  pending = mode.store.next_pending(0)
-  assert pending is not None and pending.metadata["source"] == "door_open"
-  assert pending.revision == 1 and mode.capture.pairs == 1
+  opened = recognized + 45.0
+  observe(mode, opened, DoorSample(False, opened, passenger_open=True))
+  assert mode.lock_arm_started_at is None and mode.state == "lock_waiting_for_doors"
+  closed = opened + 0.1
+  observe(mode, closed, DoorSample(False, closed))
+  mode.door_source.error = "No fresh door CAN samples"
+  mode.door_source.light_error = "No fresh indicator CAN samples"
+  send_sample(mode, closed + ARM_DELAY_SECONDS - 0.001, 0.1)
+  assert mode.lock_arm_started_at == closed and mode.lock_control == "rearm"
+  send_sample(mode, closed + ARM_DELAY_SECONDS, 0.2)
+  assert mode.state == "armed" and mode.lock_control == "none"
 
 
-@pytest.mark.parametrize("control,inferred", (("unlock_pause", "unlocked"), ("rearm", "locked"), ("rearm", "unlocked")))
-def test_restart_restores_pause_or_source_specific_fresh_rearm(lock_mode, control, inferred):
+def test_new_door_subscription_requires_new_closed_observation(lock_mode):
   mode = lock_mode
-  if control == "unlock_pause":
-    flashes(mode, 2)
-  else:
-    begin_rearm(mode, inferred)
+  recognized = flashes(mode, 1)
+  mode.door_source.generation += 1
+  send_sample(mode, recognized + 45, 0.0)
+  assert mode.lock_arm_started_at is None and mode.door_previous is None
+  send_sample(mode, recognized + ARM_DELAY_SECONDS + 100, 0.0)
+  assert mode.state == "lock_waiting_for_doors" and mode.lock_control == "rearm"
+
+
+@pytest.mark.parametrize("control", ("unlock_pause", "rearm"))
+def test_restart_restores_full_unlock_pause_or_fresh_closed_door_rearm(lock_mode, control):
+  mode = lock_mode
+  flashes(mode, 2 if control == "unlock_pause" else 1)
   restart_at = mode.clock() + 30
   with restart(mode, restart_at) as restarted:
     assert restarted.lock_control == control and restarted.door_previous is None
@@ -328,17 +244,6 @@ def test_restart_restores_pause_or_source_specific_fresh_rearm(lock_mode, contro
       send_sample(restarted, restarted.unlock_pause_until - 0.001, 0.0)
       assert restarted.lock_control == "unlock_pause"
       send_sample(restarted, restarted.unlock_pause_until, 0.0)
-    elif inferred == "locked":
-      send_sample(restarted, restart_at, 0.0)
-      assert restarted.lock_arm_started_at == restart_at
-      assert restarted.state == "arming" and restarted.door_previous is None
-      assert restarted._lock_status(restart_at)["state"] == "arming"
-      send_sample(restarted, restart_at + ARM_DELAY_SECONDS - 0.001, 0.0)
-      assert restarted.lock_control == "rearm"
-      send_sample(restarted, restart_at + ARM_DELAY_SECONDS + 1e-9, 0.0)
-      assert restarted.lock_control == "none" and restarted.state == "armed"
-      assert restarted.store.get_lock_control() == ("none", None)
-      return
     else:
       send_sample(restarted, restart_at + ARM_DELAY_SECONDS + 1, 0.0)
     assert restarted.state == "lock_waiting_for_doors" and restarted.lock_arm_started_at is None
