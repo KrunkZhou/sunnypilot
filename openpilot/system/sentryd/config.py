@@ -14,7 +14,7 @@ from pathlib import Path
 from uuid import uuid4
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 CURRENT_CONSENT_VERSION = 1
 DEFAULT_ROOT = "/data/sentry"
 MAX_CONFIG_FILE_SIZE = 128
@@ -22,7 +22,9 @@ SENSITIVITY_TO_THRESHOLD = {"high": 0.02, "standard": 0.04, "low": 0.08}
 ALLOWED_MOTION_THRESHOLDS = tuple(SENSITIVITY_TO_THRESHOLD.values())
 LEGACY_HIGH_MOTION_THRESHOLD = 0.01
 READABLE_MOTION_THRESHOLDS = (*ALLOWED_MOTION_THRESHOLDS, LEGACY_HIGH_MOTION_THRESHOLD)
-ALLOWED_WARNING_PERSISTENCE = (0.5, 1.0, 2.0, 5.0)
+WARNING_PERSISTENCE_SECONDS = 1.0
+ALLOWED_WARNING_PERSISTENCE = (WARNING_PERSISTENCE_SECONDS,)
+LEGACY_WARNING_PERSISTENCE = (0.5, 1.0, 2.0, 5.0)
 
 CONFIG_FIELDS = (
   "schema_version",
@@ -51,7 +53,7 @@ class SentryConfig:
   enabled: bool = False
   capture_upload_consent_version: int = 0
   motion_threshold_mps2: float = 0.04
-  warning_persistence_seconds: float = 1.0
+  warning_persistence_seconds: float = WARNING_PERSISTENCE_SECONDS
   wait_for_driver_exit: bool = True
 
   @property
@@ -169,6 +171,16 @@ class SentryConfigStore:
       else:
         current = replace(current, wait_for_driver_exit=staged == "1")
         self._fsync_directory(self.config_dir)
+    if current.schema_version < SCHEMA_VERSION:
+      # The fixed confirmation rule replaces every valid legacy warning delay.
+      # A retry after a crash may already see 1: sync that staged value and its
+      # directory entry before committing the new schema marker.
+      if current.warning_persistence_seconds != WARNING_PERSISTENCE_SECONDS:
+        self._write_field_locked("warning_persistence_seconds", WARNING_PERSISTENCE_SECONDS)
+      else:
+        self._read_field_locked("warning_persistence_seconds", sync=True)
+        self._fsync_directory(self.config_dir)
+      current = replace(current, warning_persistence_seconds=WARNING_PERSISTENCE_SECONDS)
       self._write_field_locked("schema_version", SCHEMA_VERSION)
       current = replace(current, schema_version=SCHEMA_VERSION)
     return current
@@ -293,7 +305,7 @@ class SentryConfigStore:
   def _load_locked(self) -> SentryConfig:
     self._validate_directory(self.config_dir, "Sentry configuration directory")
     schema_version = _parse_canonical_integer(self._read_field_locked("schema_version"), "schema_version")
-    if schema_version not in (1, SCHEMA_VERSION):
+    if schema_version not in (1, 2, SCHEMA_VERSION):
       raise SentryConfigError(f"unsupported Sentry configuration schema version: {schema_version}")
     values = {name: self._read_field_locked(name) for name in CONFIG_FIELDS
               if name not in ("schema_version", "wait_for_driver_exit")}
@@ -309,7 +321,8 @@ class SentryConfigStore:
       raise SentryConfigError("invalid capture/upload consent version")
     threshold = _parse_canonical_choice(values["motion_threshold_mps2"], READABLE_MOTION_THRESHOLDS,
                                         "motion_threshold_mps2")
-    warning = _parse_canonical_choice(values["warning_persistence_seconds"], ALLOWED_WARNING_PERSISTENCE,
+    warning_choices = LEGACY_WARNING_PERSISTENCE if schema_version < SCHEMA_VERSION else ALLOWED_WARNING_PERSISTENCE
+    warning = _parse_canonical_choice(values["warning_persistence_seconds"], warning_choices,
                                       "warning_persistence_seconds")
     return SentryConfig(
       schema_version=schema_version,
@@ -425,13 +438,7 @@ class SentryConfigStore:
         config = replace(config, motion_threshold_mps2=threshold)
       except SentryConfigError:
         pass
-    warning = self._read_legacy("SentryModeWarningTime")
-    if warning is not None:
-      try:
-        config = replace(config, warning_persistence_seconds=_parse_exact_float(
-          warning, ALLOWED_WARNING_PERSISTENCE, "warning_persistence_seconds"))
-      except SentryConfigError:
-        pass
+    # Legacy warning delays are superseded by the fixed confirmation rule.
     # Never migrate enablement or consent. Both require a new explicit consent flow.
     return config, removable
 

@@ -69,10 +69,7 @@ def test_consent_is_committed_before_enablement(tmp_path, monkeypatch) -> None:
   ("set_motion_threshold", "motion_threshold_mps2", 0.02),
   ("set_motion_threshold", "motion_threshold_mps2", 0.04),
   ("set_motion_threshold", "motion_threshold_mps2", 0.08),
-  ("set_warning_persistence", "warning_persistence_seconds", 0.5),
   ("set_warning_persistence", "warning_persistence_seconds", 1.0),
-  ("set_warning_persistence", "warning_persistence_seconds", 2.0),
-  ("set_warning_persistence", "warning_persistence_seconds", 5.0),
   ("set_wait_for_driver_exit", "wait_for_driver_exit", False),
   ("set_wait_for_driver_exit", "wait_for_driver_exit", True),
 ])
@@ -117,14 +114,14 @@ def test_post_replace_directory_sync_failure_surfaces_but_new_value_is_authorita
 
   monkeypatch.setattr(store, "_fsync_directory", fail_config_directory_sync)
   with pytest.raises(SentryConfigError, match="directory sync failure"):
-    store.set_warning_persistence(5.0)
+    store.set_motion_threshold(0.08)
   monkeypatch.setattr(store, "_fsync_directory", original_sync)
-  assert store.load().warning_persistence_seconds == 5.0
+  assert store.load().motion_threshold_mps2 == 0.08
 
 
 @pytest.mark.parametrize(("field", "value"), [
   ("enabled", "yes\n"),
-  ("schema_version", "3\n"),
+  ("schema_version", "4\n"),
   ("schema_version", "01\n"),
   ("capture_upload_consent_version", "+1\n"),
   ("motion_threshold_mps2", "nan\n"),
@@ -132,6 +129,9 @@ def test_post_replace_directory_sync_failure_surfaces_but_new_value_is_authorita
   ("motion_threshold_mps2", "0.010\n"),
   ("motion_threshold_mps2", "0.040\n"),
   ("warning_persistence_seconds", "3\n"),
+  ("warning_persistence_seconds", "0.5\n"),
+  ("warning_persistence_seconds", "2\n"),
+  ("warning_persistence_seconds", "5\n"),
   ("warning_persistence_seconds", "1.0\n"),
   ("warning_persistence_seconds", " 1\n"),
   ("warning_persistence_seconds", "1\n\n"),
@@ -219,7 +219,7 @@ def test_imports_only_valid_legacy_tuning_and_requires_fresh_consent(tmp_path, l
   store = SentryConfigStore(tmp_path / "sentry", legacy)
   config = store.initialize()
   assert config.motion_threshold_mps2 == 0.02
-  assert config.warning_persistence_seconds == 2.0
+  assert config.warning_persistence_seconds == 1.0
   assert not config.enabled and config.capture_upload_consent_version == 0
   assert not (legacy / "SentryModeSensitivity").exists()
   assert not (legacy / "SentryModeWarningTime").exists()
@@ -325,7 +325,6 @@ def test_saved_high_migrates_only_threshold_and_preserves_consent_and_data(tmp_p
   store.initialize()
   if enabled:
     store.enable_with_consent()
-  store.set_warning_persistence(5.0)
   threshold = store.config_dir / "motion_threshold_mps2"
   threshold.write_text("0.01\n")
   original = {path.name: path.read_bytes() for path in store.config_dir.iterdir() if path != threshold}
@@ -357,7 +356,7 @@ def test_high_migration_never_overwrites_incomplete_or_corrupt_configuration(tmp
   if corruption == "missing":
     (store.config_dir / "enabled").unlink()
   elif corruption == "future":
-    (store.config_dir / "schema_version").write_text("3\n")
+    (store.config_dir / "schema_version").write_text("4\n")
   elif corruption == "invalid":
     (store.config_dir / "warning_persistence_seconds").write_text("bad\n")
   else:
@@ -509,12 +508,12 @@ def test_schema_one_migration_preserves_config_and_queue(tmp_path, entrypoint, l
   store.initialize()
   store.enable_with_consent()
   store.set_motion_threshold(0.08)
-  store.set_warning_persistence(5.0)
   downgrade_to_schema_one(store)
+  (store.config_dir / "warning_persistence_seconds").write_text("5\n")
   if legacy_high:
     (store.config_dir / "motion_threshold_mps2").write_text("0.01\n")
   preserved = {name: (store.config_dir / name).read_bytes() for name in (
-    "enabled", "capture_upload_consent_version", "warning_persistence_seconds")}
+    "enabled", "capture_upload_consent_version")}
   (store.root / "outbox.sqlite3").write_bytes(b"pending queue")
   media = store.root / "media"
   media.mkdir(mode=0o700)
@@ -522,7 +521,9 @@ def test_schema_one_migration_preserves_config_and_queue(tmp_path, entrypoint, l
   lock_inode = store.lock_path.stat().st_ino
 
   result = getattr(store, entrypoint)()
-  assert result.schema_version == SCHEMA_VERSION == 2
+  assert result.schema_version == SCHEMA_VERSION == 3
+  assert result.warning_persistence_seconds == 1.0
+  assert (store.config_dir / "warning_persistence_seconds").read_text() == "1\n"
   assert result.wait_for_driver_exit and result.effective_enabled
   assert result.motion_threshold_mps2 == (0.02 if legacy_high else 0.08)
   assert {name: (store.config_dir / name).read_bytes() for name in preserved} == preserved
@@ -537,7 +538,7 @@ def test_schema_one_migration_preserves_config_and_queue(tmp_path, entrypoint, l
   ("set_enabled", (False,), "enabled", False),
   ("enable_with_consent", (), "enabled", True),
   ("set_motion_threshold", (0.08,), "motion_threshold_mps2", 0.08),
-  ("set_warning_persistence", (5.0,), "warning_persistence_seconds", 5.0),
+  ("set_warning_persistence", (1.0,), "warning_persistence_seconds", 1.0),
   ("set_wait_for_driver_exit", (False,), "wait_for_driver_exit", False),
 ])
 def test_setters_complete_pending_schema_migration(tmp_path, method, args, attribute, value):
@@ -559,7 +560,7 @@ def test_driver_exit_setter_rejects_non_boolean_types(tmp_path, value):
   assert store.load().wait_for_driver_exit
 
 
-@pytest.mark.parametrize("schema", [1, 2])
+@pytest.mark.parametrize("schema", [1, 2, 3])
 @pytest.mark.parametrize("corruption", ["malformed", "oversized", "symlink", "directory", "fifo", "permissions"])
 def test_driver_exit_configuration_fails_closed_without_repair(tmp_path, schema, corruption):
   store = make_store(tmp_path)
@@ -588,9 +589,11 @@ def test_driver_exit_configuration_fails_closed_without_repair(tmp_path, schema,
   assert (store.config_dir / "schema_version").read_text() == f"{schema}\n"
 
 
-def test_schema_two_missing_driver_exit_field_is_not_migrated_or_repaired(tmp_path):
+@pytest.mark.parametrize("schema", [2, 3])
+def test_current_and_schema_two_missing_driver_exit_field_is_not_migrated_or_repaired(tmp_path, schema):
   store = make_store(tmp_path)
   store.initialize()
+  (store.config_dir / "schema_version").write_text(f"{schema}\n")
   field = store.config_dir / "wait_for_driver_exit"
   field.unlink()
   for action in (store.load, store.initialize, lambda: store.set_wait_for_driver_exit(False)):
@@ -726,7 +729,7 @@ def test_schema_marker_directory_sync_failure_surfaces_without_erasing_complete_
   original_sync = store._fsync_directory
 
   def fail_marker_sync(path):
-    if path == store.config_dir and (path / "schema_version").read_text() == "2\n":
+    if path == store.config_dir and (path / "schema_version").read_text() == f"{SCHEMA_VERSION}\n":
       raise SentryConfigError("simulated schema marker directory fsync failure")
     original_sync(path)
 
@@ -736,3 +739,117 @@ def test_schema_marker_directory_sync_failure_surfaces_without_erasing_complete_
   monkeypatch.setattr(store, "_fsync_directory", original_sync)
   assert store.load() == SentryConfig()
   assert (store.config_dir / "wait_for_driver_exit").read_text() == "1\n"
+
+
+@pytest.mark.parametrize("value", [0.5, 2.0, 5.0, 0, float("nan"), float("inf")])
+def test_fixed_warning_setter_rejects_previous_tuning_values(tmp_path, value):
+  store = make_store(tmp_path)
+  store.initialize()
+  before = {path.name: path.read_bytes() for path in store.config_dir.iterdir()}
+  with pytest.raises(SentryConfigError):
+    store.set_warning_persistence(value)
+  assert {path.name: path.read_bytes() for path in store.config_dir.iterdir()} == before
+
+
+@pytest.mark.parametrize("schema", [1, 2])
+@pytest.mark.parametrize("warning", ["0.5", "1", "2", "5"])
+@pytest.mark.parametrize(("enabled", "consent", "driver_exit"), [
+  (False, 0, True), (False, 1, False), (True, 1, True), (True, 1, False),
+])
+def test_legacy_warning_migrates_to_fixed_one_without_changing_other_settings(tmp_path, schema, warning, enabled, consent, driver_exit):
+  store = make_store(tmp_path)
+  store.initialize()
+  if consent:
+    store.enable_with_consent()
+  store.set_enabled(enabled)
+  store.set_motion_threshold(0.08)
+  store.set_wait_for_driver_exit(driver_exit)
+  (store.config_dir / "schema_version").write_text(f"{schema}\n")
+  field = store.config_dir / "warning_persistence_seconds"
+  field.write_text(f"{warning}\n")
+  preserved = {path.name: path.read_bytes() for path in store.config_dir.iterdir()
+               if path.name not in ("schema_version", "warning_persistence_seconds")}
+  lock_inode = store.lock_path.stat().st_ino
+  (store.root / "outbox.sqlite3").write_bytes(b"retained queue")
+  result = store.load()
+  assert result.schema_version == 3
+  assert result.warning_persistence_seconds == 1.0
+  assert result.enabled is enabled and result.capture_upload_consent_version == consent
+  assert result.wait_for_driver_exit is driver_exit and result.motion_threshold_mps2 == 0.08
+  assert field.read_text() == "1\n" and field.stat().st_mode & 0o777 == 0o600
+  assert {name: (store.config_dir / name).read_bytes() for name in preserved} == preserved
+  assert store.lock_path.stat().st_ino == lock_inode
+  assert (store.root / "outbox.sqlite3").read_bytes() == b"retained queue"
+  inode = field.stat().st_ino
+  assert store.initialize() == result
+  assert field.stat().st_ino == inode
+
+
+@pytest.mark.parametrize("failure_stage", ["file", "directory", "marker", "staged_file", "staged_directory"])
+def test_fixed_warning_migration_crash_keeps_old_marker_and_retries(tmp_path, monkeypatch, failure_stage):
+  store = make_store(tmp_path)
+  store.initialize()
+  store.enable_with_consent()
+  marker = store.config_dir / "schema_version"
+  marker.write_text("2\n")
+  warning = store.config_dir / "warning_persistence_seconds"
+  warning.write_text("1\n" if failure_stage.startswith("staged") else "5\n")
+  original_fsync, original_sync, original_write = os.fsync, store._fsync_directory, store._write_field_locked
+
+  def fail_file(_fd):
+    raise OSError(28, "simulated warning fsync failure")
+
+  def fail_directory(path):
+    if path == store.config_dir:
+      raise SentryConfigError("simulated warning directory fsync failure")
+    original_sync(path)
+
+  def fail_marker(name, value):
+    if name == "schema_version":
+      assert warning.read_text() == "1\n"
+      raise SentryConfigError("simulated crash before schema marker")
+    original_write(name, value)
+
+  if failure_stage.endswith("file"):
+    monkeypatch.setattr(os, "fsync", fail_file)
+  elif failure_stage.endswith("directory"):
+    monkeypatch.setattr(store, "_fsync_directory", fail_directory)
+  else:
+    monkeypatch.setattr(store, "_write_field_locked", fail_marker)
+  with pytest.raises(SentryConfigError, match="simulated"):
+    store.load()
+  assert marker.read_text() == "2\n"
+  assert (store.config_dir / "enabled").read_text() == "1\n"
+  monkeypatch.setattr(os, "fsync", original_fsync)
+  monkeypatch.setattr(store, "_fsync_directory", original_sync)
+  monkeypatch.setattr(store, "_write_field_locked", original_write)
+  result = store.load()
+  assert result.schema_version == 3 and result.warning_persistence_seconds == 1.0 and result.effective_enabled
+
+
+@pytest.mark.parametrize("schema", [1, 2, 4])
+@pytest.mark.parametrize("corruption", ["invalid", "oversized", "symlink", "fifo", "permissions"])
+def test_warning_migration_never_repairs_corrupt_or_future_configuration(tmp_path, schema, corruption):
+  store = make_store(tmp_path)
+  store.initialize()
+  marker = store.config_dir / "schema_version"
+  marker.write_text(f"{schema}\n")
+  warning = store.config_dir / "warning_persistence_seconds"
+  if corruption == "invalid":
+    warning.write_text("1.0\n")
+  elif corruption == "oversized":
+    warning.write_bytes(b"1" * 129)
+  elif corruption == "symlink":
+    warning.unlink()
+    warning.symlink_to(marker)
+  elif corruption == "fifo":
+    warning.unlink()
+    os.mkfifo(warning, mode=0o600)
+  else:
+    warning.chmod(0o640)
+  original = warning.lstat()
+  for action in (store.load, store.initialize):
+    with pytest.raises(SentryConfigError):
+      action()
+  assert (warning.lstat().st_ino, warning.lstat().st_mode) == (original.st_ino, original.st_mode)
+  assert marker.read_text() == f"{schema}\n"

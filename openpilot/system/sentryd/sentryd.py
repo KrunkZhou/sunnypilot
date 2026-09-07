@@ -16,7 +16,7 @@ from openpilot.cereal import log
 from openpilot.common.swaglog import cloudlog
 from openpilot.system.sentryd.capture import CaptureResult, SentryCapture
 from openpilot.system.sentryd.config import SentryConfig, SentryConfigError, SentryConfigStore
-from openpilot.system.sentryd.detector import MotionDetector
+from openpilot.system.sentryd.detector import RESET_TIME_SECONDS, WARNING_TRIGGER_COUNT, MotionDetector
 from openpilot.system.sentryd.diagnostics import log_capture_diagnostic
 from openpilot.system.sentryd.door import DriverDoorSource
 from openpilot.system.sentryd.runtime import (
@@ -27,7 +27,7 @@ from openpilot.system.sentryd.runtime import (
   set_status,
   take_command,
 )
-from openpilot.system.sentryd.store import SentryStore
+from openpilot.system.sentryd.store import CaptureDiscarded, SentryStore
 from openpilot.system.sentryd.uploader import SentryUploader
 
 if TYPE_CHECKING:
@@ -44,6 +44,7 @@ CONFIG_LOCK_TIMEOUT_SECONDS = 0.1
 REPEAT_CAPTURE_SECONDS = 1.0
 MAX_FOLLOW_UP_REVISIONS = 20
 EVENT_SCHEMA_VERSION = 2
+DOOR_PAUSE_SECONDS = 300.0
 
 
 @dataclass
@@ -53,6 +54,7 @@ class CaptureJob:
   abort_reason: str | None = None
   finalize_attempts: int = 0
   next_finalize_at: float = 0.0
+  not_before: float = 0.0
 
 
 @dataclass
@@ -65,6 +67,7 @@ class ActiveCapture:
   requests: queue.SimpleQueue[bool] | None = None
   idle_stop: threading.Event = field(default_factory=threading.Event)
   request_started: threading.Event = field(default_factory=threading.Event)
+  event_id: str | None = None
 
 
 class SentryMode:
@@ -90,6 +93,14 @@ class SentryMode:
     self.driver_exit_started_at: float | None = None
     self.driver_door_open_seen = False
     self.driver_exit_completed = False
+    self.door_observation_started_at: float | None = None
+    self.door_previous: frozenset[str] | None = None
+    self.door_generation: int | None = None
+    self.door_samples = []
+    self.door_error: str | None = None
+    self.door_queue_drained = True
+    self.door_closed_at: float | None = None
+    self.pending_door_event: tuple[str, str, str] | None = None
 
     self.config = SentryConfig()
     self.config_error: str | None = None
@@ -108,11 +119,15 @@ class SentryMode:
     self.detector = self._new_detector()
     self.arm_started_at: float | None = None
     self.active_event_id: str | None = None
+    self.active_confirmed = False
+    self.discard_pending = False
     self.active_episode_started_at: str | None = None
     self.next_revision = 2
     self.next_capture_at = float("inf")
     self.last_capture_motion_at = float("-inf")
     self.pending_alarm = False
+    self.cap_pending_event_id: str | None = None
+    self.cap_rearm_until = float("-inf")
     self.capture_queue: list[CaptureJob] = []
     self.active_capture: ActiveCapture | None = None
     self.upload_thread: threading.Thread | None = None
@@ -132,11 +147,18 @@ class SentryMode:
     self.capture_abort_event = threading.Event()
     self.capture_abort_reason: str | None = None
     self.ignition_error: str | None = None
+    try:
+      self.door_paused = self.store.get_door_pause()
+      if self.door_paused:
+        # A durable pause proves the previous session had already armed.
+        self.driver_exit_completed = True
+    except (OSError, sqlite3.Error, ValueError) as exc:
+      self.door_paused = True
+      self._record_persistence_failure("Could not recover Sentry door pause", exc)
 
   def _new_detector(self) -> MotionDetector:
     return MotionDetector(
       threshold_mps2=self.config.motion_threshold_mps2,
-      warning_persistence_seconds=self.config.warning_persistence_seconds,
       clock=self.clock,
     )
 
@@ -210,7 +232,95 @@ class SentryMode:
   def _reset_driver_exit(self) -> None:
     self.driver_exit_started_at = None
     self.driver_door_open_seen = False
-    self.driver_exit_completed = False
+    # A durable door pause was entered only after arming. Telemetry recovery
+    # must not add a new driver-exit gate on top of its five-minute wait.
+    self.driver_exit_completed = self.door_paused
+    self.door_observation_started_at = None
+    self.door_previous = None
+    self.door_samples = []
+
+  def _monitoring_ready(self, now: float) -> bool:
+    return (self.config.effective_enabled and not self.door_paused and self.pending_door_event is None
+            and (not self.config.wait_for_driver_exit or self.driver_exit_completed)
+            and self.arm_started_at is not None and now - self.arm_started_at >= ARM_DELAY_SECONDS
+            and now >= self.cap_rearm_until)
+
+  def _poll_doors(self, now: float) -> None:
+    if self.door_observation_started_at is None:
+      self.door_observation_started_at = now
+    try:
+      samples = self.door_source.poll(now, after=self.door_observation_started_at)
+      self.door_error = self.door_source.error
+      self.door_queue_drained = getattr(self.door_source, "queue_drained", True)
+      generation = getattr(self.door_source, "generation", 0)
+      if generation != self.door_generation:
+        self.door_previous = None
+        if self.door_generation is not None and self.door_paused:
+          self.door_closed_at = None
+        self.door_generation = generation
+    except (OSError, RuntimeError, ValueError) as exc:
+      samples = []
+      self.door_previous = None
+      if self.door_paused:
+        self.door_closed_at = None
+      self.door_queue_drained = False
+      self.door_error = f"Could not read door CAN data: {str(exc)[:256]}"
+    self.door_samples.extend(samples)
+    for sample in samples:
+      opened = sample.open_doors
+      newly_open = opened - self.door_previous if self.door_previous is not None else frozenset()
+      self.door_previous = opened
+      if newly_open and self._monitoring_ready(now):
+        self.pending_door_event = (str(uuid4()), self._utc_now(), "Door opened: " + ", ".join(sorted(newly_open)) + ".")
+        self.door_paused = True  # Block confirmation even if its durable write fails.
+        self.door_closed_at = None
+      if self.door_paused:
+        if opened:
+          self.door_closed_at = None
+        elif self.door_closed_at is None:
+          self.door_closed_at = sample.monotonic_time
+    if self.pending_door_event is not None:
+      self._persist_door_event()
+
+  def _persist_door_event(self) -> None:
+    event_id, detected_at, message = self.pending_door_event
+    try:
+      actual_id, converted = self.store.start_door_event(
+        event_id=event_id, detected_at=detected_at, message=message,
+        provisional_event_id=self.active_event_id if not self.active_confirmed and not self.discard_pending else None,
+      )
+    except (OSError, sqlite3.Error, ValueError) as exc:
+      self._record_persistence_failure("Could not persist silent door capture", exc)
+      return
+    next_capture_at = self.next_capture_at
+    self._close_active_episode()
+    self.detector.reset()
+    # The retained first request stays queued/in flight. Only the second pair
+    # is new; never discard or recapture the first image during conversion.
+    wait_until = max(self.clock(), next_capture_at) if converted and math.isfinite(next_capture_at) else 0.0
+    self.capture_queue.append(CaptureJob(actual_id, 2 if converted else 1, not_before=wait_until))
+    self.pending_door_event = None
+    self.persistence_error = None
+
+  def _door_pause_ready(self, now: float) -> bool:
+    if not self.door_paused:
+      return True
+    self.state = "door_paused"
+    self.state_error = self.door_error if self.door_closed_at is None else None
+    if (self.pending_door_event is not None or not self.door_queue_drained or self.door_closed_at is None
+        or now - self.door_closed_at < DOOR_PAUSE_SECONDS):
+      return False
+    try:
+      self.store.clear_door_pause()
+    except (OSError, sqlite3.Error, ValueError) as exc:
+      self._record_persistence_failure("Could not finish Sentry door pause", exc)
+      return False
+    self.door_paused = False
+    self.door_closed_at = None
+    self.detector.reset()
+    self.arm_started_at = max(now - ARM_DELAY_SECONDS, self.cap_rearm_until - ARM_DELAY_SECONDS)
+    self.state_error = None
+    return True
 
   def _driver_exit_ready(self, now: float) -> bool:
     if not self.config.wait_for_driver_exit or self.driver_exit_completed:
@@ -218,15 +328,11 @@ class SentryMode:
     if self.driver_exit_started_at is None:
       # sentryd starts offroad, so startup/enable is the earliest trustworthy
       # boundary. Never infer an exit from cached onroad carState or door data.
-      self.driver_exit_started_at = now
+      self.driver_exit_started_at = self.door_observation_started_at if self.door_observation_started_at is not None else now
     self.arm_started_at = None
     self.detector.reset()
-    try:
-      samples = self.door_source.poll(now, after=self.driver_exit_started_at)
-      error = self.door_source.error
-    except (OSError, RuntimeError, ValueError) as exc:
-      samples = []
-      error = f"Could not read driver-door CAN data: {str(exc)[:256]}"
+    samples = self.door_samples
+    error = self.door_error
     closed_after_open = False
     for sample in samples:
       if sample.open:
@@ -234,7 +340,7 @@ class SentryMode:
         closed_after_open = False
       elif self.driver_door_open_seen:
         closed_after_open = True
-    if closed_after_open:
+    if closed_after_open and self.door_queue_drained:
       # Process every ordered sample before latching: open/close/open in one
       # receive batch must still wait for the final close. This is an exit
       # sequence, not proof of cabin occupancy. Later episode-cap rearming
@@ -297,7 +403,12 @@ class SentryMode:
         self.state_error = None
 
   def _process_detection(self, detection: str, now: float) -> None:
+    if self.discard_pending and detection in ("motion", "warning", "alarm"):
+      return
     if detection == "motion" and self.active_event_id is None:
+      if self.door_paused or self.capture_queue or (self.active_capture is not None and self.active_capture.job is not None):
+        self.detector.reset()
+        return
       event_id = str(uuid4())
       first_motion = self.detector.first_motion_at if self.detector.first_motion_at is not None else now
       episode_started_at = (datetime.now(UTC) - timedelta(seconds=max(0.0, now - first_motion))).isoformat()
@@ -312,6 +423,7 @@ class SentryMode:
           detected_at=detected_at,
           message="Movement detected while parked.",
           schema_version=EVENT_SCHEMA_VERSION,
+          provisional=True,
         )
       except (OSError, sqlite3.Error, ValueError) as exc:
         self.detector.reset()
@@ -319,6 +431,7 @@ class SentryMode:
         self._record_persistence_failure("Could not persist first Sentry capture", exc)
         return
       self.active_event_id = event_id
+      self.active_confirmed = False
       self.active_episode_started_at = episode_started_at
       self.next_revision = 2
       self.next_capture_at = float("inf")
@@ -326,21 +439,37 @@ class SentryMode:
       self.pending_alarm = False
       self.capture_queue.append(CaptureJob(event_id, 1))
       self.persistence_error = None
-      self.state = "warning" if self.detector.warning_triggered else "motion"
+      self.state = "confirming"
       self.state_error = None
     elif detection == "warning" and self.active_event_id is not None:
-      # Warning persistence is status-only. The first qualifying motion already
-      # queued revision 1 (wire kind="warning" for RTZ compatibility), so this
-      # transition must not create another event, capture, or webhook.
-      self.state = "warning"
+      if self.active_confirmed:
+        return
+      # Drain again before releasing the upload hold, including a door edge
+      # queued while the accelerometer/configuration work ran.
+      self._poll_doors(self.clock())
+      if self.door_paused or not self.door_queue_drained or self.active_event_id is None:
+        return
+      try:
+        confirmed = self.store.confirm_event(self.active_event_id)
+      except (OSError, sqlite3.Error, ValueError) as exc:
+        self._record_persistence_failure("Could not confirm Sentry motion", exc)
+        return
+      if not confirmed:
+        self._close_active_episode()
+        self.detector.reset()
+        return
+      self.active_confirmed = True
+      self.pending_alarm = self.detector.alarm_triggered
+      self.persistence_error = None
+      self.state = "alarm" if self.pending_alarm else "warning"
       self.state_error = None
-    elif detection == "alarm" and self.active_event_id is not None and self.active_episode_started_at is not None:
+    elif detection == "alarm" and self.active_event_id is not None and self.active_episode_started_at is not None and self.active_confirmed:
       # Promotion changes status immediately; its capture obeys the same
       # serial/cooldown limits instead of racing an in-flight follow-up.
       self.pending_alarm = True
       self.state = "alarm"
       self.state_error = None
-    elif detection == "closed":
+    elif detection in ("closed", "discarded"):
       self._close_active_episode()
       self.state = "armed"
 
@@ -358,7 +487,8 @@ class SentryMode:
     recent_motion = self.active_event_id is not None and self._recent_motion(now)
     if not busy and active is not None and not recent_motion and not self.pending_alarm:
       active.idle_stop.set()
-    if self.active_event_id is None or self.active_episode_started_at is None or busy or now < self.next_capture_at:
+    if (self.door_paused or not self.active_confirmed or self.active_event_id is None
+        or self.active_episode_started_at is None or busy or now < self.next_capture_at):
       return
     if self.next_revision > 1 + MAX_FOLLOW_UP_REVISIONS:
       return
@@ -382,6 +512,8 @@ class SentryMode:
       return
     self.capture_queue.append(CaptureJob(self.active_event_id, self.next_revision))
     self.next_revision += 1
+    if self.next_revision > 1 + MAX_FOLLOW_UP_REVISIONS:
+      self.cap_pending_event_id = self.active_event_id
     self.last_capture_motion_at = self.detector.last_motion_at or now
     self.pending_alarm = False
     self.next_capture_at = float("inf")
@@ -389,6 +521,8 @@ class SentryMode:
 
   def _start_capture_if_needed(self) -> None:
     if not self.capture_queue:
+      return
+    if self.clock() < self.capture_queue[0].not_before:
       return
     active = self.active_capture
     if active is not None:
@@ -401,6 +535,7 @@ class SentryMode:
       elif self.capture_queue[0].abort_reason is None:
         active.request_started.clear()
         active.job = self.capture_queue.pop(0)
+        active.event_id = active.job.event_id
         active.requests.put(True)
         return
     job = self.capture_queue[0]
@@ -410,6 +545,9 @@ class SentryMode:
       try:
         self.store.finish_capture(
           job.event_id, job.revision, {}, {"wide": job.abort_reason, "cabin": job.abort_reason})
+      except CaptureDiscarded:
+        self.capture_queue.pop(0)
+        return
       except (OSError, sqlite3.Error, ValueError) as exc:
         if self._revision_is_finalized(job):
           self.capture_queue.pop(0)
@@ -460,7 +598,7 @@ class SentryMode:
 
     thread = threading.Thread(target=capture_worker, name=f"sentry-capture-{job.revision}", daemon=True)
     active_capture = ActiveCapture(job, thread, result, requests=requests if repeated else None,
-                                   idle_stop=idle_stop, request_started=request_started)
+                                   idle_stop=idle_stop, request_started=request_started, event_id=job.event_id)
     self.active_capture = active_capture
     thread.start()
 
@@ -477,6 +615,14 @@ class SentryMode:
     if not active.result and not active.request_started.is_set():
       # A bounded camera session may expire between is_alive() and dispatch.
       # No frame was attempted: retain the durable job for a fresh lease.
+      try:
+        discarded = self.store.revision_state(active.job.event_id, active.job.revision) in (None, "discarding")
+      except (OSError, sqlite3.Error, ValueError) as exc:
+        self._record_persistence_failure("Could not inspect interrupted Sentry capture", exc)
+        return
+      if discarded:
+        self.active_capture = None
+        return
       if self.capture_abort_reason is not None:
         active.job.abort_reason = self.capture_abort_reason
       self.capture_queue.insert(0, active.job)
@@ -490,13 +636,20 @@ class SentryMode:
     try:
       self.store.finish_capture(active.job.event_id, active.job.revision, result.media, result.omissions)
       self.persistence_error = None
+    except CaptureDiscarded:
+      if active.job.event_id == self.active_event_id:
+        self._close_active_episode()
+        self.detector.reset()
+      active.idle_stop.set()
+      self._capture_finalized(active)
+      return
     except Exception as exc:
       try:
         revision_state = self.store.revision_state(active.job.event_id, active.job.revision)
       except Exception:
         revision_state = None
       if revision_state in (
-          "ready", "uploading", "terminal", "acknowledged",
+          "provisional_ready", "ready", "uploading", "terminal", "acknowledged",
           "evicting_ready", "evicting_terminal", "evicting_uncertain"):
         self._capture_finalized(active)
       else:
@@ -507,16 +660,24 @@ class SentryMode:
     self._capture_finalized(active)
 
   def _capture_finalized(self, active: ActiveCapture) -> None:
-    if active.job is not None and active.job.event_id == self.active_event_id:
+    if active.job is not None:
+      # Door revision 2 follows the retained pair, not its initial request time.
+      for job in self.capture_queue:
+        if job.event_id == active.job.event_id and job.revision == active.job.revision + 1:
+          job.not_before = max(job.not_before, self.clock() + REPEAT_CAPTURE_SECONDS)
+    if active.job is not None and (active.job.event_id == self.active_event_id or active.job.event_id == self.cap_pending_event_id):
       if active.job.revision >= 1 + MAX_FOLLOW_UP_REVISIONS:
         # Count alarm and failed-camera revisions too, but only rearm once the
         # last result is durable. Stop the warm session without aborting its
         # already finalized images; upload retries continue during arming.
         active.idle_stop.set()
-        self._close_active_episode()
+        if active.job.event_id == self.active_event_id:
+          self._close_active_episode()
+        self.cap_pending_event_id = None
         self.detector.reset()
         self.arm_started_at = self.clock()
-        self.state = "arming"
+        self.cap_rearm_until = self.arm_started_at + ARM_DELAY_SECONDS
+        self.state = "door_paused" if self.door_paused else "arming"
         self.state_error = None
       else:
         # Start the cooldown only after a result has been durably finalized.
@@ -549,6 +710,8 @@ class SentryMode:
       try:
         self.store.finish_capture(
           job.event_id, job.revision, {}, {"wide": job.abort_reason, "cabin": job.abort_reason})
+      except CaptureDiscarded:
+        continue
       except (OSError, sqlite3.Error, ValueError) as exc:
         had_error = True
         if not self._revision_is_finalized(job):
@@ -613,7 +776,20 @@ class SentryMode:
 
   def _close_active_episode(self) -> None:
     event_id = self.active_event_id
+    if event_id is not None and not self.active_confirmed:
+      self.discard_pending = True
+      try:
+        discarded = self.store.discard_event(event_id)
+      except (OSError, sqlite3.Error, ValueError) as exc:
+        self._record_persistence_failure("Could not discard unconfirmed Sentry capture", exc)
+        return  # Keep its identity so the durable cancellation can be retried.
+      if discarded:
+        self.capture_queue = [job for job in self.capture_queue if job.event_id != event_id]
+        if self.active_capture is not None and self.active_capture.event_id == event_id:
+          self.active_capture.idle_stop.set()
     self.active_event_id = None
+    self.active_confirmed = False
+    self.discard_pending = False
     self.active_episode_started_at = None
     self.pending_alarm = False
     self.next_capture_at = float("inf")
@@ -625,6 +801,14 @@ class SentryMode:
         self.persistence_error = None
       except (OSError, sqlite3.Error, ValueError) as exc:
         self._record_persistence_failure("Could not close Sentry episode", exc)
+
+  def _cleanup_discarded_work(self) -> None:
+    if self.active_capture is not None and self.active_capture.thread.is_alive():
+      return
+    try:
+      self.store.cleanup_discarded_events()
+    except (OSError, sqlite3.Error, ValueError) as exc:
+      self._record_persistence_failure("Could not clean discarded Sentry captures", exc)
 
   def _write_status(self, now: float, *, force: bool = False) -> None:
     if not force and now - self.last_status_refresh < STATUS_REFRESH_SECONDS:
@@ -646,6 +830,20 @@ class SentryMode:
         "required": self.config.wait_for_driver_exit,
         "door_open_seen": self.driver_door_open_seen,
         "completed": self.driver_exit_completed,
+      },
+      "door_pause": {
+        "active": self.door_paused,
+        "waiting_for_close": self.door_paused and self.door_closed_at is None,
+        "waiting_for_status": (self.door_paused and self.door_closed_at is None
+                               and (self.door_previous is None or bool(self.door_error))),
+        "seconds_remaining": (max(0.0, DOOR_PAUSE_SECONDS - (now - self.door_closed_at))
+                              if self.door_paused and self.door_closed_at is not None else None),
+      },
+      "confirmation": {
+        "hits": self.detector.trigger_count,
+        "required_hits": WARNING_TRIGGER_COUNT,
+        "seconds_remaining": (max(0.0, RESET_TIME_SECONDS - (now - self.detector.first_motion_at))
+                              if self.detector.first_motion_at is not None else 0.0),
       },
     }
     error = self.config_error or self.persistence_error or self.runtime_error or self.state_error
@@ -700,18 +898,42 @@ class SentryMode:
 
   def update(self) -> None:
     self.sm.update(0)
-    # SubMaster stamps receive times inside update; sample age must use a clock
-    # read after it returns or a newly received sample can appear to be future-dated.
     now = self.clock()
-    # Physical ignition wins over all filesystem/configuration work. In
-    # particular, do not let a contended config flock delay capture abortion.
     onroad = self._is_onroad()
     if onroad:
       self.capture_abort_event.set()
       self.capture_abort_reason = "ignition_on"
     self._refresh_config(now)
     onroad = onroad or self._is_onroad()
-    enabled = self.config.effective_enabled and not onroad
+    if self.discard_pending:
+      # A failed durable cancellation may never become confirmation of the
+      # same UUID after the detector has reset. Retry even during door pause.
+      self._close_active_episode()
+    self.door_samples = []
+    if onroad:
+      self._close_active_episode()
+      self.pending_door_event = None
+      if self.door_paused and self.ignition_error is None:
+        try:
+          self.store.clear_door_pause()
+          self.door_paused = False
+          self.door_closed_at = None
+        except (OSError, sqlite3.Error, ValueError) as exc:
+          self._record_persistence_failure("Could not clear Sentry door pause on ignition", exc)
+      elif self.door_paused:
+        # Polling is suspended while ignition is unknown: unlike normal CAN
+        # sleep, this interruption requires a new observed all-closed state.
+        self.door_closed_at = None
+    elif self.config.effective_enabled and not self.config_error:
+      # Door edges take priority over capture finalization, upload claims, and
+      # the tenth motion sample. This also keeps polling after the exit latch.
+      self._poll_doors(now)
+      self._door_pause_ready(now)
+    else:
+      self._close_active_episode()
+      self.pending_door_event = None
+
+    enabled = self.config.effective_enabled and not onroad and not self.door_paused
     if enabled != self.last_runtime_enabled or now - self.last_runtime_check >= CONFIG_REFRESH_SECONDS:
       self.last_runtime_check = now
       try:
@@ -729,14 +951,16 @@ class SentryMode:
     elif self.config_error or not self.config.effective_enabled:
       self._abort_capture_work("stale_capture")
     self._finish_capture_if_ready()
+    self._cleanup_discarded_work()
     self._start_upload_if_needed()
 
     if onroad:
       self.state = "disabled"
       self.state_error = self.ignition_error
-      self._close_active_episode()
       self.detector.reset()
       self.arm_started_at = None
+      self.cap_pending_event_id = None
+      self.cap_rearm_until = float("-inf")
       self._reset_driver_exit()
       self._write_status(now)
       return
@@ -753,42 +977,50 @@ class SentryMode:
     if self.active_capture is None:
       self.capture_abort_event.clear()
     self._start_capture_if_needed()
-
-    # Configuration and outbox work can take time; don't accept a sample that
-    # became stale while that work ran.
     now = self.clock()
+    if self.door_paused:
+      self.state = "door_paused"
+      self._write_status(now)
+      return
     if not self._driver_exit_ready(now):
       self._write_status(now)
       return
     now = self.clock()
     if self.arm_started_at is None:
       self.arm_started_at = now
-    elapsed = now - self.arm_started_at
-    accelerometer_error = self._accelerometer_error(now)
-    if elapsed < ARM_DELAY_SECONDS:
+    if now - self.arm_started_at < ARM_DELAY_SECONDS or now < self.cap_rearm_until:
       self.state = "arming"
       self.state_error = None
       self._write_status(now)
       return
 
-    if self.active_event_id is not None and self.next_revision > 1 + MAX_FOLLOW_UP_REVISIONS:
-      # The final allowed revision is queued, capturing, or awaiting a durable
-      # write. Do not let a quiet/sensor gap close it and open another episode
-      # before finalization starts the full arming period.
+    if self.cap_pending_event_id is not None or (
+        self.active_event_id is not None and self.next_revision > 1 + MAX_FOLLOW_UP_REVISIONS):
+      # A door pause or expiry cannot spend the cap's rearming delay before the
+      # final allowed result is durable.
       self._write_status(now)
       return
 
-    if self.state not in ("motion", "warning", "alarm"):
-      if self.detector.episode_active:
-        self.state = ("alarm" if self.detector.alarm_triggered else
-                      "warning" if self.detector.warning_triggered else "motion")
-      else:
-        self.state = "armed"
-      self.state_error = None
+    if (self.active_event_id is not None and not self.active_confirmed and self.detector.previous_sample_at is not None
+        and now - self.detector.previous_sample_at >= self.detector.sample_stale_seconds):
+      # Ten sensor hits do not equal a durable confirmation when its commit
+      # failed. A sampling gap must discard that still-held candidate too.
+      self._close_active_episode()
+      self.detector.reset()
     timeout_detection = self.detector.tick(now)
     if timeout_detection is not None:
       self._process_detection(timeout_detection, now)
+    if self.active_event_id is not None and not self.active_confirmed and not self.detector.episode_active:
+      self._close_active_episode()  # retry a failed durable discard
+    if self.discard_pending:
+      self.detector.reset()
+      self.state = "discarding_capture"
+      self._write_status(now)
+      return
+    accelerometer_error = self._accelerometer_error(now)
     if accelerometer_error is not None:
+      if not self.active_confirmed:
+        self._close_active_episode()
       self.detector.invalidate_samples()
       if self.active_capture is not None and self.active_capture.job is None:
         self.active_capture.idle_stop.set()
@@ -796,17 +1028,36 @@ class SentryMode:
       self.state_error = accelerometer_error
       self._write_status(now)
       return
-    if self.sm.updated.get("accelerometer", False):
+    if self.active_event_id is None and (
+        self.capture_queue or (self.active_capture is not None and self.active_capture.job is not None)):
+      self.detector.reset()
+      self.state = "finishing_capture"
+      self._write_status(now)
+      return
+
+    self.state = ("alarm" if self.detector.alarm_triggered else "warning") if self.active_confirmed else (
+      "confirming" if self.active_event_id is not None else "armed")
+    self.state_error = None
+    detection = None
+    if not self.door_paused and self.sm.updated.get("accelerometer", False):
       try:
         acceleration = self.sm["accelerometer"].acceleration.v
         detection = self.detector.update(acceleration, now)
         if detection is not None:
           self._process_detection(detection, now)
       except (AttributeError, TypeError, ValueError):
+        if not self.active_confirmed:
+          self._close_active_episode()
         self.detector.invalidate_samples()
         self.state = "sensor_unavailable"
         self.state_error = "Accelerometer samples are unavailable"
+    if (detection != "warning" and self.active_event_id is not None and not self.active_confirmed
+        and self.detector.warning_triggered):
+      # Retry only after validating a newly received acceleration vector.
+      self._process_detection("warning", now)
     self._schedule_motion_capture(now)
+    if self.door_paused:
+      self.state = "door_paused"
     self._write_status(now)
 
   def run(self, stop_event: threading.Event | None = None) -> None:
@@ -830,10 +1081,12 @@ class SentryMode:
     finally:
       self.stop_event.set()
       self.capture_abort_event.set()
+      self._close_active_episode()
       if self.active_capture is not None:
         self.active_capture.thread.join(timeout=2.0)
         self._finish_capture_if_ready()
       self._close_active_episode()
+      self._cleanup_discarded_work()
       try:
         if self.last_runtime_enabled is not False:
           set_runtime_enabled(False, self.volatile_params)

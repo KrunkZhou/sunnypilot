@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+import math
 from uuid import uuid4
 
 import pyray as rl
@@ -21,8 +22,18 @@ from openpilot.system.ui.lib.application import gui_app
 from openpilot.system.ui.widgets.scroller import NavScroller
 
 
-WARNING_TO_SECONDS = {"0.5 sec": 0.5, "1 sec": 1.0, "2 sec": 2.0, "5 sec": 5.0}
 STATUS_STALE_SECONDS = 15.0
+CONFIRMATION_HELP = (
+  "The first movement captures a wide-road and cabin photo pair locally. " +
+  "10 qualifying motion samples within 60 seconds confirm the event for upload and an alert. " +
+  "Unconfirmed photos are otherwise discarded when that window expires."
+)
+DOOR_PAUSE_HELP = (
+  "Opening any door or the trunk keeps an unconfirmed first photo pair and takes a new pair. " +
+  "If there is no pending first pair, only the new pair is taken. These door photos upload without a webhook alert. " +
+  "New motion capture pauses until all doors and the trunk have stayed closed for 5 minutes. " +
+  "Earlier confirmed events keep their normal delivery and alerts."
+)
 DRIVER_EXIT_STATUS = {
   "waiting_for_door_open": (
     "waiting for door open",
@@ -49,7 +60,10 @@ class SentryConsentLayoutMici(NavScroller):
     self._scroller.add_widgets([
       GreyBigButton("Sentry Mode", "review before enabling", icon),
       GreyBigButton("wait for driver exit", "On by default: after ignition turns off, open and close the driver's door to start the 90-second arming timer."),
-      GreyBigButton("parked camera capture", "Continuing motion captures wide-road and cabin photos with a one-second minimum interval."),
+      GreyBigButton("motion confirmation", "The first wide + cabin pair waits locally for 10 motion samples within 60 seconds before upload and an alert."),
+      GreyBigButton("unconfirmed photos", "Without confirmation, the first pair is discarded after 60 seconds, unless a door opens."),
+      GreyBigButton("silent door photos", "A door or trunk opening keeps any pending first pair and captures a new pair. Both upload without an alert."),
+      GreyBigButton("door pause", "New motion capture resumes after all doors and the trunk stay closed for 5 minutes."),
       GreyBigButton("capture limit", "First capture plus up to 20 more revisions per episode, then 90 seconds to rearm."),
       GreyBigButton("alert frequency", "Only the first capture in each motion episode sends a webhook alert."),
       GreyBigButton("upload to your RTZ server", "Captures wait securely on this device while offline and upload when connectivity returns."),
@@ -74,7 +88,8 @@ class SentryLayoutMici(NavScroller):
     self.icon = gui_app.texture("icons_mici/settings/device/cameras.png", 64, 64)
     self._enable_toggle = BigToggle("parked Sentry Mode", "wide + cabin", self.config.effective_enabled, self._on_enabled)
     self._sensitivity = BigMultiToggle("motion sensitivity", list(SENSITIVITY_TO_THRESHOLD), select_callback=self._on_sensitivity)
-    self._warning = BigMultiToggle("warning status delay", list(WARNING_TO_SECONDS), select_callback=self._on_warning)
+    self._confirmation = BigButton("motion confirmation", "10 motion samples")
+    self._confirmation.set_click_callback(self._show_confirmation)
     self._wait_for_driver_exit = BigToggle("wait for driver exit", "door open + close before arming",
                                          self.config.wait_for_driver_exit, self._on_wait_for_driver_exit)
     self._status = BigButton("Sentry status", "starting", self.icon)
@@ -94,7 +109,7 @@ class SentryLayoutMici(NavScroller):
     self._scroller.add_widgets([
       self._enable_toggle,
       self._sensitivity,
-      self._warning,
+      self._confirmation,
       self._wait_for_driver_exit,
       self._status,
       self._queue,
@@ -129,8 +144,6 @@ class SentryLayoutMici(NavScroller):
     self._enable_toggle.set_checked(config.effective_enabled)
     self._sensitivity.set_value(next(
       name for name, threshold in SENSITIVITY_TO_THRESHOLD.items() if threshold == config.motion_threshold_mps2))
-    self._warning.set_value(next(
-      name for name, seconds in WARNING_TO_SECONDS.items() if seconds == config.warning_persistence_seconds))
     self._wait_for_driver_exit.set_checked(config.wait_for_driver_exit)
     self._refresh_status()
 
@@ -144,7 +157,12 @@ class SentryLayoutMici(NavScroller):
       state = "configuration error"
     elif self._runtime_status_error(status):
       state = "daemon unavailable"
+    elif state_key == "confirming":
+      state = "confirming motion"
+    elif state_key == "door_paused":
+      state = self._door_pause_text(status)
     self._status.set_value(state)
+    self._confirmation.set_value(self._confirmation_text(status) if state == "confirming motion" else "10 motion samples")
     try:
       stats = read_outbox_stats()
       queued = f"{stats.pending} pending / {stats.media_bytes / (1024 * 1024):.1f} MB"
@@ -171,9 +189,6 @@ class SentryLayoutMici(NavScroller):
 
   def _on_sensitivity(self, value: str) -> None:
     self._write_config(lambda: self.store.set_motion_threshold(SENSITIVITY_TO_THRESHOLD[value]))
-
-  def _on_warning(self, value: str) -> None:
-    self._write_config(lambda: self.store.set_warning_persistence(WARNING_TO_SECONDS[value]))
 
   def _on_wait_for_driver_exit(self, enabled: bool) -> None:
     self._write_config(lambda: self.store.set_wait_for_driver_exit(enabled))
@@ -214,16 +229,50 @@ class SentryLayoutMici(NavScroller):
       description = f"{self.config_error}\n\n{reset_guidance}"
     elif runtime_error:
       description = f"{runtime_error}\n\nRestart the device or inspect sentryd logs if the problem continues."
+    elif status.get("state") == "door_paused":
+      description = f"{self._door_pause_text(status)}.\n\n{DOOR_PAUSE_HELP}"
+      if status.get("error"):
+        description += f"\n\n{status['error']}"
+    elif status.get("state") == "confirming":
+      description = f"{self._confirmation_text(status)}.\n\n{CONFIRMATION_HELP}\n\n{DOOR_PAUSE_HELP}"
     elif status.get("state") in DRIVER_EXIT_STATUS:
       description = DRIVER_EXIT_STATUS[status["state"]][1]
       if status.get("error"):
         description += f"\n\n{status['error']}"
     else:
-      description = ("The first qualifying movement starts capture without waiting for warning. " +
-                     "Warning status delay changes the status only. Captures remain queued until RTZ acknowledges them.")
+      description = f"{CONFIRMATION_HELP}\n\n{DOOR_PAUSE_HELP}"
       if self.config.wait_for_driver_exit:
         description += " After ignition switches off, open and close the driver's door to start the 90-second arming timer."
     gui_app.push_widget(BigDialog("Sentry status", description))
+
+  def _show_confirmation(self) -> None:
+    gui_app.push_widget(BigDialog("motion confirmation", f"{CONFIRMATION_HELP}\n\n{DOOR_PAUSE_HELP}"))
+
+  @staticmethod
+  def _confirmation_text(status: dict) -> str:
+    progress = status.get("confirmation")
+    if not isinstance(progress, dict):
+      return "10 motion samples"
+    hits = progress.get("hits")
+    seconds = progress.get("seconds_remaining")
+    if (type(hits) is not int or progress.get("required_hits") != 10 or
+        type(seconds) not in (int, float) or not math.isfinite(seconds)):
+      return "10 motion samples"
+    return f"{max(0, min(hits, 10))}/10 · {math.ceil(max(0, min(seconds, 60)))} sec left"
+
+  @staticmethod
+  def _door_pause_text(status: dict) -> str:
+    pause = status.get("door_pause")
+    if not isinstance(pause, dict) or not pause.get("active"):
+      return "door pause"
+    if pause.get("waiting_for_status"):
+      return "waiting for door status"
+    if pause.get("waiting_for_close"):
+      return "waiting for doors closed"
+    seconds = pause.get("seconds_remaining")
+    if type(seconds) not in (int, float) or not math.isfinite(seconds):
+      return "waiting for door status"
+    return f"door pause · {math.ceil(max(0, min(seconds, 300)))} sec left"
 
   @staticmethod
   def _runtime_status_error(status: dict) -> str | None:
@@ -239,7 +288,7 @@ class SentryLayoutMici(NavScroller):
       return "Sentry daemon status has an invalid update timestamp."
     if age > STATUS_STALE_SECONDS or age < -60:
       return "Sentry daemon status is stale. Restart the device or inspect sentryd logs."
-    if status.get("error") and status.get("state") not in DRIVER_EXIT_STATUS:
+    if status.get("error") and status.get("state") not in (*DRIVER_EXIT_STATUS, "door_paused"):
       return str(status["error"])
     return None
 

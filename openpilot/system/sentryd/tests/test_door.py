@@ -144,12 +144,14 @@ def test_profile_reads_are_rate_limited_and_changes_fail_closed(source):
   reader, params, socket, opened = source
   socket.events.append(event())
   assert reader.poll(100, after=90)
+  generation = reader.generation
   reader.poll(100.1, after=90)
   assert len(params.reads) == 1
   params.raw = profile(fingerprint="UNKNOWN")
   socket.events.append(event(at=101))
   assert reader.poll(101, after=90) == []
   assert reader._socket is None
+  assert reader.generation > generation  # Profile loss invalidates any paused closure baseline.
   assert reader.error is not None
   assert len(opened) == 1
 
@@ -244,6 +246,9 @@ def test_poll_bounded_to_512_nonblocking_events(source):
   assert len(reader.poll(100.1, after=90)) == door.MAX_EVENTS_PER_POLL
   assert socket.reads == door.MAX_EVENTS_PER_POLL
   assert len(socket.events) == 1
+  assert not reader.queue_drained
+  assert len(reader.poll(100.1, after=90)) == 1
+  assert reader.queue_drained and not socket.events
 
 
 def test_socket_failure_is_reported_and_retried(source, monkeypatch):
@@ -283,3 +288,40 @@ def test_driver_door_bit_mapping_matches_existing_mqb_dbc():
     assert bool(data[door.DRIVER_DOOR_BYTE] & door.DRIVER_DOOR_MASK) == (signal == "ZV_FT_offen")
     parser.update([(100, [(address, data, bus)])])
     assert bool(parser.vl["Gateway_72"]["ZV_FT_offen"]) == (signal == "ZV_FT_offen")
+
+
+@pytest.mark.parametrize("signal, name", [
+  ("ZV_FT_offen", "driver"), ("ZV_BT_offen", "passenger"), ("ZV_HFS_offen", "rear_left"),
+  ("ZV_HBFS_offen", "rear_right"), ("ZV_HD_offen", "trunk"),
+])
+def test_real_dbc_decoder_reports_each_door_and_trunk_independently(source, signal, name):
+  from opendbc.can import CANPacker
+  reader, _, socket, _ = source
+  address, data, bus = CANPacker("vw_mqb").make_can_msg("Gateway_72", 0, {signal: 1})
+  socket.events.append(event(frames=[frame(bus=bus, address=address, data=data)]))
+  samples = reader.poll(100.1, after=90)
+  assert len(samples) == 1
+  assert samples[0].open_doors == frozenset({name})
+  assert samples[0].open is (name == "driver")
+  assert reader.queue_drained
+
+
+def test_decoder_preserves_all_simultaneously_open_doors_and_closed_transition(source):
+  from opendbc.can import CANPacker
+  reader, _, socket, _ = source
+  signals = dict.fromkeys(("ZV_FT_offen", "ZV_BT_offen", "ZV_HFS_offen", "ZV_HBFS_offen", "ZV_HD_offen"), 1)
+  address, data, bus = CANPacker("vw_mqb").make_can_msg("Gateway_72", 0, signals)
+  socket.events.append(event(frames=[frame(bus=bus, address=address, data=data), frame(False)]))
+  samples = reader.poll(100.1, after=90)
+  assert [sample.open_doors for sample in samples] == [frozenset({"driver", "passenger", "rear_left", "rear_right", "trunk"}), frozenset()]
+
+
+def test_queued_open_after_budget_cannot_be_reported_as_drained(source):
+  reader, _, socket, _ = source
+  socket.events.extend(event(at=100 + i / 10000, frames=[frame(False)]) for i in range(door.MAX_EVENTS_PER_POLL))
+  socket.events.append(event(at=100.06, frames=[frame(True)]))
+  first = reader.poll(100.1, after=90)
+  assert all(not sample.open_doors for sample in first)
+  assert not reader.queue_drained
+  assert reader.poll(100.1, after=90) == [DoorSample(True, 100.06)]
+  assert reader.queue_drained

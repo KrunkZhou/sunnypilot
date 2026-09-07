@@ -13,7 +13,7 @@ from uuid import uuid4
 
 import pytest
 
-from openpilot.system.sentryd.store import MAX_REVISION, MediaData, SentryStore, read_outbox_stats
+from openpilot.system.sentryd.store import CaptureDiscarded, MAX_REVISION, MediaData, SentryStore, read_outbox_stats
 from openpilot.system.sentryd import store as store_module
 
 
@@ -21,12 +21,12 @@ JPEG = b"\xff\xd8test-image\xff\xd9"
 NOW = datetime(2026, 9, 4, tzinfo=UTC).isoformat()
 
 
-def begin(store, event_id=None, revision=1, kind="warning", source="motion", schema_version=1) -> str:
+def begin(store, event_id=None, revision=1, kind="warning", source="motion", schema_version=1, provisional=False) -> str:
   event_id = event_id or str(uuid4())
   store.begin_revision(
     event_id=event_id, revision=revision, kind=kind, source=source,
     episode_started_at=NOW, detected_at=NOW, message="Movement detected while parked.",
-    schema_version=schema_version,
+    schema_version=schema_version, provisional=provisional,
   )
   return event_id
 
@@ -36,6 +36,302 @@ def finish_complete(store, event_id, revision=1) -> None:
     "wide": MediaData(JPEG + b"w\xff\xd9", 1928, 1208),
     "cabin": MediaData(JPEG + b"c\xff\xd9", 1344, 760),
   }, {})
+
+
+@pytest.mark.parametrize("capture_first", (False, True))
+def test_confirmation_releases_only_provisional_first_capture(tmp_path, capture_first) -> None:
+  store = SentryStore(tmp_path / "outbox.sqlite3")
+  event_id = begin(store, schema_version=2, provisional=True)
+  assert store.revision_state(event_id, 1) == "provisional_capturing"
+  if capture_first:
+    finish_complete(store, event_id)
+  assert store.next_pending(1e20) is None
+  assert store.claim_pending(1e20) is None
+  assert not store.upload_work_due(1e20)
+  assert store.retry_all() == store.retry_terminal() == store.retry_pending() == 0
+  assert not store.acknowledge(event_id, 1, {}, deleted=True)
+  with pytest.raises(ValueError, match="unconfirmed"):
+    begin(store, event_id, revision=2, kind="follow_up", schema_version=2)
+  assert store.confirm_event(event_id)
+  assert not store.confirm_event(event_id)
+  assert not store.discard_event(event_id)
+  if not capture_first:
+    finish_complete(store, event_id)
+  assert store.next_pending(0).event_id == event_id
+  begin(store, event_id, revision=2, kind="follow_up", schema_version=2)
+  store.close()
+
+
+@pytest.mark.parametrize("capture_first", (False, True))
+def test_provisional_discard_prevents_confirmation_and_removes_media(tmp_path, capture_first) -> None:
+  store = SentryStore(tmp_path / "outbox.sqlite3")
+  event_id = begin(store, provisional=True)
+  if capture_first:
+    finish_complete(store, event_id)
+  assert store.discard_event(event_id)
+  assert not store.confirm_event(event_id)
+  assert not store.discard_event(event_id)
+  assert store.retry_all() == store.retry_pending() == 0
+  with pytest.raises(CaptureDiscarded):
+    finish_complete(store, event_id)
+  store.cleanup_discarded_events()
+  assert store.revision_state(event_id, 1) is None
+  assert list(store.media_root.iterdir()) == []
+  assert store.connection.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 0
+  with pytest.raises(CaptureDiscarded):
+    finish_complete(store, event_id)
+
+
+@pytest.mark.parametrize("state", ("provisional_capturing", "provisional_ready", "discarding"))
+def test_startup_discards_unconfirmed_work_but_worker_open_leaves_it_held(tmp_path, state) -> None:
+  path = tmp_path / "outbox.sqlite3"
+  store = SentryStore(path)
+  event_id = begin(store, provisional=True)
+  confirmed = begin(store)
+  finish_complete(store, confirmed)
+  if state != "provisional_capturing":
+    finish_complete(store, event_id)
+  if state == "discarding":
+    store.discard_event(event_id)
+  if state == "provisional_capturing":
+    store._write_media(event_id, 1, "wide", MediaData(JPEG, 10, 10))  # process died before manifest commit
+  store.close()
+  worker = SentryStore(path, run_maintenance=False)
+  assert worker.revision_state(event_id, 1) == state
+  worker.close()
+  store = SentryStore(path)
+  assert store.revision_state(event_id, 1) is None
+  assert not (store.media_root / event_id).exists()
+  assert store.next_pending(0).event_id == confirmed
+
+
+@pytest.mark.parametrize("fail_at", ("unlink", "revision_sync", "event_sync", "root_sync"))
+def test_discard_cleanup_retains_marker_until_filesystem_cleanup_is_durable(tmp_path, monkeypatch, fail_at) -> None:
+  path = tmp_path / "outbox.sqlite3"
+  store = SentryStore(path)
+  event_id = begin(store, provisional=True)
+  finish_complete(store, event_id)
+  store.discard_event(event_id)
+  original_sync, original_unlink = store._fsync_directory, Path.unlink
+
+  def fail_sync(directory):
+    failed = {"revision_sync": "1", "event_sync": event_id, "root_sync": "media"}
+    if directory.name == failed.get(fail_at):
+      raise OSError("simulated discard fsync failure")
+    original_sync(directory)
+
+  def fail_unlink(target, *args, **kwargs):
+    if fail_at == "unlink" and target.name == "cabin.jpg":
+      raise OSError("simulated discard unlink failure")
+    return original_unlink(target, *args, **kwargs)
+
+  with monkeypatch.context() as patch:
+    patch.setattr(store, "_fsync_directory", fail_sync)
+    patch.setattr(Path, "unlink", fail_unlink)
+    with pytest.raises(OSError, match="simulated discard"):
+      store.cleanup_discarded_events()
+  assert store.revision_state(event_id, 1) == "discarding"
+  store.close()
+  reopened = SentryStore(path)
+  assert reopened.revision_state(event_id, 1) is None
+  assert list(reopened.media_root.iterdir()) == []
+
+
+def test_discard_cleanup_does_not_follow_replaced_directory_symlink(tmp_path) -> None:
+  store = SentryStore(tmp_path / "sentry" / "outbox.sqlite3")
+  event_id = begin(store, provisional=True)
+  finish_complete(store, event_id)
+  store.discard_event(event_id)
+  event_directory = store.media_root / event_id
+  moved = tmp_path / "preserved"
+  event_directory.rename(moved)
+  event_directory.symlink_to(moved, target_is_directory=True)
+  with pytest.raises(OSError, match="unsafe Sentry discarded"):
+    store.cleanup_discarded_events()
+  assert store.revision_state(event_id, 1) == "discarding"
+  assert len(list(moved.rglob("*.jpg"))) == 2
+
+
+@pytest.mark.parametrize("transition", ("confirm", "discard", "door"))
+def test_capture_finalization_rechecks_identity_after_media_writes(tmp_path, monkeypatch, transition) -> None:
+  path = tmp_path / "outbox.sqlite3"
+  store = SentryStore(path)
+  event_id = begin(store, schema_version=2, provisional=True)
+  other = SentryStore(path, run_maintenance=False)
+  original_write = store._write_media
+  transitioned = False
+
+  def write_then_transition(*args):
+    nonlocal transitioned
+    written = original_write(*args)
+    if not transitioned:
+      transitioned = True
+      if transition == "door":
+        assert other.start_door_event(
+          event_id=str(uuid4()), provisional_event_id=event_id, detected_at=NOW, message="Door opened.",
+        ) == (event_id, True)
+      else:
+        assert getattr(other, f"{transition}_event")(event_id)
+    return written
+
+  monkeypatch.setattr(store, "_write_media", write_then_transition)
+  if transition == "discard":
+    with pytest.raises(CaptureDiscarded):
+      finish_complete(store, event_id)
+    assert list(store.media_root.rglob("*.jpg")) == []
+    assert store.next_pending(0) is None
+  else:
+    finish_complete(store, event_id)
+    queued = store.next_pending(0)
+    assert queued.metadata["source"] == ("door_open" if transition == "door" else "motion")
+    assert queued.metadata["schema_version"] == (3 if transition == "door" else 2)
+    assert queued.metadata["kind"] == ("door_open" if transition == "door" else "warning")
+    assert len(queued.media) == 2
+  other.close()
+
+
+@pytest.mark.parametrize("capture_first", (False, True))
+def test_door_conversion_retains_first_pair_and_reserves_second_before_upload(tmp_path, capture_first) -> None:
+  path = tmp_path / "outbox.sqlite3"
+  store = SentryStore(path)
+  event_id = begin(store, schema_version=2, provisional=True)
+  before = None
+  if capture_first:
+    finish_complete(store, event_id)
+    before = [dict(row) for row in store.connection.execute("SELECT * FROM media WHERE event_id=? ORDER BY role", (event_id,))]
+  triggered_at = "2026-09-04T00:00:02+00:00"
+  result = store.start_door_event(event_id=str(uuid4()), provisional_event_id=event_id, detected_at=triggered_at, message="Door opened.")
+  assert result == (event_id, True)
+  assert store.get_door_pause()
+  assert store.revision_state(event_id, 2) == "capturing"
+  if before is not None:
+    assert [dict(row) for row in store.connection.execute("SELECT * FROM media WHERE event_id=? ORDER BY role", (event_id,))] == before
+  else:
+    finish_complete(store, event_id)
+  assert not store.confirm_event(event_id)
+  assert not store.discard_event(event_id)
+  first = store.claim_pending(0)
+  assert (first.metadata["schema_version"], first.metadata["source"], first.metadata["kind"]) == (3, "door_open", "door_open")
+  assert first.metadata["detected_at"] == first.metadata["episode_started_at"] == NOW
+  assert store.acknowledge(event_id, 1, {item.role: item.sha256 for item in first.media})
+  assert store.revision_state(event_id, 1) == "acknowledged"
+  finish_complete(store, event_id, 2)
+  second = store.claim_pending(0)
+  assert (second.revision, second.metadata["kind"], second.metadata["source"]) == (2, "follow_up", "door_open")
+  assert second.metadata["detected_at"] == triggered_at
+  assert store.acknowledge(event_id, 2, {item.role: item.sha256 for item in second.media})
+  assert store.revision_state(event_id, 1) is None
+  # Pause persists independently of acknowledged history cleanup and reboot.
+  store.close()
+  store = SentryStore(path)
+  assert store.get_door_pause()
+  assert store.start_door_event(event_id=str(uuid4()), detected_at=NOW, message="Door reopened.") == result
+  store.clear_door_pause()
+  store.close()
+  assert not SentryStore(path).get_door_pause()
+
+
+@pytest.mark.parametrize("state", ("capturing", "ready", "uploading", "terminal", "acknowledged", "discarding"))
+def test_door_does_not_rewrite_confirmed_claimed_or_discarded_motion_events(tmp_path, state) -> None:
+  store = SentryStore(tmp_path / "outbox.sqlite3")
+  motion = begin(store, provisional=state == "discarding")
+  if state not in ("capturing", "discarding"):
+    finish_complete(store, motion)
+  if state == "discarding":
+    store.discard_event(motion)
+  elif state != "capturing":
+    with store.connection:
+      store.connection.execute("UPDATE revisions SET state=? WHERE event_id=?", (state, motion))
+  snapshot = {table: [dict(row) for row in store.connection.execute(f"SELECT * FROM {table} WHERE event_id=?", (motion,))]
+              for table in ("events", "revisions", "media")}
+  door = str(uuid4())
+  assert store.start_door_event(event_id=door, provisional_event_id=motion, detected_at=NOW, message="Door opened.") == (door, False)
+  assert store.revision_state(door, 1) == "capturing"
+  assert store.revision_state(door, 2) is None
+  for table, expected in snapshot.items():
+    assert [dict(row) for row in store.connection.execute(f"SELECT * FROM {table} WHERE event_id=?", (motion,))] == expected
+
+
+@pytest.mark.parametrize("schema,revision,kind,source", [
+  (1, 1, "door_open", "door_open"), (2, 1, "door_open", "door_open"), (3, 1, "warning", "motion"),
+  (3, 1, "door_open", "manual_test"), (3, 2, "alarm", "door_open"), (3, 3, "follow_up", "door_open"),
+])
+def test_door_wire_contract_rejects_invalid_combinations(tmp_path, schema, revision, kind, source) -> None:
+  store = SentryStore(tmp_path / "outbox.sqlite3")
+  with pytest.raises(ValueError):
+    begin(store, schema_version=schema, revision=revision, kind=kind, source=source)
+
+
+@pytest.mark.parametrize("provisional", (1, "yes", None))
+def test_provisional_flag_has_strict_boolean_type(tmp_path, provisional) -> None:
+  with pytest.raises(ValueError, match="provisional"):
+    begin(SentryStore(tmp_path / "outbox.sqlite3"), provisional=provisional)
+
+
+def test_provisional_quota_discards_pair_without_rewriting_confirmed_work(tmp_path) -> None:
+  store = SentryStore(tmp_path / "outbox.sqlite3")
+  confirmed = begin(store)
+  finish_complete(store, confirmed)
+  original = store.next_pending(0)
+  store.media_quota_bytes = store.stats().media_bytes
+  provisional = begin(store, provisional=True)
+  with pytest.raises(CaptureDiscarded, match="quota"):
+    finish_complete(store, provisional)
+  assert store.revision_state(provisional, 1) is None
+  assert store.next_pending(0) == original
+  assert not store.confirm_event(provisional)
+  assert not (store.media_root / provisional).exists()
+
+
+@pytest.mark.parametrize("fail_statement", (
+  "UPDATE events SET source=", "UPDATE revisions SET kind=", "INSERT INTO revisions", "UPDATE runtime_state SET door_pause_active=1",
+))
+def test_door_conversion_and_pause_transaction_rolls_back_completely(tmp_path, monkeypatch, fail_statement) -> None:
+  path = tmp_path / "outbox.sqlite3"
+  store = SentryStore(path)
+  event_id = begin(store, provisional=True)
+  finish_complete(store, event_id)
+  snapshot = {table: [dict(row) for row in store.connection.execute(f"SELECT * FROM {table}")]
+              for table in ("events", "revisions", "media", "runtime_state")}
+  files = {row["path"]: Path(row["path"]).read_bytes() for row in snapshot["media"]}
+  store.close()
+  original_connect = sqlite3.connect
+
+  class FailingConnection(sqlite3.Connection):
+    def execute(self, sql, parameters=()):
+      result = super().execute(sql, parameters)
+      if sql.strip().startswith(fail_statement):
+        raise sqlite3.OperationalError("simulated door transaction failure")
+      return result
+
+  with monkeypatch.context() as patch:
+    patch.setattr(sqlite3, "connect", lambda *args, **kwargs: original_connect(*args, factory=FailingConnection, **kwargs))
+    store = SentryStore(path, run_maintenance=False)
+    with pytest.raises(sqlite3.OperationalError, match="door transaction"):
+      store.start_door_event(event_id=str(uuid4()), provisional_event_id=event_id, detected_at=NOW, message="Door opened.")
+  for table, expected in snapshot.items():
+    assert [dict(row) for row in store.connection.execute(f"SELECT * FROM {table}")] == expected
+  assert {name: Path(name).read_bytes() for name in files} == files
+  assert store.next_pending(0) is None
+  assert not store.get_door_pause()
+  store.close()
+
+
+def test_restart_after_door_conversion_preserves_first_pair_and_recovers_second_as_missing(tmp_path) -> None:
+  path = tmp_path / "outbox.sqlite3"
+  store = SentryStore(path)
+  event_id = begin(store, provisional=True)
+  finish_complete(store, event_id)
+  store.start_door_event(event_id=str(uuid4()), provisional_event_id=event_id, detected_at=NOW, message="Door opened.")
+  first = store.next_pending(0)
+  store.close()
+  store = SentryStore(path)
+  assert store.get_door_pause()
+  assert store.next_pending(0) == first
+  assert store.revision_state(event_id, 2) == "ready"
+  metadata = json.loads(store.connection.execute("SELECT metadata_json FROM revisions WHERE event_id=? AND revision=2", (event_id,)).fetchone()[0])
+  assert (metadata["schema_version"], metadata["source"], metadata["kind"]) == (3, "door_open", "follow_up")
+  assert {omission["reason"] for omission in metadata["omitted_media"]} == {"stale_capture"}
 
 
 def test_complete_revision_has_exact_wire_metadata(tmp_path) -> None:
@@ -337,6 +633,122 @@ CREATE TABLE media (
 """
 
 
+def create_schema_three_outbox(path):
+  store = SentryStore(path)
+  future = datetime.now(UTC).timestamp() + 3600
+  for index, state in enumerate(("ready", "capturing", "uploading", "terminal", "acknowledged",
+                                  "evicting_ready", "evicting_terminal", "evicting_uncertain")):
+    event_id = begin(store, schema_version=1 + index % 2)
+    if state != "capturing":
+      finish_complete(store, event_id)
+    with store.connection:
+      store.connection.execute(
+        "UPDATE revisions SET state=?, attempts=?, next_attempt_at=?, retry_after_at=?, last_attempt_at=?, last_http_status=? WHERE event_id=?",
+        (state, index, future, 123 + index, NOW, 503, event_id),
+      )
+  snapshot = {table: [dict(row) for row in store.connection.execute(f"SELECT * FROM {table}")]
+              for table in ("events", "revisions", "media")}
+  files = {row["path"]: Path(row["path"]).read_bytes() for row in snapshot["media"] if row["path"]}
+  # Independently recreate deployed v3 CHECK constraints. No provisional states,
+  # door identities or runtime pause table existed before this migration.
+  schema = LEGACY_SCHEMA.replace("revision IN (1, 2)", f"revision>=1 AND revision<={MAX_REVISION}")
+  schema = schema.replace("kind IN ('warning', 'alarm')", "kind IN ('warning', 'follow_up', 'alarm')")
+  schema = schema.replace("next_attempt_at REAL NOT NULL DEFAULT 0,", "next_attempt_at REAL NOT NULL DEFAULT 0, retry_after_at REAL NOT NULL DEFAULT 0,")
+  store.connection.execute("PRAGMA foreign_keys=OFF")
+  store.connection.executescript("DROP TABLE media; DROP TABLE revisions; DROP TABLE events; DROP TABLE runtime_state;" + schema)
+  with store.connection:
+    store.connection.execute("ALTER TABLE events ADD COLUMN schema_version INTEGER NOT NULL DEFAULT 1 CHECK(schema_version IN (1, 2))")
+    for table, rows in snapshot.items():
+      for row in rows:
+        columns, placeholders = ",".join(row), ",".join("?" for _ in row)
+        store.connection.execute(f"INSERT INTO {table} ({columns}) VALUES ({placeholders})", tuple(row.values()))
+    store.connection.execute("PRAGMA user_version=3")
+  store.close()
+  return snapshot, files
+
+
+def assert_migrated_schema_three(store, snapshot, files):
+  for table, expected in snapshot.items():
+    assert [dict(row) for row in store.connection.execute(f"SELECT * FROM {table}")] == expected
+  assert {name: Path(name).read_bytes() for name in files} == files
+  assert store.connection.execute("PRAGMA user_version").fetchone()[0] == 4
+  assert store.connection.execute("PRAGMA foreign_key_check").fetchall() == []
+  assert store.connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+  assert not store.get_door_pause()
+
+
+def test_schema_three_migration_preserves_claims_wire_bytes_and_exact_retry_floors(tmp_path) -> None:
+  path = tmp_path / "outbox.sqlite3"
+  snapshot, files = create_schema_three_outbox(path)
+  for _ in range(2):
+    store = SentryStore(path, run_maintenance=False)
+    assert_migrated_schema_three(store, snapshot, files)
+    store.close()
+  store = SentryStore(path, run_maintenance=False)
+  candidate = begin(store, provisional=True)
+  assert store.start_door_event(event_id=str(uuid4()), provisional_event_id=candidate, detected_at=NOW, message="Door opened.") == (candidate, True)
+
+
+@pytest.mark.parametrize("fail_statement", (
+  "INSERT INTO sentry_revisions_v2", "DROP TABLE revisions", "ALTER TABLE sentry_revisions_v2",
+  "INSERT INTO sentry_events_v4", "DROP TABLE events", "ALTER TABLE sentry_events_v4", "CREATE TABLE IF NOT EXISTS runtime_state",
+  "PRAGMA user_version=4",
+))
+def test_schema_three_migration_failure_rolls_back_every_table_and_floor(tmp_path, monkeypatch, fail_statement) -> None:
+  path = tmp_path / "outbox.sqlite3"
+  snapshot, files = create_schema_three_outbox(path)
+  original_connect = sqlite3.connect
+
+  class FailingConnection(sqlite3.Connection):
+    def execute(self, sql, parameters=()):
+      result = super().execute(sql, parameters)
+      if sql.strip().startswith(fail_statement):
+        raise sqlite3.OperationalError("simulated schema-four migration failure")
+      return result
+
+  with monkeypatch.context() as patch:
+    patch.setattr(sqlite3, "connect", lambda *args, **kwargs: original_connect(*args, factory=FailingConnection, **kwargs))
+    with pytest.raises(sqlite3.OperationalError, match="schema-four"):
+      SentryStore(path, run_maintenance=False)
+  with sqlite3.connect(path) as verifier:
+    verifier.row_factory = sqlite3.Row
+    assert verifier.execute("PRAGMA user_version").fetchone()[0] == 3
+    assert verifier.execute("SELECT 1 FROM sqlite_master WHERE name='runtime_state'").fetchone() is None
+    for table, expected in snapshot.items():
+      assert [dict(row) for row in verifier.execute(f"SELECT * FROM {table}")] == expected
+  verifier.close()
+  store = SentryStore(path, run_maintenance=False)
+  assert_migrated_schema_three(store, snapshot, files)
+
+
+@pytest.mark.parametrize("crash_statement", ("DROP TABLE events", "PRAGMA user_version=4"))
+def test_process_death_during_schema_three_migration_retains_old_queue(tmp_path, crash_statement) -> None:
+  path = tmp_path / "outbox.sqlite3"
+  snapshot, files = create_schema_three_outbox(path)
+  program = """
+import os
+import sqlite3
+import sys
+from openpilot.system.sentryd.store import SentryStore
+original_connect = sqlite3.connect
+class CrashConnection(sqlite3.Connection):
+  def execute(self, sql, parameters=()):
+    result = super().execute(sql, parameters)
+    if sql.strip().startswith(sys.argv[2]):
+      os._exit(77)
+    return result
+sqlite3.connect = lambda *args, **kwargs: original_connect(*args, factory=CrashConnection, **kwargs)
+SentryStore(sys.argv[1], run_maintenance=False)
+"""
+  result = subprocess.run([sys.executable, "-c", program, str(path), crash_statement], timeout=10, check=False)
+  assert result.returncode == 77
+  with sqlite3.connect(path) as verifier:
+    assert verifier.execute("PRAGMA user_version").fetchone()[0] == 3
+  verifier.close()
+  store = SentryStore(path, run_maintenance=False)
+  assert_migrated_schema_three(store, snapshot, files)
+
+
 def create_legacy_outbox(path):
   # Use today's media writer to make realistic bytes, then independently build
   # yesterday's schema from the exact rows with the event version stripped.
@@ -378,7 +790,7 @@ def assert_migrated_legacy(store, snapshot):
     assert actual == snapshot[table]
   assert store.connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
   assert store.connection.execute("PRAGMA foreign_key_check").fetchall() == []
-  assert store.connection.execute("PRAGMA user_version").fetchone()[0] == 3
+  assert store.connection.execute("PRAGMA user_version").fetchone()[0] == 4
   assert store.connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
   assert store.connection.execute("PRAGMA synchronous").fetchone()[0] == 2
 
@@ -453,7 +865,7 @@ def assert_migrated_schema_two(store, snapshot, files):
         expected_floor = row["next_attempt_at"] if row["state"] == "ready" and row["last_http_status"] is not None and row["next_attempt_at"] > 1 else 0
         assert row.pop("retry_after_at") == expected_floor
     assert actual == snapshot[table]
-  assert store.connection.execute("PRAGMA user_version").fetchone()[0] == 3
+  assert store.connection.execute("PRAGMA user_version").fetchone()[0] == 4
   assert store.connection.execute("PRAGMA foreign_key_check").fetchall() == []
   assert store.connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
   assert {name: Path(name).read_bytes() for name in files} == files
@@ -476,7 +888,7 @@ def test_schema_two_migration_preserves_both_wire_schemas_claims_and_server_dead
 
 
 @pytest.mark.parametrize("fail_statement", (
-  "ALTER TABLE revisions ADD COLUMN retry_after_at", "UPDATE revisions SET retry_after_at=next_attempt_at", "PRAGMA user_version=3",
+  "ALTER TABLE revisions ADD COLUMN retry_after_at", "UPDATE revisions SET retry_after_at=next_attempt_at", "PRAGMA user_version=4",
 ))
 def test_schema_two_migration_failure_rolls_back_column_version_and_every_row(tmp_path, monkeypatch, fail_statement) -> None:
   path = tmp_path / "outbox.sqlite3"
@@ -507,7 +919,7 @@ def test_schema_two_migration_failure_rolls_back_column_version_and_every_row(tm
   assert_migrated_schema_two(migrated, snapshot, files)
 
 
-@pytest.mark.parametrize("crash_statement", ("ALTER TABLE revisions ADD COLUMN retry_after_at", "PRAGMA user_version=3"))
+@pytest.mark.parametrize("crash_statement", ("ALTER TABLE revisions ADD COLUMN retry_after_at", "PRAGMA user_version=4"))
 def test_process_death_during_schema_two_migration_preserves_queue(tmp_path, crash_statement) -> None:
   path = tmp_path / "outbox.sqlite3"
   _, snapshot, files = create_schema_two_outbox(path)
@@ -574,7 +986,7 @@ def test_concurrent_first_time_initializers_create_private_database(tmp_path) ->
     store = None
     try:
       store = SentryStore(path, run_maintenance=False)
-      assert store.connection.execute("PRAGMA user_version").fetchone()[0] == 3
+      assert store.connection.execute("PRAGMA user_version").fetchone()[0] == 4
       assert store.connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
       opened.wait(timeout=5)
     except Exception:
@@ -606,7 +1018,7 @@ def test_current_schema_open_does_not_request_a_migration_write_lock(tmp_path, m
   reopened = SentryStore(path, run_maintenance=False)
   assert "BEGIN IMMEDIATE" not in statements
   assert "PRAGMA foreign_key_check" not in statements
-  assert "PRAGMA user_version=3" not in statements
+  assert "PRAGMA user_version=4" not in statements
   reopened.close()
   initial.close()
 
@@ -661,7 +1073,7 @@ def test_wal_failure_is_bounded_and_closes_connection(tmp_path, monkeypatch, cod
 
 
 @pytest.mark.parametrize("fail_statement", [
-  "INSERT INTO sentry_revisions_v2", "DROP TABLE revisions", "ALTER TABLE sentry_revisions_v2", "PRAGMA user_version=3",
+  "INSERT INTO sentry_revisions_v2", "DROP TABLE revisions", "ALTER TABLE sentry_revisions_v2", "PRAGMA user_version=4",
 ])
 def test_legacy_migration_failure_rolls_back_schema_and_rows(tmp_path, monkeypatch, fail_statement) -> None:
   path = tmp_path / "outbox.sqlite3"
@@ -694,7 +1106,7 @@ def test_legacy_migration_failure_rolls_back_schema_and_rows(tmp_path, monkeypat
   assert_migrated_legacy(restarted, snapshot)
 
 
-@pytest.mark.parametrize("crash_statement", ["DROP TABLE revisions", "ALTER TABLE sentry_revisions_v2", "PRAGMA user_version=3"])
+@pytest.mark.parametrize("crash_statement", ["DROP TABLE revisions", "ALTER TABLE sentry_revisions_v2", "PRAGMA user_version=4"])
 def test_process_death_during_migration_recovers_the_complete_legacy_outbox(tmp_path, crash_statement) -> None:
   path = tmp_path / "outbox.sqlite3"
   _, _, snapshot, files = create_legacy_outbox(path)
@@ -743,12 +1155,12 @@ def test_legacy_quota_rewrite_does_not_upgrade_wire_schema(tmp_path) -> None:
 def test_future_database_schema_is_not_downgraded(tmp_path) -> None:
   path = tmp_path / "outbox.sqlite3"
   store = SentryStore(path)
-  store.connection.execute("PRAGMA user_version=4")
+  store.connection.execute("PRAGMA user_version=5")
   store.close()
   with pytest.raises(ValueError, match="future"):
     SentryStore(path)
   with sqlite3.connect(path) as connection:
-    assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
 
 
 def test_revision_timestamps_are_clamped_to_server_ordering_invariants(tmp_path) -> None:

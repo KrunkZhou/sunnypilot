@@ -131,6 +131,65 @@ class DrainTransport:
     return Response(outcome, payload)
 
 
+@pytest.mark.parametrize("state", ("provisional_capturing", "provisional_ready", "discarding"))
+def test_provisional_and_discarded_captures_never_upload_even_after_manual_retry(tmp_path, state) -> None:
+  path = tmp_path / "outbox.sqlite3"
+  store = SentryStore(path)
+  candidate = str(uuid4())
+  store.begin_revision(
+    event_id=candidate, revision=1, kind="warning", source="motion", schema_version=2,
+    episode_started_at=NOW, detected_at=NOW, message="Movement detected.", provisional=True,
+  )
+  if state != "provisional_capturing":
+    store.finish_capture(candidate, 1, {"wide": MediaData(JPEG, 10, 10)}, {"cabin": "camera_unavailable"})
+  if state == "discarding":
+    store.discard_event(candidate)
+  confirmed = add_queued_revision(store, attempts=1)
+  transport = DrainTransport()
+  uploader = SentryUploader("dongle", store, transport)
+  store.retry_all()
+  uploader.upload_pending()
+  assert transport.calls == [(confirmed, 1)]
+  assert store.revision_state(candidate, 1) == state
+  worker = SentryStore(path, run_maintenance=False)
+  worker.retry_pending()
+  worker.retry_all()
+  SentryUploader("dongle", worker, transport).upload_pending()
+  assert transport.calls == [(confirmed, 1)]
+  worker.close()
+  store.close()
+  restarted = SentryStore(path)
+  SentryUploader("dongle", restarted, transport).upload_pending()
+  assert transport.calls == [(confirmed, 1)]
+  assert restarted.revision_state(candidate, 1) is None
+
+
+def test_converted_door_pair_uploads_only_new_identity_in_order(tmp_path) -> None:
+  store = SentryStore(tmp_path / "outbox.sqlite3")
+  candidate = str(uuid4())
+  store.begin_revision(
+    event_id=candidate, revision=1, kind="warning", source="motion", schema_version=2,
+    episode_started_at=NOW, detected_at=NOW, message="Movement detected.", provisional=True,
+  )
+  store.finish_capture(candidate, 1, {"wide": MediaData(JPEG, 10, 10)}, {"cabin": "camera_unavailable"})
+  transport = DrainTransport()
+  uploader = SentryUploader("dongle", store, transport)
+  assert not uploader.upload_once()
+  store.start_door_event(event_id=str(uuid4()), provisional_event_id=candidate, detected_at=NOW, message="Door opened.")
+  store.finish_capture(candidate, 2, {"wide": MediaData(JPEG, 10, 10)}, {"cabin": "camera_unavailable"})
+
+  def verify_door(revision):
+    assert revision.metadata["schema_version"] == 3
+    assert revision.metadata["source"] == "door_open"
+    assert revision.metadata["kind"] == ("door_open" if revision.revision == 1 else "follow_up")
+    return 201
+
+  transport.outcome = verify_door
+  uploader.upload_pending()
+  assert transport.calls == [(candidate, 1), (candidate, 2)]
+  assert store.revision_state(candidate, 1) is None
+
+
 def test_successful_retry_drains_deferred_revisions_in_order_without_reopening_failed_or_active_work(tmp_path) -> None:
   store = SentryStore(tmp_path / "outbox.sqlite3")
   active = add_queued_revision(store)

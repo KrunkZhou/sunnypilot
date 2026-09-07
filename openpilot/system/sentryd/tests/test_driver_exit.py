@@ -4,7 +4,7 @@ import pytest
 
 from openpilot.system.sentryd.door import DoorSample
 from openpilot.system.sentryd.sentryd import ARM_DELAY_SECONDS, CaptureJob
-from openpilot.system.sentryd.tests.test_repeated_capture import finish_pair, motion_at, send_sample
+from openpilot.system.sentryd.tests.test_repeated_capture import confirm_motion, finish_pair, motion_at, send_sample
 from openpilot.system.sentryd.tests.test_repeated_capture import mode as mode
 
 
@@ -13,6 +13,8 @@ class DoorSource:
     self.samples = []
     self.error = None
     self.calls = []
+    self.queue_drained = True
+    self.generation = 0
 
   def poll(self, now, *, after):
     self.calls.append((now, after))
@@ -121,7 +123,8 @@ def test_toggle_off_restores_usb_timer_and_toggle_on_requires_a_new_exit(exit_mo
   mode.last_config_refresh = float("-inf")
   send_sample(mode, 191.2, 0.4)
   assert mode.state == "door_signal_unavailable" and mode.active_event_id is None
-  assert not mode.capture_queue and mode.store.revision_state(event_id, 1) == "ready"
+  assert not mode.capture_queue and mode.store.revision_state(event_id, 1) in (None, "discarding")
+  assert mode.store.next_pending(0) is None
   assert mode.arm_started_at is None and not mode.driver_exit_completed
 
 
@@ -143,6 +146,7 @@ def test_capture_limit_rearm_does_not_require_a_second_driver_exit(exit_mode):
   event_id = mode.active_event_id
   mode._start_capture_if_needed()
   finish_pair(mode)
+  confirm_motion(mode)
   for revision in range(2, 22):
     motion_at(mode, mode.next_capture_at)
     mode._schedule_motion_capture(mode.clock())
@@ -158,7 +162,7 @@ def test_capture_limit_rearm_does_not_require_a_second_driver_exit(exit_mode):
   send_sample(mode, rearmed_at + 0.001, 0.3)
   assert mode.state == "armed"
   send_sample(mode, rearmed_at + 0.1, 0.4)
-  assert len(mode.door_source.calls) == source_calls
+  assert len(mode.door_source.calls) > source_calls
   assert mode.active_event_id is not None and mode.active_event_id != event_id
   assert mode.capture_queue == [CaptureJob(mode.active_event_id, 1)]
 

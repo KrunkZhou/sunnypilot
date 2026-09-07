@@ -29,6 +29,11 @@ MAX_MEDIA_BYTES = 8 * 1024 * 1024
 DEFAULT_MEDIA_QUOTA = 1024 * 1024 * 1024
 UPLOAD_CLAIM_SECONDS = 120.0
 MAX_REVISION = 2 ** 31 - 1
+PROVISIONAL_STATES = ("provisional_capturing", "provisional_ready")
+
+
+class CaptureDiscarded(ValueError):
+  """A canceled provisional capture must not be finalized or retried."""
 
 
 @dataclass(frozen=True)
@@ -196,6 +201,13 @@ class SentryStore:
       raise
     if run_maintenance:
       try:
+        # Only the daemon's startup connection owns abandoned capture recovery.
+        # Upload-worker connections must never discard a live provisional pair.
+        with self.connection:
+          self.connection.execute(
+            "UPDATE revisions SET state='discarding' WHERE state IN ('provisional_capturing', 'provisional_ready')"
+          )
+        self.cleanup_discarded_events()
         self.recover_expired_upload_claims()
         self.recover_interrupted_evictions()
         self.cleanup_acknowledged_media()
@@ -228,8 +240,11 @@ class SentryStore:
       raise OSError(f"Sentry outbox could not enable WAL mode: {journal_mode}")
 
   def begin_revision(self, *, event_id: str, revision: int, kind: str, source: str,
-                     episode_started_at: str, detected_at: str, message: str, schema_version: int = 1) -> None:
+                     episode_started_at: str, detected_at: str, message: str, schema_version: int = 1,
+                     provisional: bool = False) -> None:
     self._validate_revision(event_id, revision, kind, source, episode_started_at, detected_at, message, schema_version)
+    if type(provisional) is not bool or (provisional and (revision != 1 or source != "motion")):
+      raise ValueError("only the first motion capture can be provisional")
     detected_at = self._timestamp_at_least(detected_at, episode_started_at)
     self.connection.execute("BEGIN IMMEDIATE")
     with self.connection:
@@ -251,6 +266,11 @@ class SentryStore:
       ).fetchone()[0]
       if preceding_count != revision - 1:
         raise ValueError("a revision requires all preceding revisions")
+      if self.connection.execute(
+        "SELECT 1 FROM revisions WHERE event_id=? AND state IN ('provisional_capturing', 'provisional_ready', 'discarding')",
+        (event_id,),
+      ).fetchone() is not None:
+        raise ValueError("an unconfirmed event cannot create further revisions")
       if revision > 1:
         previous_timestamp = self.connection.execute(
           "SELECT detected_at FROM revisions WHERE event_id=? AND revision=?", (event_id, revision - 1)
@@ -263,10 +283,126 @@ class SentryStore:
       self.connection.execute(
         """
         INSERT INTO revisions(event_id, revision, kind, detected_at, message, state)
-        VALUES (?, ?, ?, ?, ?, 'capturing')
+        VALUES (?, ?, ?, ?, ?, ?)
         """,
-        (event_id, revision, kind, detected_at, message),
+        (event_id, revision, kind, detected_at, message, "provisional_capturing" if provisional else "capturing"),
       )
+
+  def confirm_event(self, event_id: str) -> bool:
+    with self.connection:
+      changed = self.connection.execute(
+        """
+        UPDATE revisions SET state=CASE state WHEN 'provisional_capturing' THEN 'capturing' ELSE 'ready' END
+        WHERE event_id=? AND revision=1 AND attempts=0 AND state IN ('provisional_capturing', 'provisional_ready')
+          AND EXISTS (SELECT 1 FROM events WHERE event_id=? AND source='motion')
+        """, (event_id, event_id),
+      )
+    return changed.rowcount == 1
+
+  def discard_event(self, event_id: str) -> bool:
+    """Durably cancel a candidate; its capture owner must quiesce before cleanup."""
+    with self.connection:
+      changed = self.connection.execute(
+        """
+        UPDATE revisions SET state='discarding'
+        WHERE event_id=? AND revision=1 AND attempts=0 AND state IN ('provisional_capturing', 'provisional_ready')
+          AND EXISTS (SELECT 1 FROM events WHERE event_id=? AND source='motion')
+        """, (event_id, event_id),
+      )
+    return changed.rowcount == 1
+
+  def cleanup_discarded_events(self) -> None:
+    """Remove canceled candidates after their capture/finalizer has stopped.
+
+    Keep the durable marker until every unlink and directory fsync succeeds.
+    Startup also calls this before ordinary capture/media reconciliation.
+    """
+    rows = self.connection.execute(
+      "SELECT event_id, revision FROM revisions WHERE state='discarding' ORDER BY event_id, revision"
+    ).fetchall()
+    for row in rows:
+      self._cleanup_discarded_revision(row["event_id"], row["revision"])
+
+  def _cleanup_discarded_revision(self, event_id: str, revision: int) -> None:
+    directory = self._revision_directory(event_id, revision)
+    # Unlike best-effort removal of empty acknowledged directories, privacy
+    # cleanup must retain its marker on every unsafe entry or fsync failure.
+    for parent in (self.media_root, directory.parent, directory):
+      try:
+        info = parent.lstat()
+      except FileNotFoundError:
+        break
+      if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o700:
+        raise OSError(f"unsafe Sentry discarded media directory: {parent}")
+    else:
+      self._delete_paths(tuple(str(child) for child in directory.iterdir()))
+      self._fsync_directory(directory)
+      directory.rmdir()
+    if directory.parent.exists():
+      self._fsync_directory(directory.parent)
+      if not any(directory.parent.iterdir()):
+        directory.parent.rmdir()
+    self._fsync_directory(self.media_root)
+    with self.connection:
+      self.connection.execute("DELETE FROM revisions WHERE event_id=? AND revision=? AND state='discarding'", (event_id, revision))
+      self.connection.execute(
+        "DELETE FROM events WHERE event_id=? AND NOT EXISTS (SELECT 1 FROM revisions WHERE event_id=?)", (event_id, event_id),
+      )
+
+  def get_door_pause(self) -> bool:
+    return bool(self.connection.execute("SELECT door_pause_active FROM runtime_state WHERE singleton=1").fetchone()[0])
+
+  def clear_door_pause(self) -> None:
+    with self.connection:
+      self.connection.execute("UPDATE runtime_state SET door_pause_active=0, door_event_id=NULL, door_converted=0 WHERE singleton=1")
+
+  def start_door_event(self, *, event_id: str, detected_at: str, message: str,
+                       provisional_event_id: str | None = None) -> tuple[str, bool]:
+    """Atomically reserve a silent door capture and pause, optionally retaining the first pair."""
+    self._validate_revision(event_id, 1, "door_open", "door_open", detected_at, detected_at, message, 3)
+    self.connection.execute("BEGIN IMMEDIATE")
+    with self.connection:
+      pause = self.connection.execute("SELECT * FROM runtime_state WHERE singleton=1").fetchone()
+      if pause["door_pause_active"]:
+        return pause["door_event_id"], bool(pause["door_converted"])
+      candidate = self.connection.execute(
+        """
+        SELECT e.source, e.episode_started_at, e.schema_version, r.* FROM revisions r JOIN events e USING(event_id)
+        WHERE r.event_id=? AND r.revision=1 AND e.source='motion' AND r.attempts=0
+          AND r.state IN ('provisional_capturing', 'provisional_ready')
+          AND (SELECT COUNT(*) FROM revisions WHERE event_id=r.event_id)=1
+        """, (provisional_event_id,),
+      ).fetchone()
+      converted = candidate is not None
+      if converted:
+        event_id = candidate["event_id"]
+        self.connection.execute("UPDATE events SET source='door_open', schema_version=3, closed=1 WHERE event_id=?", (event_id,))
+        state = "ready" if candidate["state"] == "provisional_ready" else "capturing"
+        metadata_json = candidate["metadata_json"]
+        if state == "ready":
+          metadata = json.loads(metadata_json)
+          metadata.update(schema_version=3, source="door_open", kind="door_open", message=message)
+          metadata_json = self._dump_metadata(metadata)
+        self.connection.execute(
+          "UPDATE revisions SET kind='door_open', state=?, message=?, metadata_json=? WHERE event_id=? AND revision=1",
+          (state, message, metadata_json, event_id),
+        )
+        revision = 2
+        detected_at = self._timestamp_at_least(detected_at, candidate["detected_at"])
+      else:
+        self.connection.execute(
+          "INSERT INTO events(event_id, source, episode_started_at, schema_version, closed) VALUES (?, 'door_open', ?, 3, 1)",
+          (event_id, detected_at),
+        )
+        revision = 1
+      self.connection.execute(
+        "INSERT INTO revisions(event_id, revision, kind, detected_at, message, state) VALUES (?, ?, ?, ?, ?, 'capturing')",
+        (event_id, revision, "follow_up" if converted else "door_open", detected_at, message),
+      )
+      self.connection.execute(
+        "UPDATE runtime_state SET door_pause_active=1, door_event_id=?, door_converted=? WHERE singleton=1", (event_id, int(converted)),
+      )
+    return event_id, converted
 
   def finish_capture(self, event_id: str, revision: int, media: dict[str, MediaData],
                      omissions: dict[str, str]) -> None:
@@ -287,7 +423,9 @@ class SentryStore:
       """,
       (event_id, revision),
     ).fetchone()
-    if row is None or row["state"] != "capturing":
+    if row is None or row["state"] == "discarding":
+      raise CaptureDiscarded("Sentry capture was discarded")
+    if row["state"] not in ("capturing", "provisional_capturing"):
       raise ValueError("Sentry revision is not awaiting capture")
 
     written: dict[str, QueuedMedia] = {}
@@ -298,9 +436,23 @@ class SentryStore:
         omissions[role] = "capture_failed"
         media.pop(role, None)
 
-    metadata = self._metadata(event_id, revision, dict(row), tuple(written.values()), omissions)
     try:
+      self.connection.execute("BEGIN IMMEDIATE")
       with self.connection:
+        # Confirmation, cancellation and door conversion can happen while JPEGs
+        # are written. Re-read identity under the final write lock, never commit
+        # the stale motion payload after conversion to a silent door event.
+        row = self.connection.execute(
+          """
+          SELECT e.source, e.episode_started_at, e.schema_version, r.kind, r.detected_at, r.message, r.state
+          FROM revisions r JOIN events e USING(event_id) WHERE r.event_id=? AND r.revision=?
+          """, (event_id, revision),
+        ).fetchone()
+        if row is None or row["state"] == "discarding":
+          raise CaptureDiscarded("Sentry capture was discarded")
+        if row["state"] not in ("capturing", "provisional_capturing"):
+          raise ValueError("Sentry revision is not awaiting capture")
+        metadata = self._metadata(event_id, revision, dict(row), tuple(written.values()), omissions)
         for item in written.values():
           self.connection.execute(
             """
@@ -315,14 +467,17 @@ class SentryStore:
             (event_id, revision, role, self._bounded_reason(reason)),
           )
         self.connection.execute(
-          "UPDATE revisions SET state='ready', capture_status=?, metadata_json=? WHERE event_id=? AND revision=?",
-          (metadata["capture_status"], self._dump_metadata(metadata), event_id, revision),
+          "UPDATE revisions SET state=?, capture_status=?, metadata_json=? WHERE event_id=? AND revision=?",
+          ("provisional_ready" if row["state"] == "provisional_capturing" else "ready",
+           metadata["capture_status"], self._dump_metadata(metadata), event_id, revision),
         )
     except Exception:
       self._delete_paths(tuple(item.path for item in written.values()))
       self._remove_empty_revision_directory(event_id, revision)
       raise
     self.enforce_media_quota()
+    if row["state"] == "provisional_capturing" and self.revision_state(event_id, revision) in (None, "discarding"):
+      raise CaptureDiscarded("Sentry provisional capture exceeded the media quota")
     self._secure_sidecars()
 
   def recover_interrupted_captures(self) -> int:
@@ -655,7 +810,10 @@ class SentryStore:
       reserved = self._reserve_quota_candidate()
       if reserved is None:
         break
-      self._finish_reserved_eviction(*reserved)
+      if reserved[2] == "discarding":
+        self._cleanup_discarded_revision(reserved[0], reserved[1])
+      else:
+        self._finish_reserved_eviction(*reserved)
       evicted += 1
     return evicted
 
@@ -676,18 +834,25 @@ class SentryStore:
       candidate = self.connection.execute(
         """
         SELECT r.event_id, r.revision, r.state, r.attempts FROM revisions r
-        WHERE (r.state='ready' OR (r.state='terminal' AND r.retryable=1))
+        WHERE (r.state IN ('ready', 'provisional_ready') OR (r.state='terminal' AND r.retryable=1))
           AND EXISTS (
             SELECT 1 FROM media m
             WHERE m.event_id=r.event_id AND m.revision=r.revision AND m.path IS NOT NULL
           )
-        ORDER BY r.created_at, r.event_id, r.revision LIMIT 1
+        ORDER BY (r.state='provisional_ready') DESC, r.created_at, r.event_id, r.revision LIMIT 1
         """
       ).fetchone()
       if candidate is None:
         self.connection.commit()
         return None
       source_state = candidate["state"]
+      if source_state == "provisional_ready":
+        self.connection.execute(
+          "UPDATE revisions SET state='discarding' WHERE event_id=? AND revision=? AND state='provisional_ready'",
+          (candidate["event_id"], candidate["revision"]),
+        )
+        self.connection.commit()
+        return candidate["event_id"], candidate["revision"], "discarding"
       if source_state == "terminal":
         reserved_state = "evicting_terminal"
       elif candidate["attempts"] == 0:
@@ -925,9 +1090,9 @@ class SentryStore:
     # Every upload worker uses a new connection. Already-migrated readers must not take
     # a schema write lock or rescan all queued media on each one-second poll.
     version = self.connection.execute("PRAGMA user_version").fetchone()[0]
-    if version == 3:
+    if version == 4:
       return
-    if version > 3:
+    if version > 4:
       raise ValueError("unsupported future Sentry outbox schema")
     # SQLite cannot widen an existing CHECK constraint in place. Disable FK
     # actions only on this connection, then serialize discovery and the complete
@@ -938,11 +1103,11 @@ class SentryStore:
     try:
       self.connection.execute("BEGIN IMMEDIATE")
       version = self.connection.execute("PRAGMA user_version").fetchone()[0]
-      if version == 3:
+      if version == 4:
         # A concurrent initializer completed migration while we waited.
         self.connection.commit()
         return
-      if version > 3:
+      if version > 4:
         raise ValueError("unsupported future Sentry outbox schema")
       self.connection.execute(
         """
@@ -963,35 +1128,65 @@ class SentryStore:
       existing = self.connection.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='revisions'").fetchone()
       if existing is None:
         self._create_revision_table("revisions")
-      elif version < 2:
+      else:
+        if "retry_after_at" not in {row["name"] for row in self.connection.execute("PRAGMA table_info(revisions)")}:
+          self.connection.execute("ALTER TABLE revisions ADD COLUMN retry_after_at REAL NOT NULL DEFAULT 0")
         self._create_revision_table("sentry_revisions_v2")
         # Copy stored wire JSON as opaque text, never regenerate queued payloads:
         # they may already have been accepted by RTZ before a lost acknowledgement.
         columns = (
           "event_id, revision, kind, detected_at, message, capture_status, metadata_json, state, retryable, " +
-          "attempts, next_attempt_at, last_attempt_at, last_http_status, last_error, acknowledged_at, created_at"
+          "attempts, next_attempt_at, retry_after_at, last_attempt_at, last_http_status, last_error, acknowledged_at, created_at"
         )
         self.connection.execute(f"INSERT INTO sentry_revisions_v2 ({columns}) SELECT {columns} FROM revisions")
         self.connection.execute("DROP TABLE revisions")
         self.connection.execute("ALTER TABLE sentry_revisions_v2 RENAME TO revisions")
-      if "retry_after_at" not in {row["name"] for row in self.connection.execute("PRAGMA table_info(revisions)")}:
-        self.connection.execute("ALTER TABLE revisions ADD COLUMN retry_after_at REAL NOT NULL DEFAULT 0")
       # Older queues cannot distinguish Retry-After from local HTTP backoff.
       # Preserve future HTTP deadlines conservatively; network errors have no
       # server floor. Never rewrite active claims or any immutable wire data.
+      if version < 3:
+        self.connection.execute(
+          """
+          UPDATE revisions SET retry_after_at=next_attempt_at
+          WHERE state='ready' AND last_http_status IS NOT NULL AND next_attempt_at>?
+          """, (datetime.now(UTC).timestamp(),),
+        )
       self.connection.execute(
         """
-        UPDATE revisions SET retry_after_at=next_attempt_at
-        WHERE state='ready' AND last_http_status IS NOT NULL AND next_attempt_at>?
-        """, (datetime.now(UTC).timestamp(),),
+        CREATE TABLE sentry_events_v4 (
+          event_id TEXT PRIMARY KEY,
+          source TEXT NOT NULL CHECK(source IN ('motion', 'manual_test', 'door_open')),
+          episode_started_at TEXT NOT NULL,
+          closed INTEGER NOT NULL DEFAULT 0 CHECK(closed IN (0, 1)),
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          schema_version INTEGER NOT NULL DEFAULT 1 CHECK(schema_version IN (1, 2, 3)),
+          CHECK((source='door_open' AND schema_version=3) OR (source!='door_open' AND schema_version IN (1, 2)))
+        )
+        """
       )
+      self.connection.execute("INSERT INTO sentry_events_v4 SELECT event_id, source, episode_started_at, closed, created_at, schema_version FROM events")
+      self.connection.execute("DROP TABLE events")
+      self.connection.execute("ALTER TABLE sentry_events_v4 RENAME TO events")
       self.connection.execute(
         "CREATE INDEX IF NOT EXISTS sentry_revisions_pending ON revisions(state, next_attempt_at, created_at)"
       )
       self._create_media_table()
+      self.connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS runtime_state (
+          singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+          door_pause_active INTEGER NOT NULL DEFAULT 0 CHECK(door_pause_active IN (0, 1)),
+          door_event_id TEXT,
+          door_converted INTEGER NOT NULL DEFAULT 0 CHECK(door_converted IN (0, 1)),
+          CHECK((door_pause_active=0 AND door_event_id IS NULL AND door_converted=0)
+            OR (door_pause_active=1 AND door_event_id IS NOT NULL))
+        )
+        """
+      )
+      self.connection.execute("INSERT OR IGNORE INTO runtime_state(singleton) VALUES (1)")
       if self.connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
         raise sqlite3.IntegrityError("Sentry outbox migration found invalid foreign keys")
-      self.connection.execute("PRAGMA user_version=3")
+      self.connection.execute("PRAGMA user_version=4")
       self.connection.commit()
     except Exception:
       self.connection.rollback()
@@ -1007,13 +1202,14 @@ class SentryStore:
       CREATE TABLE {table} (
         event_id TEXT NOT NULL REFERENCES events(event_id) ON DELETE CASCADE,
         revision INTEGER NOT NULL CHECK(revision>=1 AND revision<={MAX_REVISION}),
-        kind TEXT NOT NULL CHECK(kind IN ('warning', 'follow_up', 'alarm')),
+        kind TEXT NOT NULL CHECK(kind IN ('warning', 'follow_up', 'alarm', 'door_open')),
         detected_at TEXT NOT NULL,
         message TEXT NOT NULL,
         capture_status TEXT CHECK(capture_status IN ('complete', 'partial', 'failed', 'omitted')),
         metadata_json TEXT,
         state TEXT NOT NULL CHECK(state IN (
           'capturing', 'ready', 'uploading', 'terminal', 'acknowledged',
+          'provisional_capturing', 'provisional_ready', 'discarding',
           'evicting_ready', 'evicting_terminal', 'evicting_uncertain'
         )),
         retryable INTEGER NOT NULL DEFAULT 1 CHECK(retryable IN (0, 1)),
@@ -1026,7 +1222,8 @@ class SentryStore:
         acknowledged_at TEXT,
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         PRIMARY KEY(event_id, revision),
-        CHECK((revision=1 AND kind='warning') OR (revision>=2 AND kind IN ('follow_up', 'alarm')))
+        CHECK((revision=1 AND kind IN ('warning', 'door_open')) OR (revision>=2 AND kind IN ('follow_up', 'alarm'))),
+        CHECK(state NOT IN ('provisional_capturing', 'provisional_ready', 'discarding') OR (revision=1 AND kind='warning' AND attempts=0))
       )
       """
     )
@@ -1066,15 +1263,18 @@ class SentryStore:
       raise ValueError("event_id must be a UUID") from exc
     if parsed.version != 4 or str(parsed) != event_id:
       raise ValueError("event_id must be a canonical UUIDv4")
-    if type(schema_version) is not int or schema_version not in (1, 2):
+    if type(schema_version) is not int or schema_version not in (1, 2, 3):
       raise ValueError("invalid Sentry event schema version")
     if type(revision) is not int or not 1 <= revision <= MAX_REVISION:
       raise ValueError("invalid Sentry event revision number")
-    valid_pair = ((revision, kind) in ((1, "warning"), (2, "alarm")) if schema_version == 1 else
-                  (revision == 1 and kind == "warning") or (revision >= 2 and kind in ("follow_up", "alarm")))
+    if schema_version == 3:
+      valid_pair = source == "door_open" and (revision, kind) in ((1, "door_open"), (2, "follow_up"))
+    else:
+      valid_pair = ((revision, kind) in ((1, "warning"), (2, "alarm")) if schema_version == 1 else
+                    (revision == 1 and kind == "warning") or (revision >= 2 and kind in ("follow_up", "alarm")))
     if not valid_pair:
       raise ValueError("revision and kind do not match")
-    if source not in ("motion", "manual_test") or (source == "manual_test" and revision != 1):
+    if source not in (("door_open",) if schema_version == 3 else ("motion", "manual_test")) or (source == "manual_test" and revision != 1):
       raise ValueError("invalid Sentry event source")
     for name, value in (("episode_started_at", episode_started_at), ("detected_at", detected_at)):
       if not isinstance(value, str) or len(value) > 64:

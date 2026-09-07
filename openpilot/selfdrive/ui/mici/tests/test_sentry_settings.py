@@ -14,10 +14,12 @@ import pytest
 
 
 @pytest.mark.parametrize("scenario", [
-  "consent_cancel", "consent_confirm", "sensitivity", "warning", "save_failure", "legacy_high", "existing_high",
+  "consent_cancel", "consent_confirm", "sensitivity", "fixed_confirmation", "save_failure", "legacy_high", "existing_high",
   "driver_exit", "driver_exit_failure", "waiting_for_door_open", "waiting_for_door_close", "door_signal_unavailable",
   "stale_door_status", "runtime_error",
   "queue_retry", "retry_all", "retry_failure", "retry_onroad",
+  "confirmation_progress", "door_pause_open", "door_pause_countdown", "door_pause_error", "door_pause_unknown", "invalid_progress",
+  "stale_confirmation", "consent_details", "legacy_warning",
 ])
 def test_sentry_settings_navigation_and_persistence(tmp_path, scenario):
   # ui_state owns native messaging/Params singletons. Isolate its replacement in
@@ -65,9 +67,14 @@ def _exercise_scenario(scenario: str, temporary_root: Path) -> None:
         old_store = SentryConfigStore()
         old_store.initialize()
         (old_store.config_dir / "motion_threshold_mps2").write_text("0.01\n" if scenario == "legacy_high" else "0.02\n")
+      elif scenario == "legacy_warning":
+        old_store = SentryConfigStore()
+        old_store.initialize()
+        (old_store.config_dir / "schema_version").write_text("2\n")
+        (old_store.config_dir / "warning_persistence_seconds").write_text("5\n")
       panel = sentry.SentryLayoutMici()
       gui_app.push_widget(panel)
-      enabled, sensitivity, warning = panel._scroller.items[:3]
+      enabled, sensitivity, confirmation_info = panel._scroller.items[:3]
       driver_exit = panel._scroller.items[3]
       store = SentryConfigStore()
 
@@ -89,6 +96,10 @@ def _exercise_scenario(scenario: str, temporary_root: Path) -> None:
       assert driver_exit._checked
       assert store.load().wait_for_driver_exit
       assert (store.config_dir / "wait_for_driver_exit").read_text() == "1\n"
+      assert store.load().schema_version == 3
+      assert (store.config_dir / "warning_persistence_seconds").read_text() == "1\n"
+      assert confirmation_info.value == "10 motion samples"
+      assert not isinstance(confirmation_info, sentry.BigMultiToggle)
 
       if scenario in ("consent_cancel", "consent_confirm"):
         click(enabled)
@@ -130,17 +141,84 @@ def _exercise_scenario(scenario: str, temporary_root: Path) -> None:
           assert gui_app._nav_stack[-1] is panel  # Existing consent needs no dialog.
           assert store.load().effective_enabled
 
-      elif scenario in ("sensitivity", "warning"):
-        toggle, field, expected = ((sensitivity, "motion_threshold_mps2", "0.08\n") if scenario == "sensitivity" else
-                                   (warning, "warning_persistence_seconds", "2\n"))
-        click(toggle)
-        assert (store.config_dir / field).read_text() == expected
+      elif scenario == "sensitivity":
+        click(sensitivity)
+        assert (store.config_dir / "motion_threshold_mps2").read_text() == "0.08\n"
         # Settings panels are reused. Leaving and reopening must still preserve
         # the toggle object and reload the authoritative folder configuration.
         gui_app.pop_widget()
         gui_app.push_widget(panel)
-        click(toggle)
-        assert (store.config_dir / field).read_text() == ("0.02\n" if scenario == "sensitivity" else "5\n")
+        click(sensitivity)
+        assert (store.config_dir / "motion_threshold_mps2").read_text() == "0.02\n"
+
+      elif scenario in ("fixed_confirmation", "legacy_warning"):
+        config_before = {path.name: path.read_bytes() for path in store.config_dir.iterdir()}
+        click(confirmation_info)
+        dialog = gui_app._nav_stack[-1]
+        assert isinstance(dialog, sentry.BigDialog)
+        assert "10 qualifying motion samples within 60 seconds" in dialog._card.value
+        assert "without a webhook alert" in dialog._card.value
+        assert "closed for 5 minutes" in dialog._card.value
+        gui_app.pop_widget()
+        gui_app.pop_widget()
+        gui_app.push_widget(panel)
+        assert confirmation_info.value == "10 motion samples"
+        assert {path.name: path.read_bytes() for path in store.config_dir.iterdir()} == config_before
+        assert runtime_writes == []
+
+      elif scenario == "consent_details":
+        click(enabled)
+        consent = gui_app._nav_stack[-1]
+        cards = {item.text: item.value for item in consent._scroller.items if isinstance(item, sentry.GreyBigButton)}
+        assert "10 motion samples within 60 seconds" in cards["motion confirmation"]
+        assert "unless a door opens" in cards["unconfirmed photos"]
+        assert "pending first pair" in cards["silent door photos"]
+        assert "Both upload without an alert" in cards["silent door photos"]
+        assert "5 minutes" in cards["door pause"]
+        assert not store.load().effective_enabled
+
+      elif scenario in ("confirmation_progress", "door_pause_open", "door_pause_countdown", "door_pause_error", "door_pause_unknown", "invalid_progress",
+                        "stale_confirmation"):
+        config_before = {path.name: path.read_bytes() for path in store.config_dir.iterdir()}
+        state = "door_paused" if scenario.startswith("door_pause") else "confirming"
+        updated = datetime.now(UTC) - timedelta(seconds=30 if scenario == "stale_confirmation" else 0)
+        status = {"state": state, "updated_at": updated.isoformat(),
+                  "confirmation": {"hits": 4, "required_hits": 10, "seconds_remaining": 32.2},
+                  "door_pause": {"active": True, "waiting_for_close": scenario == "door_pause_open",
+                                 "seconds_remaining": None if scenario == "door_pause_open" else 299.2}}
+        if scenario == "invalid_progress":
+          status["confirmation"] = {"hits": "bad", "required_hits": 10, "seconds_remaining": float("nan")}
+        if scenario == "door_pause_error":
+          status["error"] = "Door receiver disconnected. Check the vehicle connection."
+        if scenario == "door_pause_unknown":
+          status["door_pause"] = {"active": True, "waiting_for_close": True, "waiting_for_status": True, "seconds_remaining": None}
+        with patch.object(sentry, "get_status", return_value=status):
+          panel._refresh_status()
+          click(panel._status)
+        dialog = gui_app._nav_stack[-1]
+        assert isinstance(dialog, sentry.BigDialog)
+        if scenario == "stale_confirmation":
+          assert panel._status.value == "daemon unavailable"
+          assert confirmation_info.value == "10 motion samples"
+          assert "status is stale" in dialog._card.value
+        elif scenario == "invalid_progress":
+          assert confirmation_info.value == "10 motion samples"
+        elif scenario.startswith("door_pause"):
+          expected = "waiting for doors closed" if scenario == "door_pause_open" else "door pause · 300 sec left"
+          if scenario == "door_pause_unknown":
+            expected = "waiting for door status"
+          assert panel._status.value == expected
+          assert "without a webhook alert" in dialog._card.value
+          assert "Earlier confirmed events" in dialog._card.value
+          if scenario == "door_pause_error":
+            assert status["error"] in dialog._card.value
+            assert "Restart the device" not in dialog._card.value
+        else:
+          assert panel._status.value == "confirming motion"
+          assert confirmation_info.value == "4/10 · 33 sec left"
+          assert "4/10 · 33 sec left" in dialog._card.value
+        assert {path.name: path.read_bytes() for path in store.config_dir.iterdir()} == config_before
+        assert runtime_writes == []
 
       elif scenario in ("legacy_high", "existing_high"):
         assert sensitivity.value == "high"

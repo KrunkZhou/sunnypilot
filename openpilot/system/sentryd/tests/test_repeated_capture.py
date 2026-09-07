@@ -20,12 +20,20 @@ class RepeatCapture:
     self.sessions = 0
     self.pairs = 0
 
+  def _pair(self):
+    self.pairs += 1
+    return CaptureResult({role: MediaData(
+      b"\xff\xd8" + str(self.pairs).encode() + b"\xff\xd9", 4, 2) for role in ("wide", "cabin")}, {})
+
+  def capture(self, abort_callback):
+    self.sessions += 1
+    assert not abort_callback()
+    return self._pair()
+
   def capture_repeated(self, completed, *, next_capture, abort_callback):
     self.sessions += 1
     while not abort_callback():
-      self.pairs += 1
-      completed(CaptureResult({role: MediaData(
-        b"\xff\xd8" + str(self.pairs).encode() + b"\xff\xd9", 4, 2) for role in ("wide", "cabin")}, {}))
+      completed(self._pair())
       while not abort_callback():
         if next_capture():
           break
@@ -66,9 +74,22 @@ def motion_at(mode, now):
 
 def begin_motion(mode):
   motion_at(mode, 100.0)
+  mode.detector.episode_active = True
+  mode.detector.first_motion_at = 100.0
+  mode.detector.trigger_count = 1
   mode._process_detection("motion", 100.0)
   mode._start_capture_if_needed()
   finish_pair(mode)
+  confirm_motion(mode)
+
+
+def confirm_motion(mode):
+  # Repeated-capture tests start from a confirmed episode; detector boundary
+  # tests independently exercise the ten real qualifying sensor samples.
+  mode.detector.trigger_count = 10
+  mode.detector.warning_triggered = True
+  mode._process_detection("warning", mode.clock())
+  assert mode.active_confirmed
 
 
 def test_diagnostic_context_tracks_each_repeated_revision(mode, monkeypatch):
@@ -91,7 +112,7 @@ def test_diagnostic_context_tracks_each_repeated_revision(mode, monkeypatch):
   assert cloudlog.get_ctx() == original_context  # Worker-local context never leaks into the main loop.
 
 
-def send_sample(mode, timestamp, x):
+def send_sample(mode, timestamp, magnitude_change):
   # The fake clock and encoded publication must share the same nanosecond
   # precision. Repeated float additions can otherwise make a fresh test sample
   # a fraction of a nanosecond newer than the clock and correctly fail closed.
@@ -100,44 +121,45 @@ def send_sample(mode, timestamp, x):
   mode.sm.updated["accelerometer"] = True
   mode.sm.recv_time["accelerometer"] = timestamp
   mode.sm.logMonoTime["accelerometer"] = round(timestamp * 1e9)
-  mode.sm.accelerometer = log.SensorEventData.new_message(acceleration={"v": [x, 0.0, 9.81]}).as_reader()
+  mode.sm.accelerometer = log.SensorEventData.new_message(acceleration={"v": [0.0, 0.0, 9.81 + magnitude_change]}).as_reader()
   mode.update()
 
 
-@pytest.mark.parametrize("warning_seconds", [0.5, 1.0, 2.0, 5.0])
-def test_first_pair_is_ready_to_upload_before_warning_for_every_setting(mode, warning_seconds):
-  mode.config_store.config = replace(mode.config, warning_persistence_seconds=warning_seconds)
-  mode._refresh_config(100.0)
+def test_first_pair_is_provisional_and_unavailable_to_uploader_before_tenth_hit(mode):
   mode.arm_started_at = 0.0
   send_sample(mode, 100.0, 0.0)
   assert mode.active_event_id is None  # a baseline alone is not motion
   send_sample(mode, 100.1, 0.1)
-  assert mode.state == "motion" and not mode.detector.warning_triggered
+  assert mode.state == "confirming" and not mode.detector.warning_triggered
   assert mode.capture_queue == [CaptureJob(mode.active_event_id, 1)]
   send_sample(mode, 100.2, 0.1)  # the worker starts on the next 10 Hz iteration
   finish_pair(mode)
-  queued = mode.store.next_pending(0)
-  assert queued is not None and queued.metadata["capture_status"] == "complete"
-  assert queued.metadata["kind"] == "warning"  # unchanged RTZ revision-1 contract
-  assert mode.state == "motion" and not mode.detector.warning_triggered
+  assert mode.store.next_pending(0) is None
+  assert mode.store.revision_state(mode.active_event_id, 1) == "provisional_ready"
+  row = mode.store.connection.execute("SELECT kind, capture_status FROM revisions").fetchone()
+  assert tuple(row) == ("warning", "complete")
+  assert mode.state == "confirming" and not mode.detector.warning_triggered
   assert mode.capture.pairs == 1
 
 
 def test_follow_ups_and_warning_status_do_not_recreate_first_event(mode):
-  mode.config_store.config = replace(mode.config, warning_persistence_seconds=5.0)
-  mode._refresh_config(100.0)
   mode.arm_started_at = 0.0
   send_sample(mode, 100.0, 0.0)
   send_sample(mode, 100.1, 0.1)
   send_sample(mode, 100.2, 0.2)
   finish_pair(mode)
   event_id = mode.active_event_id
-  for index in range(3, 14):
+  for index in range(3, 10):
     send_sample(mode, 100 + index / 10, index / 10)
-  assert mode.detector.motion_evidence_seconds < 5.0
-  assert mode.state == "motion"
+  assert mode.detector.trigger_count == 9 and not mode.active_confirmed
+  assert mode.store.next_pending(0) is None and mode.capture.pairs == 1
+  send_sample(mode, 101.0, 1.0)
+  assert mode.active_confirmed and mode.state == "warning"
+  assert mode.store.next_pending(0).metadata["event_id"] == event_id
+  for index in range(11, 14):
+    send_sample(mode, 100 + index / 10, index / 10)
   finish_pair(mode)
-  assert mode.capture.pairs == 2  # repeat capture also does not wait for warning
+  assert mode.capture.pairs == 2
   before = list(mode.store.connection.execute("SELECT event_id, revision FROM revisions ORDER BY revision"))
   mode._process_detection("warning", mode.clock())
   assert mode.state == "warning" and mode.active_event_id == event_id
@@ -196,6 +218,7 @@ def test_repeats_beyond_second_capture_with_one_second_cooldown_and_warm_session
 
 def test_slow_capture_or_storage_never_accumulates_follow_up_jobs(mode, monkeypatch):
   mode._process_detection("motion", 100.0)
+  confirm_motion(mode)
   motion_at(mode, 102.0)
   mode._schedule_motion_capture(mode.clock())
   assert len(mode.capture_queue) == 1

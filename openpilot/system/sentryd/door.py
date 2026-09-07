@@ -24,6 +24,17 @@ DISABLE_HINT = "Turn off Wait for Driver Exit for USB use or an unsupported vehi
 class DoorSample:
   open: bool
   monotonic_time: float
+  passenger_open: bool = False
+  rear_left_open: bool = False
+  rear_right_open: bool = False
+  trunk_open: bool = False
+
+  @property
+  def open_doors(self) -> frozenset[str]:
+    return frozenset(name for name, opened in (
+      ("driver", self.open), ("passenger", self.passenger_open),
+      ("rear_left", self.rear_left_open), ("rear_right", self.rear_right_open), ("trunk", self.trunk_open),
+    ) if opened)
 
 
 def _open_can_socket():
@@ -69,6 +80,8 @@ class DriverDoorSource:
     self._last_event_ns = -1
     self._last_sample_at: float | None = None
     self._after: float | None = None
+    self.queue_drained = True
+    self.generation = 0
 
   def _configure(self, now: float) -> bool:
     if now - self._last_profile_check >= PROFILE_REFRESH_SECONDS:
@@ -86,9 +99,12 @@ class DriverDoorSource:
           self._socket = None
           self._last_sample_at = None
           self._last_event_ns = -1
+          self.generation += 1
       except Exception as exc:
         # Params, capnp and the native socket can raise different exception
         # types. A bad saved profile must fail closed, not stop the daemon.
+        if self._bus is not None or self._profile is not None or self._socket is not None:
+          self.generation += 1
         self._bus = None
         self._profile = None
         self._socket = None
@@ -107,6 +123,7 @@ class DriverDoorSource:
     return True
 
   def poll(self, now: float, *, after: float) -> list[DoorSample]:
+    self.queue_drained = True
     if not math.isfinite(now) or not math.isfinite(after) or after > now:
       self.error = "Driver-door observation time is invalid"
       return []
@@ -123,6 +140,7 @@ class DriverDoorSource:
         raw = self._socket.receive(non_blocking=True)
       except Exception:
         self._socket = None
+        self.generation += 1
         self.error = f"Driver-door CAN receiver failed. {DISABLE_HINT}"
         return samples
       if raw is None:
@@ -148,10 +166,17 @@ class DriverDoorSource:
             continue
           # vw_mqb.dbc: Gateway_72 / ZV_FT_offen is little-endian bit 26.
           # Exact-size checking matters: missing bytes must never mean closed.
-          samples.append(DoorSample(bool(data[DRIVER_DOOR_BYTE] & DRIVER_DOOR_MASK), timestamp))
+          samples.append(DoorSample(
+            bool(data[DRIVER_DOOR_BYTE] & DRIVER_DOOR_MASK), timestamp,
+            passenger_open=bool(data[3] & 0x01), rear_left_open=bool(data[2] & 0x10),
+            rear_right_open=bool(data[2] & 0x20), trunk_open=bool(data[3] & 0x40),
+          ))
           self._last_sample_at = timestamp
       except Exception:
         invalid_event = True
+    else:
+      # A queued open at event 513 must not lose to the tenth motion hit.
+      self.queue_drained = False
 
     if self._last_sample_at is not None and 0 <= now - self._last_sample_at < SAMPLE_MAX_AGE_SECONDS:
       self.error = None

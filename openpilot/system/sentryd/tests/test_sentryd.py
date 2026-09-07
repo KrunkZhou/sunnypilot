@@ -85,6 +85,9 @@ class FailingStore:
   path = None
   media_quota_bytes = 1024
 
+  def get_door_pause(self):
+    return False
+
   def close_open_events(self):
     return 0
 
@@ -109,6 +112,7 @@ def test_persistence_failures_do_not_escape_detection_or_strand_episode() -> Non
   assert not mode.detector.episode_active
 
   mode.active_event_id = "event"
+  mode.active_confirmed = True
   mode.active_episode_started_at = "time"
   mode._close_active_episode()
   assert mode.active_event_id is None and mode.active_episode_started_at is None
@@ -192,11 +196,11 @@ def test_stale_accelerometer_is_actionable_and_clears_evidence(tmp_path) -> None
     capture=object(), clock=lambda: 100.0,
   )
   mode.arm_started_at = 0.0
-  mode.detector.motion_evidence_seconds = 0.9
+  mode.detector.trigger_count = 9
   mode.update()
   assert mode.state == "sensor_unavailable"
   assert "Accelerometer" in mode.state_error
-  assert mode.detector.motion_evidence_seconds == 0
+  assert mode.detector.trigger_count == 0
 
 
 def test_real_accelerometer_reader_captures_before_warning_and_warns_without_duplicate(tmp_path, monkeypatch) -> None:
@@ -207,7 +211,7 @@ def test_real_accelerometer_reader_captures_before_warning_and_warns_without_dup
   now = [100.0]
   mode = SentryMode(
     config_store=ConfigStore(SentryConfig(enabled=True, capture_upload_consent_version=CURRENT_CONSENT_VERSION,
-                                         warning_persistence_seconds=0.5, wait_for_driver_exit=False)),
+                                         wait_for_driver_exit=False)),
     store=store, params=params, volatile_params=params, sm=sm, capture=object(), clock=lambda: now[0],
   )
   mode.arm_started_at = 0.0
@@ -219,18 +223,18 @@ def test_real_accelerometer_reader_captures_before_warning_and_warns_without_dup
     assert params.get_bool("SentryRuntimeEnabled")
     assert mode.detector.previous_acceleration == pytest.approx((0.0, 0.0, 9.81))
 
-    for index in range(1, 6):
+    for index in range(1, 11):
       now[0] = 100.0 + index / 10
       sm.recv_time["accelerometer"] = now[0]
       sm.logMonoTime["accelerometer"] = round(now[0] * 1e9)
-      sm.accelerometer = log.SensorEventData.new_message(acceleration={"v": [index / 10, 0.0, 9.81]}).as_reader()
+      sm.accelerometer = log.SensorEventData.new_message(acceleration={"v": [0.0, 0.0, 9.81 + index / 10]}).as_reader()
       mode.update()
       if index == 1:
-        assert mode.state == "motion"
+        assert mode.state == "confirming"
         assert mode.active_event_id is not None
         first_event_id = mode.active_event_id
         assert mode.capture_queue == [CaptureJob(first_event_id, 1)]
-        assert store.revision_state(first_event_id, 1) == "capturing"
+        assert store.revision_state(first_event_id, 1) == "provisional_capturing"
 
     assert mode.state == "warning"
     assert mode.state_error is None
@@ -557,3 +561,213 @@ def test_main_clears_stale_runtime_before_fallible_initialization(monkeypatch) -
   with pytest.raises(RuntimeError, match="config failure"):
     main()
   assert constructed == [True]
+
+
+@pytest.mark.parametrize("reason", ("expiry", "sensor_loss"))
+def test_failed_provisional_discard_cannot_be_reconfirmed_by_later_motion(tmp_path, monkeypatch, reason) -> None:
+  now = [100.0]
+  params, sm = Params(), SubMaster()
+  store = SentryStore(tmp_path / "outbox.sqlite3")
+  mode = SentryMode(
+    config_store=ConfigStore(), store=store, params=params, volatile_params=params, sm=sm,
+    capture=object(), clock=lambda: now[0],
+  )
+  mode.arm_started_at = 0.0
+  monkeypatch.setattr(mode, "_start_capture_if_needed", lambda: None)
+
+  def sample(timestamp, z):
+    timestamp = round(timestamp, 6)
+    now[0] = timestamp
+    sm.updated["accelerometer"] = True
+    sm.recv_time["accelerometer"] = timestamp
+    sm.logMonoTime["accelerometer"] = round(timestamp * 1e9)
+    sm.accelerometer = log.SensorEventData.new_message(acceleration={"v": [0.0, 0.0, z]}).as_reader()
+    mode.update()
+
+  sample(100.0, 9.81)
+  sample(100.1, 9.91)
+  old_id = mode.active_event_id
+  assert old_id is not None
+  # Model a completed first capture without starting hardware/thread workers.
+  store.finish_capture(old_id, 1, {}, {"wide": "camera_unavailable", "cabin": "camera_unavailable"})
+  mode.capture_queue.clear()
+  fail_discard = [True]
+  original_discard, original_confirm = store.discard_event, store.confirm_event
+  confirmed_ids = []
+
+  def discard(event_id):
+    if event_id == old_id and fail_discard[0]:
+      raise sqlite3.OperationalError("simulated provisional discard failure")
+    return original_discard(event_id)
+
+  def confirm(event_id):
+    confirmed_ids.append(event_id)
+    return original_confirm(event_id)
+
+  monkeypatch.setattr(store, "discard_event", discard)
+  monkeypatch.setattr(store, "confirm_event", confirm)
+  if reason == "expiry":
+    sample(160.1, 9.81)
+  else:
+    sm.valid["accelerometer"] = False
+    sample(100.2, 9.81)
+    sm.valid["accelerometer"] = True
+  start = now[0]
+  for index in range(1, 21):
+    sample(start + index / 10, 9.81 + (index % 2) / 10)
+    assert not mode.active_confirmed
+    assert store.revision_state(old_id, 1) == "provisional_ready"
+    assert store.next_pending(1e20) is None
+  assert old_id not in confirmed_ids
+
+  fail_discard[0] = False
+  sample(now[0] + 0.1, 9.81)
+  assert store.revision_state(old_id, 1) in (None, "discarding")
+  assert mode.active_event_id != old_id
+  start = now[0]
+  for index in range(1, 13):
+    sample(start + index / 10, 9.81 + (index % 2) / 10)
+  assert mode.active_confirmed
+  assert mode.active_event_id != old_id
+  assert old_id not in confirmed_ids
+  store.close()
+
+
+@pytest.mark.parametrize("failure", ("stale", "empty", "unknown", "params"))
+def test_unavailable_ignition_cannot_clear_recovered_durable_door_pause(tmp_path, failure) -> None:
+  class FailingParams(Params):
+    fail_ignition = False
+
+    def get_bool(self, key):
+      if key == "IsOffroad" and self.fail_ignition:
+        raise OSError("simulated ignition Params failure")
+      return super().get_bool(key)
+
+  params, sm = FailingParams(), SubMaster()
+  path = tmp_path / "outbox.sqlite3"
+  store = SentryStore(path)
+  store.start_door_event(
+    event_id="2efb19cb-3bf6-49a7-865a-f15e87f50743", detected_at="2026-09-04T12:00:00+00:00", message="Door opened.",
+  )
+  store.close()
+  # The restart must retain its pause before fresh physical ignition arrives.
+  store = SentryStore(path)
+  mode = SentryMode(
+    config_store=ConfigStore(), store=store, params=params, volatile_params=params, sm=sm,
+    capture=object(), clock=lambda: 100.0,
+  )
+  valid_pandas = sm.panda_states
+  if failure == "stale":
+    sm.panda_checks = False
+  elif failure == "empty":
+    sm.panda_states = []
+  elif failure == "unknown":
+    sm.panda_states[0].pandaType = log.PandaState.PandaType.unknown
+  else:
+    params.fail_ignition = True
+  mode.update()
+  assert mode.ignition_error is not None
+  assert mode.door_paused and store.get_door_pause()
+  assert mode.driver_exit_completed  # No extra exit/90-second gate after this durable pause.
+  assert mode.door_closed_at is None
+  assert not params.get_bool("SentryRuntimeEnabled")
+
+  sm.panda_checks = True
+  sm.panda_states = valid_pandas
+  sm.panda_states[0].pandaType = "dos"
+  params.fail_ignition = False
+  mode.update()
+  assert mode.ignition_error is None
+  assert mode.door_paused and store.get_door_pause()
+  sm.panda_states[0].ignitionCan = True
+  mode.update()
+  assert not mode.door_paused and not store.get_door_pause()
+  store.close()
+
+
+def confirmation_failure_fixture(tmp_path, monkeypatch):
+  now = [100.0]
+  params, sm = Params(), SubMaster()
+  store = SentryStore(tmp_path / "outbox.sqlite3")
+  mode = SentryMode(
+    config_store=ConfigStore(), store=store, params=params, volatile_params=params, sm=sm,
+    capture=object(), clock=lambda: now[0],
+  )
+  mode.arm_started_at = 0.0
+  monkeypatch.setattr(mode, "_start_capture_if_needed", lambda: None)
+  confirmation_fails = [True]
+  attempts = []
+  original_confirm = store.confirm_event
+
+  def confirm(event_id):
+    attempts.append(event_id)
+    if confirmation_fails[0]:
+      raise sqlite3.OperationalError("simulated confirmation commit failure")
+    return original_confirm(event_id)
+
+  def sample(index, *, timestamp=None):
+    now[0] = round(100.0 + index / 10 if timestamp is None else timestamp, 6)
+    sm.updated["accelerometer"] = True
+    sm.recv_time["accelerometer"] = now[0]
+    sm.logMonoTime["accelerometer"] = round(now[0] * 1e9)
+    sm.accelerometer = log.SensorEventData.new_message(acceleration={"v": [0.0, 0.0, 9.81 + (index % 2) / 10]}).as_reader()
+    mode.update()
+
+  monkeypatch.setattr(store, "confirm_event", confirm)
+  sample(0)
+  sample(1)
+  event_id = mode.active_event_id
+  assert event_id is not None
+  store.finish_capture(event_id, 1, {}, {"wide": "camera_unavailable", "cabin": "camera_unavailable"})
+  mode.capture_queue.clear()
+  mode.next_capture_at = 101.1
+  return mode, store, event_id, confirmation_fails, attempts, sample
+
+
+@pytest.mark.parametrize("gap", (1.0, 1.1))
+def test_sampling_gap_discards_warning_hits_without_durable_confirmation(tmp_path, monkeypatch, gap) -> None:
+  mode, store, event_id, confirmation_fails, attempts, sample = confirmation_failure_fixture(tmp_path, monkeypatch)
+  for index in range(2, 11):
+    sample(index)
+  assert mode.detector.warning_triggered
+  assert not mode.active_confirmed
+  assert store.revision_state(event_id, 1) == "provisional_ready"
+  previous_attempts = len(attempts)
+  assert previous_attempts >= 1
+
+  # The resumed sample itself is fresh: the gap must be checked against the
+  # previous consumed sample, not just the current receive/publish timestamps.
+  confirmation_fails[0] = False
+  sample(11, timestamp=101.0 + gap)
+  assert len(attempts) == previous_attempts
+  assert not mode.active_confirmed
+  assert mode.active_event_id != event_id
+  assert store.revision_state(event_id, 1) in (None, "discarding")
+  mode._cleanup_discarded_work()
+  assert store.revision_state(event_id, 1) is None
+  assert store.retry_all() == 0
+  assert store.next_pending(1e20) is None
+  store.close()
+
+
+def test_alarm_evidence_survives_confirmation_commit_failure_with_fresh_samples(tmp_path, monkeypatch) -> None:
+  mode, store, event_id, confirmation_fails, attempts, sample = confirmation_failure_fixture(tmp_path, monkeypatch)
+  for index in range(2, 303):
+    sample(index)
+  assert len(attempts) > 1
+  assert mode.detector.warning_triggered and mode.detector.alarm_triggered
+  assert not mode.active_confirmed
+  assert store.revision_state(event_id, 1) == "provisional_ready"
+  assert store.connection.execute("SELECT COUNT(*) FROM revisions").fetchone()[0] == 1
+  assert store.next_pending(1e20) is None
+
+  confirmation_fails[0] = False
+  sample(303)
+  assert mode.active_confirmed
+  assert mode.active_event_id == event_id
+  assert store.revision_state(event_id, 1) == "ready"
+  assert mode.capture_queue == [CaptureJob(event_id, 2)]
+  assert store.connection.execute("SELECT kind FROM revisions WHERE event_id=? AND revision=2", (event_id,)).fetchone()[0] == "alarm"
+  assert not mode.pending_alarm  # Consumed exactly once by the reserved alarm capture.
+  assert store.next_pending(0).event_id == event_id
+  store.close()

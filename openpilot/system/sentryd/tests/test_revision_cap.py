@@ -80,7 +80,7 @@ def test_cap_rearms_for_ninety_seconds_while_uploads_continue_then_starts_a_new_
   send_sample(mode, rearm_at + ARM_DELAY_SECONDS + 0.1, 1.1)
   assert mode.active_event_id is not None and mode.active_event_id != event_id
   assert mode.capture_queue == [CaptureJob(mode.active_event_id, 1)]
-  assert mode.store.revision_state(mode.active_event_id, 1) == "capturing"
+  assert mode.store.revision_state(mode.active_event_id, 1) == "provisional_capturing"
 
 
 def test_last_revision_storage_failure_retains_episode_until_durable_then_starts_full_rearm(mode, monkeypatch):
@@ -153,7 +153,12 @@ def test_old_final_revision_cannot_close_or_rearm_a_newer_episode(mode):
   old_event_id = capture_through(mode, 20)
   queue_next_pair(mode, old_event_id, 21)
   old_worker = mode.active_capture
-  mode._close_active_episode()
+  finish_pair(mode)
+  old_worker.thread.join(1)
+  mode._finish_capture_if_ready()
+  # A delayed duplicate completion from a retired worker must not act on a
+  # new episode. Start it only after the actual final result became durable.
+  mode.test_now[0] += ARM_DELAY_SECONDS
   mode.detector.reset()
   mode.detector.episode_active = True
   mode.detector.first_motion_at = mode.clock()
@@ -162,10 +167,11 @@ def test_old_final_revision_cannot_close_or_rearm_a_newer_episode(mode):
   mode._process_detection("motion", mode.clock())
   new_event_id = mode.active_event_id
   assert new_event_id != old_event_id
-  finish_pair(mode)
+  old_worker.job = CaptureJob(old_event_id, 21)
+  mode._capture_finalized(old_worker)
   assert mode.store.revision_state(old_event_id, 21) == "ready"
   assert old_worker.idle_stop.is_set()
   assert mode.active_event_id == new_event_id and mode.arm_started_at == 10.0
-  assert mode.detector.episode_active and mode.state == "motion"
+  assert mode.detector.episode_active and mode.state == "confirming"
   assert mode.capture_queue == [CaptureJob(new_event_id, 1)]
   assert mode.store.connection.execute("SELECT closed FROM events WHERE event_id=?", (new_event_id,)).fetchone()[0] == 0
