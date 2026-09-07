@@ -348,7 +348,8 @@ def _exercise_scenario(scenario: str, temporary_root: Path) -> None:
                  "waiting_for_doors": "lock_waiting_for_doors"}.get(lock_state, "arming")
         status = {"state": state, "updated_at": datetime.now(UTC).isoformat(),
                   "lock_detection": {"enabled": scenario != "flash_help", "state": lock_state,
-                                     "inferred_state": "locked" if lock_state in ("arming", "armed", "waiting_for_doors") else None,
+                                     "inferred_state": "unlocked" if lock_state == "waiting_for_doors" else
+                                                       "locked" if lock_state in ("arming", "armed") else None,
                                      "pulse_count": 1, "pause_seconds_remaining": 89.2 if lock_state == "arming" else 3599.2,
                                      "error": None}}
         if scenario == "flash_unavailable":
@@ -386,10 +387,15 @@ def _exercise_scenario(scenario: str, temporary_root: Path) -> None:
               assert panel._status.value == expected
             assert "heuristic, not a verified door-lock signal" in dialog._card.value
             assert "validated Audi MQB CAN profile" in dialog._card.value
-            assert "90 seconds" in dialog._card.value and "all doors and the trunk close" in dialog._card.value
+            assert "starts 90 seconds of arming immediately, without checking door closure" in dialog._card.value
+            assert "bypasses the driver-exit and five-minute door waits" in dialog._card.value
+            assert "Open doors or loss of the door receiver do not reset this lock timer" in dialog._card.value
             assert "all automatic motion and door captures for 60 minutes" in dialog._card.value
+            assert "After that hour, all doors and the trunk must be observed closed before a new 90-second arming timer" in dialog._card.value
+            assert "reopening resets that timer" in dialog._card.value
             assert "Hazard flashes are ignored" in dialog._card.value
             assert "restarts the full 60 minutes" in dialog._card.value
+            assert "Restarting during lock-triggered arming starts a fresh 90 seconds without checking doors" in dialog._card.value
             assert "Manual tests and queued uploads continue" in dialog._card.value
             if scenario == "flash_unavailable":
               assert status["lock_detection"]["error"] in dialog._card.value
