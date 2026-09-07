@@ -2,6 +2,7 @@ import base64
 import io
 import json
 from datetime import UTC, datetime
+from threading import Event
 from uuid import uuid4
 
 import pytest
@@ -93,6 +94,179 @@ def ack_for(store):
     "media": [{"role": item.role, "sha256": item.sha256} for item in queued.media],
     "deleted": False,
   }
+
+
+def add_queued_revision(store, *, event_id=None, revision=1, attempts=0, next_attempt_at=0, order=0):
+  event_id = event_id or str(uuid4())
+  store.begin_revision(
+    event_id=event_id, revision=revision, kind="warning" if revision == 1 else "follow_up", source="motion",
+    episode_started_at=NOW, detected_at=NOW, message="Movement detected while parked.", schema_version=2,
+  )
+  store.finish_capture(event_id, revision, {"wide": MediaData(JPEG, 10, 10)}, {"cabin": "camera_unavailable"})
+  with store.connection:
+    store.connection.execute(
+      "UPDATE revisions SET attempts=?, next_attempt_at=?, created_at=? WHERE event_id=? AND revision=?",
+      (attempts, next_attempt_at, datetime.fromtimestamp(order, UTC).isoformat(), event_id, revision),
+    )
+  return event_id
+
+
+class DrainTransport:
+  def __init__(self, outcome=lambda _: 201):
+    self.outcome = outcome
+    self.calls = []
+
+  def post_event(self, dongle_id, revision, files):
+    self.calls.append((revision.event_id, revision.revision))
+    outcome = self.outcome(revision)
+    if isinstance(outcome, Exception):
+      raise outcome
+    payload = {
+      "event_id": revision.event_id, "revision": revision.revision, "deleted": False,
+      "media": [{"role": item.role, "sha256": item.sha256} for item in revision.media],
+    }
+    if outcome == "mismatched_ack":
+      payload["event_id"] = str(uuid4())
+      outcome = 200
+    return Response(outcome, payload)
+
+
+def test_successful_retry_drains_deferred_revisions_in_order_without_reopening_failed_or_active_work(tmp_path) -> None:
+  store = SentryStore(tmp_path / "outbox.sqlite3")
+  active = add_queued_revision(store)
+  assert store.claim_pending(0).event_id == active
+  recovered = add_queued_revision(store, attempts=2, order=1)
+  deferred = add_queued_revision(store, attempts=1, next_attempt_at=1000, order=2)
+  for revision in (2, 3):
+    add_queued_revision(store, event_id=deferred, revision=revision, next_attempt_at=1000, order=revision + 1)
+  terminal = add_queued_revision(store, attempts=1, next_attempt_at=1000, order=5)
+  store.mark_terminal(terminal, 1, error="terminal", http_status=422)
+  quota_lost = add_queued_revision(store, attempts=1, next_attempt_at=1000, order=6)
+  store.mark_terminal(quota_lost, 1, error="quota lost", http_status=0)
+  with store.connection:
+    store.connection.execute("UPDATE revisions SET retryable=0 WHERE event_id=?", (quota_lost,))
+
+  transport = DrainTransport()
+  uploader = SentryUploader("dongle", store, transport)
+  assert uploader.upload_pending(now=100) == 4
+  assert transport.calls == [(recovered, 1), (deferred, 1), (deferred, 2), (deferred, 3)]
+  assert store.revision_state(active, 1) == "uploading"
+  assert store.revision_state(terminal, 1) == "terminal"
+  assert store.revision_state(quota_lost, 1) == "terminal"
+
+
+def test_drain_recovery_sweep_runs_once_so_later_success_preserves_new_failure_backoff(tmp_path) -> None:
+  store = SentryStore(tmp_path / "outbox.sqlite3")
+  recovered = add_queued_revision(store, attempts=1, order=0)
+  failed = add_queued_revision(store, attempts=2, next_attempt_at=1000, order=1)
+  later_success = add_queued_revision(store, attempts=3, next_attempt_at=1000, order=2)
+  transport = DrainTransport(lambda revision: 503 if revision.event_id == failed else 201)
+
+  assert SentryUploader("dongle", store, transport, random_uniform=lambda *_: 0).upload_pending(now=100) == 2
+  assert transport.calls == [(recovered, 1), (failed, 1), (later_success, 1)]
+  assert tuple(store.connection.execute(
+    "SELECT state, attempts, next_attempt_at FROM revisions WHERE event_id=?", (failed,),
+  ).fetchone()) == ("ready", 3, 120.0)
+
+
+def test_failure_before_first_success_keeps_backoff_during_recovery_sweep(tmp_path, monkeypatch) -> None:
+  store = SentryStore(tmp_path / "outbox.sqlite3")
+  # Equal timestamps must be excluded too, even when the clock does not tick
+  # between the drain starting and the first failed claim.
+  monkeypatch.setattr(store, "_utc_now", lambda: NOW)
+  failed = add_queued_revision(store, attempts=2, order=0)
+  recovered = add_queued_revision(store, attempts=1, order=1)
+  deferred = add_queued_revision(store, attempts=1, next_attempt_at=1000, order=2)
+  transport = DrainTransport(lambda revision: 503 if revision.event_id == failed else 201)
+
+  assert SentryUploader("dongle", store, transport, random_uniform=lambda *_: 0).upload_pending(now=100) == 2
+  assert transport.calls == [(failed, 1), (recovered, 1), (deferred, 1)]
+  assert tuple(store.connection.execute(
+    "SELECT state, attempts, next_attempt_at FROM revisions WHERE event_id=?", (failed,),
+  ).fetchone()) == ("ready", 3, 120.0)
+
+
+@pytest.mark.parametrize("retry_after,floor,recovery_at,wakes", (
+  (None, 0, 102, True), ("invalid", 0, 102, True),
+  ("30", 130, 102, False), ("30", 130, 131, True),
+  ("Thu, 01 Jan 1970 00:02:10 GMT", 130, 102, False),
+  ("Thu, 01 Jan 1970 00:01:00 GMT", 100, 102, True),
+  ("999999", 3700, 102, False),
+))
+def test_automatic_recovery_preserves_retry_after_across_restart_but_wakes_local_http_backoff(
+    tmp_path, monkeypatch, retry_after, floor, recovery_at, wakes) -> None:
+  path = tmp_path / "outbox.sqlite3"
+  store = SentryStore(path)
+  monkeypatch.setattr(SentryStore, "_utc_now", staticmethod(lambda: NOW))
+  deferred = add_queued_revision(store, attempts=4)
+  headers = {"Retry-After": retry_after} if retry_after is not None else {}
+  assert SentryUploader("dongle", store, Transport(Response(503, {}, headers)), random_uniform=lambda *_: 0).upload_once(now=100) is False
+  assert store.connection.execute("SELECT retry_after_at FROM revisions WHERE event_id=?", (deferred,)).fetchone()[0] == floor
+  store.close()
+
+  store = SentryStore(path)
+  monkeypatch.setattr(SentryStore, "_utc_now", staticmethod(lambda: "2026-09-04T00:00:01+00:00"))
+  recovered = add_queued_revision(store, attempts=1, order=1)
+  transport = DrainTransport()
+  assert SentryUploader("dongle", store, transport).upload_pending(now=recovery_at) == 1 + int(wakes)
+  assert transport.calls == ([(recovered, 1), (deferred, 1)] if wakes else [(recovered, 1)])
+  if not wakes:
+    assert tuple(store.connection.execute(
+      "SELECT state, next_attempt_at, retry_after_at FROM revisions WHERE event_id=?", (deferred,),
+    ).fetchone()) == ("ready", floor, floor)
+    assert not store.upload_work_due(recovery_at)
+    assert store.retry_all() == 1  # explicit user action can override the server wait
+    assert SentryUploader("dongle", store, DrainTransport()).upload_pending(now=recovery_at) == 1
+
+
+@pytest.mark.parametrize("attempts,outcome,uploaded", (
+  (0, 201, 1), (1, requests.ConnectionError("offline"), 0), (1, 503, 0),
+  (1, 422, 0), (1, "mismatched_ack", 0),
+))
+def test_only_a_successfully_acknowledged_retry_wakes_deferred_work(tmp_path, attempts, outcome, uploaded) -> None:
+  store = SentryStore(tmp_path / "outbox.sqlite3")
+  first = add_queued_revision(store, attempts=attempts)
+  deferred = add_queued_revision(store, attempts=2, next_attempt_at=1000, order=1)
+  transport = DrainTransport(lambda _: outcome)
+
+  assert SentryUploader("dongle", store, transport, random_uniform=lambda *_: 0).upload_pending(now=100) == uploaded
+  assert transport.calls == [(first, 1)]
+  assert tuple(store.connection.execute(
+    "SELECT state, attempts, next_attempt_at FROM revisions WHERE event_id=?", (deferred,),
+  ).fetchone()) == ("ready", 2, 1000.0)
+
+
+def test_manual_retry_all_drains_ready_and_recoverable_terminal_work(tmp_path) -> None:
+  store = SentryStore(tmp_path / "outbox.sqlite3")
+  deferred = add_queued_revision(store, attempts=2, next_attempt_at=1000, order=0)
+  terminal = add_queued_revision(store, attempts=1, next_attempt_at=1000, order=1)
+  store.mark_terminal(terminal, 1, error="RTZ returned terminal HTTP 422", http_status=422)
+  assert store.retry_all() == 2
+  transport = DrainTransport()
+
+  assert SentryUploader("dongle", store, transport).upload_pending(now=100) == 2
+  assert transport.calls == [(deferred, 1), (terminal, 1)]
+
+
+@pytest.mark.parametrize("stopped_before_upload", (False, True))
+def test_upload_drain_stops_between_requests_without_claiming_more_work(tmp_path, stopped_before_upload) -> None:
+  store = SentryStore(tmp_path / "outbox.sqlite3")
+  first = add_queued_revision(store, order=0)
+  second = add_queued_revision(store, order=1)
+  stop = Event()
+
+  def succeed_then_stop(_):
+    stop.set()
+    return 201
+
+  transport = DrainTransport(succeed_then_stop)
+  if stopped_before_upload:
+    stop.set()
+  assert SentryUploader("dongle", store, transport).upload_pending(now=100, stop_event=stop) == int(not stopped_before_upload)
+  assert transport.calls == ([] if stopped_before_upload else [(first, 1)])
+  assert store.revision_state(first, 1) == ("ready" if stopped_before_upload else "acknowledged")
+  assert store.revision_state(second, 1) == "ready"
+  assert store.connection.execute("SELECT attempts FROM revisions WHERE event_id=?", (second,)).fetchone()[0] == 0
 
 
 def test_default_transport_preserves_base_api_registered_key_preference(tmp_path, monkeypatch) -> None:

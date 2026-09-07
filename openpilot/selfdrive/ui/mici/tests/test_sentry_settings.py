@@ -8,6 +8,7 @@ import subprocess
 import sys
 from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
+from uuid import UUID
 
 import pytest
 
@@ -16,6 +17,7 @@ import pytest
   "consent_cancel", "consent_confirm", "sensitivity", "warning", "save_failure", "legacy_high", "existing_high",
   "driver_exit", "driver_exit_failure", "waiting_for_door_open", "waiting_for_door_close", "door_signal_unavailable",
   "stale_door_status", "runtime_error",
+  "queue_retry", "retry_all", "retry_failure", "retry_onroad",
 ])
 def test_sentry_settings_navigation_and_persistence(tmp_path, scenario):
   # ui_state owns native messaging/Params singletons. Isolate its replacement in
@@ -48,10 +50,15 @@ def _exercise_scenario(scenario: str, temporary_root: Path) -> None:
     def texture(_path, width, height, *args, **kwargs):
       return SimpleNamespace(id=0, width=width, height=height)
 
+    runtime_writes = []
+    volatile_params = SimpleNamespace(
+      get=lambda _key: None,
+      put=lambda key, value, block=False: runtime_writes.append((key, value, block)),
+    )
     with (patch.object(gui_app, "texture", side_effect=texture),
           patch.object(gui_app, "font", return_value=rl.Font()),
           patch.object(rl, "get_time", return_value=100.0),
-          patch.object(sentry, "runtime_params", return_value=SimpleNamespace(get=lambda _key: None))):
+          patch.object(sentry, "runtime_params", return_value=volatile_params)):
       base = NavScroller()
       gui_app.push_widget(base)
       if scenario in ("legacy_high", "existing_high"):
@@ -198,6 +205,49 @@ def _exercise_scenario(scenario: str, temporary_root: Path) -> None:
           if scenario == "door_signal_unavailable":
             assert "USB power" in status_dialog._card.value
             assert "Turn off wait for driver exit" in status_dialog._card.value
+
+      elif scenario in ("queue_retry", "retry_all", "retry_failure", "retry_onroad"):
+        config_before = {path.name: path.read_bytes() for path in store.config_dir.iterdir()}
+        assert panel._queue.enabled
+        assert panel._retry.enabled
+        assert panel._retry.text == "retry all uploads"
+
+        if scenario == "retry_onroad":
+          ui_state_module.ui_state.is_offroad = lambda: False
+          assert not panel._queue.enabled
+          assert not panel._retry.enabled
+          # Invoke the real callbacks even though normal touch dispatch is
+          # disabled, exercising ignition changes during an existing touch.
+          click(panel._queue)
+          click(panel._retry)
+          assert runtime_writes == []
+          assert gui_app._nav_stack[-1] is panel
+          ui_state_module.ui_state.is_offroad = lambda: True
+          click(panel._queue)
+        elif scenario == "retry_failure":
+          with patch.object(volatile_params, "put", side_effect=OSError(errno.ENOSPC, "No space left on device")):
+            click(panel._queue)
+          assert runtime_writes == []
+          error_dialog = gui_app._nav_stack[-1]
+          assert isinstance(error_dialog, sentry.BigDialog)
+          assert error_dialog._card.text == "Sentry command failed"
+          assert "No space left on device" in error_dialog._card.value
+          gui_app.pop_widget()
+          assert panel.enabled is True
+          click(panel._retry)
+        else:
+          click(panel._queue if scenario == "queue_retry" else panel._retry)
+
+        assert len(runtime_writes) == 1
+        key, command, block = runtime_writes[0]
+        assert key == "SentryRuntimeCommand"
+        assert command["command"] == "retry_uploads"
+        assert UUID(command["request_id"]).version == 4
+        assert set(command) == {"command", "request_id"}
+        assert block is True
+        assert gui_app._nav_stack[-1] is panel
+        assert {path.name: path.read_bytes() for path in store.config_dir.iterdir()} == config_before
+        assert not store.load().effective_enabled
 
       elif scenario == "save_failure":
         with patch("openpilot.system.sentryd.config.os.fsync", side_effect=OSError(errno.ENOSPC, "No space left on device")):

@@ -11,6 +11,7 @@ import stat
 from contextlib import ExitStack
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import Event
 from typing import BinaryIO, Protocol
 
 import requests
@@ -151,12 +152,36 @@ class SentryUploader:
     self.wall_clock = wall_clock
 
   def upload_once(self, now: float | None = None) -> bool | None:
+    result, _ = self._upload_next(now)
+    return result
+
+  def upload_pending(self, now: float | None = None, *, stop_event: Event | None = None) -> int:
+    """Drain eligible uploads and wake deferred work once after a successful retry."""
+    uploaded = 0
+    woke_pending = False
+    drain_started_at = self.store._utc_now()
+    while stop_event is None or not stop_event.is_set():
+      result, was_retry = self._upload_next(now)
+      if result is None:
+        return uploaded
+      if result:
+        uploaded += 1
+        if was_retry and not woke_pending:
+          # One recovery sweep per drain: subsequent successes must not keep
+          # overriding backoff for revisions that failed again during it.
+          self.store.retry_pending(attempted_before=drain_started_at)
+          woke_pending = True
+    return uploaded
+
+  def _upload_next(self, now: float | None) -> tuple[bool | None, bool]:
     fixed_now = now is not None
     claim_now = self.wall_clock() if now is None else now
     revision = self.store.claim_pending(claim_now)
     if revision is None:
-      return None
+      return None, False
+    return self._upload_revision(revision, claim_now, fixed_now), revision.attempts > 0
 
+  def _upload_revision(self, revision: QueuedRevision, claim_now: float, fixed_now: bool) -> bool:
     try:
       with ExitStack() as stack:
         files = {item.role: stack.enter_context(self._open_media(item, self.store.media_root)) for item in revision.media}
@@ -216,6 +241,7 @@ class SentryUploader:
     self.store.schedule_retry(
       revision.event_id, revision.revision,
       next_attempt_at=now + min(delay, MAX_RETRY_SECONDS), error=error, http_status=http_status,
+      retry_after_at=now + parsed_retry_after if parsed_retry_after is not None else 0,
     )
 
   @staticmethod

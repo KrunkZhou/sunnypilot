@@ -458,14 +458,14 @@ class SentryStore:
     return row["state"] if row is not None else None
 
   def schedule_retry(self, event_id: str, revision: int, *, next_attempt_at: float,
-                     error: str, http_status: int | None = None) -> None:
+                     error: str, http_status: int | None = None, retry_after_at: float = 0) -> None:
     with self.connection:
       self.connection.execute(
         """
-        UPDATE revisions SET state='ready', next_attempt_at=?, last_error=?, last_http_status=?
+        UPDATE revisions SET state='ready', next_attempt_at=?, retry_after_at=?, last_error=?, last_http_status=?
         WHERE event_id=? AND revision=? AND state IN ('ready', 'uploading')
         """,
-        (next_attempt_at, self._bounded_error(error), http_status, event_id, revision),
+        (max(next_attempt_at, retry_after_at), retry_after_at, self._bounded_error(error), http_status, event_id, revision),
       )
 
   def mark_terminal(self, event_id: str, revision: int, *, error: str, http_status: int) -> None:
@@ -482,8 +482,30 @@ class SentryStore:
     with self.connection:
       result = self.connection.execute(
         """
-        UPDATE revisions SET state='ready', next_attempt_at=0, last_error=NULL, last_http_status=NULL
+        UPDATE revisions SET state='ready', next_attempt_at=0, retry_after_at=0, last_error=NULL, last_http_status=NULL
         WHERE state='terminal' AND retryable=1
+        """
+      )
+    return result.rowcount
+
+  def retry_pending(self, *, attempted_before: str | None = None) -> int:
+    """Wake older queued work, honoring server retry floors and current-drain failures."""
+    with self.connection:
+      result = self.connection.execute(
+        """
+        UPDATE revisions SET next_attempt_at=retry_after_at WHERE state='ready' AND retryable=1
+          AND (? IS NULL OR last_attempt_at IS NULL OR last_attempt_at<?)
+        """, (attempted_before, attempted_before),
+      )
+    return result.rowcount
+
+  def retry_all(self) -> int:
+    """Manually wake queued and recoverable failed uploads, preserving their payloads."""
+    with self.connection:
+      result = self.connection.execute(
+        """
+        UPDATE revisions SET state='ready', next_attempt_at=0, retry_after_at=0, last_error=NULL, last_http_status=NULL
+        WHERE state IN ('ready', 'terminal') AND retryable=1
         """
       )
     return result.rowcount
@@ -900,12 +922,12 @@ class SentryStore:
     )
 
   def _create_schema(self) -> None:
-    # Every upload uses a new connection. Already-migrated readers must not take
+    # Every upload worker uses a new connection. Already-migrated readers must not take
     # a schema write lock or rescan all queued media on each one-second poll.
     version = self.connection.execute("PRAGMA user_version").fetchone()[0]
-    if version == 2:
+    if version == 3:
       return
-    if version > 2:
+    if version > 3:
       raise ValueError("unsupported future Sentry outbox schema")
     # SQLite cannot widen an existing CHECK constraint in place. Disable FK
     # actions only on this connection, then serialize discovery and the complete
@@ -916,11 +938,11 @@ class SentryStore:
     try:
       self.connection.execute("BEGIN IMMEDIATE")
       version = self.connection.execute("PRAGMA user_version").fetchone()[0]
-      if version == 2:
+      if version == 3:
         # A concurrent initializer completed migration while we waited.
         self.connection.commit()
         return
-      if version > 2:
+      if version > 3:
         raise ValueError("unsupported future Sentry outbox schema")
       self.connection.execute(
         """
@@ -952,13 +974,24 @@ class SentryStore:
         self.connection.execute(f"INSERT INTO sentry_revisions_v2 ({columns}) SELECT {columns} FROM revisions")
         self.connection.execute("DROP TABLE revisions")
         self.connection.execute("ALTER TABLE sentry_revisions_v2 RENAME TO revisions")
+      if "retry_after_at" not in {row["name"] for row in self.connection.execute("PRAGMA table_info(revisions)")}:
+        self.connection.execute("ALTER TABLE revisions ADD COLUMN retry_after_at REAL NOT NULL DEFAULT 0")
+      # Older queues cannot distinguish Retry-After from local HTTP backoff.
+      # Preserve future HTTP deadlines conservatively; network errors have no
+      # server floor. Never rewrite active claims or any immutable wire data.
+      self.connection.execute(
+        """
+        UPDATE revisions SET retry_after_at=next_attempt_at
+        WHERE state='ready' AND last_http_status IS NOT NULL AND next_attempt_at>?
+        """, (datetime.now(UTC).timestamp(),),
+      )
       self.connection.execute(
         "CREATE INDEX IF NOT EXISTS sentry_revisions_pending ON revisions(state, next_attempt_at, created_at)"
       )
       self._create_media_table()
       if self.connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
         raise sqlite3.IntegrityError("Sentry outbox migration found invalid foreign keys")
-      self.connection.execute("PRAGMA user_version=2")
+      self.connection.execute("PRAGMA user_version=3")
       self.connection.commit()
     except Exception:
       self.connection.rollback()
@@ -986,6 +1019,7 @@ class SentryStore:
         retryable INTEGER NOT NULL DEFAULT 1 CHECK(retryable IN (0, 1)),
         attempts INTEGER NOT NULL DEFAULT 0,
         next_attempt_at REAL NOT NULL DEFAULT 0,
+        retry_after_at REAL NOT NULL DEFAULT 0,
         last_attempt_at TEXT,
         last_http_status INTEGER,
         last_error TEXT,

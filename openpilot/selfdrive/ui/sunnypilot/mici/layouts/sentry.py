@@ -80,11 +80,14 @@ class SentryLayoutMici(NavScroller):
     self._status = BigButton("Sentry status", "starting", self.icon)
     self._status.set_click_callback(self._show_status)
     self._queue = BigButton("upload queue", "0 pending")
+    self._queue.set_click_callback(self._retry_uploads)
+    self._queue.set_enabled(lambda: ui_state.is_offroad())
     self._manual_test = BigButton("test Sentry alert", "capture + upload", self.icon)
     self._manual_test.set_click_callback(lambda: self._send_command("manual_test"))
     self._manual_test.set_enabled(lambda: ui_state.is_offroad() and self.config.effective_enabled and self.config_error is None)
-    self._retry = BigButton("retry failed uploads", "manual retry")
-    self._retry.set_click_callback(lambda: self._send_command("retry_uploads"))
+    self._retry = BigButton("retry all uploads", "pending + failed")
+    self._retry.set_click_callback(self._retry_uploads)
+    self._retry.set_enabled(lambda: ui_state.is_offroad())
     self._reset = BigButton("reset Sentry settings", "keeps queued captures")
     self._reset.set_click_callback(self._confirm_reset)
 
@@ -186,6 +189,11 @@ class SentryLayoutMici(NavScroller):
       gui_app.push_widget(BigDialog("Sentry setting was not saved", error))
       return
     self._refresh_controls()
+
+  def _retry_uploads(self) -> None:
+    # Recheck at dispatch in case ignition changed after the touch began.
+    if ui_state.is_offroad():
+      self._send_command("retry_uploads")
 
   def _send_command(self, command: str) -> None:
     try:

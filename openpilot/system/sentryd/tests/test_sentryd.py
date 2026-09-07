@@ -467,6 +467,78 @@ def test_upload_poll_retries_acknowledged_media_cleanup_in_same_session(tmp_path
   assert mode.upload_thread is None
 
 
+def test_manual_retry_uses_all_queue_and_clears_poll_delay(tmp_path, monkeypatch) -> None:
+  params = Params()
+  store = SentryStore(tmp_path / "outbox.sqlite3")
+  mode = SentryMode(
+    config_store=ConfigStore(), store=store, params=params, volatile_params=params, sm=SubMaster(),
+    capture=object(), clock=lambda: 100.0,
+  )
+  calls = []
+  monkeypatch.setattr(store, "retry_all", lambda: calls.append("all") or 3)
+  mode.last_upload_started = 100.0
+  params.put("SentryRuntimeCommand", {
+    "command": "retry_uploads", "request_id": "2efb19cb-3bf6-49a7-865a-f15e87f50743",
+  })
+  mode._handle_command()
+  assert calls == ["all"]
+  assert mode.last_upload_started == float("-inf")
+  assert mode.state == "uploads_retried"
+  assert params.get("SentryRuntimeCommand") is None
+
+
+def test_manual_retry_storage_failure_remains_actionable(tmp_path, monkeypatch) -> None:
+  params = Params()
+  store = SentryStore(tmp_path / "outbox.sqlite3")
+  mode = SentryMode(
+    config_store=ConfigStore(), store=store, params=params, volatile_params=params, sm=SubMaster(),
+    capture=object(), clock=lambda: 100.0,
+  )
+  monkeypatch.setattr(store, "retry_all", lambda: (_ for _ in ()).throw(sqlite3.OperationalError("disk full")))
+  params.put("SentryRuntimeCommand", {
+    "command": "retry_uploads", "request_id": "2efb19cb-3bf6-49a7-865a-f15e87f50743",
+  })
+  mode._handle_command()
+  assert mode.state == "storage_error"
+  assert "Could not retry Sentry uploads" in mode.persistence_error
+  assert "disk full" in mode.persistence_error
+
+
+def test_upload_worker_drains_queue_with_shutdown_signal(tmp_path, monkeypatch) -> None:
+  import openpilot.system.sentryd.sentryd as sentryd_module
+  params = Params()
+  params.values["DongleId"] = "test-dongle"
+  store = SentryStore(tmp_path / "outbox.sqlite3")
+  event_id = "2efb19cb-3bf6-49a7-865a-f15e87f50743"
+  timestamp = "2026-09-04T12:00:00+00:00"
+  store.begin_revision(
+    event_id=event_id, revision=1, kind="warning", source="motion",
+    episode_started_at=timestamp, detected_at=timestamp, message="Movement detected while parked.",
+  )
+  store.finish_capture(event_id, 1, {}, {"wide": "camera_unavailable", "cabin": "camera_unavailable"})
+  mode = SentryMode(
+    config_store=ConfigStore(SentryConfig()), store=store, params=params, volatile_params=params, sm=SubMaster(),
+    capture=object(), clock=lambda: 100.0,
+  )
+  calls = []
+
+  class Uploader:
+    def __init__(self, dongle_id, worker_store):
+      assert dongle_id == "test-dongle"
+      assert worker_store is not store and worker_store.path == store.path
+
+    def upload_pending(self, *, stop_event):
+      calls.append(stop_event)
+      return 1
+
+  monkeypatch.setattr(sentryd_module, "SentryUploader", Uploader)
+  mode._start_upload_if_needed()
+  assert mode.upload_thread is not None
+  mode.upload_thread.join(timeout=5.0)
+  assert not mode.upload_thread.is_alive()
+  assert calls == [mode.stop_event]
+
+
 def test_main_clears_stale_runtime_before_fallible_initialization(monkeypatch) -> None:
   import openpilot.system.sentryd.sentryd as sentryd_module
   params = Params()

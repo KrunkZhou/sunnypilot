@@ -255,14 +255,15 @@ class SentryMode:
     name = command.get("command")
     if name == "retry_uploads":
       try:
-        count = self.store.retry_terminal()
+        count = self.store.retry_all()
       except (OSError, sqlite3.Error, ValueError) as exc:
         self._record_persistence_failure("Could not retry Sentry uploads", exc)
         return
       self.state = "uploads_retried"
       self.state_error = None
       self.persistence_error = None
-      cloudlog.info("Requeued %d terminal Sentry uploads", count)
+      self.last_upload_started = float("-inf")
+      cloudlog.info("Requeued %d pending or failed Sentry uploads", count)
     elif name == "manual_test":
       if not self.config.effective_enabled:
         self.state_error = "Enable Sentry Mode and accept capture/upload consent before testing"
@@ -600,7 +601,7 @@ class SentryMode:
       worker_store = None
       try:
         worker_store = SentryStore(store_path, media_quota_bytes=media_quota, run_maintenance=False)
-        SentryUploader(dongle_id, worker_store).upload_once()
+        SentryUploader(dongle_id, worker_store).upload_pending(stop_event=self.stop_event)
       except Exception:
         cloudlog.exception("Unexpected Sentry uploader failure")
       finally:

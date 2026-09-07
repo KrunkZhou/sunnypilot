@@ -113,6 +113,96 @@ def test_follow_up_terminal_failure_blocks_alarm_until_manual_retry_ack(tmp_path
   assert store.claim_pending(0).revision == 3
 
 
+@pytest.mark.parametrize("method", ("retry_pending", "retry_all"))
+@pytest.mark.parametrize("state,retryable", (
+  ("ready", 1), ("ready", 0), ("terminal", 1), ("terminal", 0),
+  ("uploading", 1), ("acknowledged", 1), ("capturing", 1),
+))
+def test_bulk_retry_preserves_payloads_attempts_and_active_claims(tmp_path, method, state, retryable) -> None:
+  store = SentryStore(tmp_path / "outbox.sqlite3")
+  event_id = begin(store)
+  if state != "capturing":
+    finish_complete(store, event_id)
+  with store.connection:
+    store.connection.execute(
+      """
+      UPDATE revisions SET state=?, retryable=?, attempts=7, next_attempt_at=1000,
+        last_attempt_at=?, last_error='previous failure', last_http_status=503 WHERE event_id=?
+      """, (state, retryable, NOW, event_id),
+    )
+  before = dict(store.connection.execute("SELECT * FROM revisions WHERE event_id=?", (event_id,)).fetchone())
+  media_before = [dict(row) for row in store.connection.execute("SELECT * FROM media WHERE event_id=?", (event_id,))]
+  files_before = {row["path"]: Path(row["path"]).read_bytes() for row in media_before if row["path"]}
+
+  eligible = bool(retryable and (state == "ready" or (method == "retry_all" and state == "terminal")))
+  assert getattr(store, method)() == int(eligible)
+  expected = before.copy()
+  if eligible:
+    expected["next_attempt_at"] = 0
+    if method == "retry_all":
+      expected.update(state="ready", last_error=None, last_http_status=None)
+  assert dict(store.connection.execute("SELECT * FROM revisions WHERE event_id=?", (event_id,)).fetchone()) == expected
+  assert [dict(row) for row in store.connection.execute("SELECT * FROM media WHERE event_id=?", (event_id,))] == media_before
+  assert {path: Path(path).read_bytes() for path in files_before} == files_before
+
+
+@pytest.mark.parametrize("method", ("retry_pending", "retry_all"))
+def test_bulk_retry_keeps_revisions_ordered(tmp_path, method) -> None:
+  store = SentryStore(tmp_path / "outbox.sqlite3")
+  event_id = begin(store, schema_version=2)
+  finish_complete(store, event_id)
+  for revision in (2, 3):
+    begin(store, event_id, revision=revision, kind="follow_up", schema_version=2)
+    finish_complete(store, event_id, revision=revision)
+  for revision in (1, 2, 3):
+    store.schedule_retry(event_id, revision, next_attempt_at=1000, error="offline")
+
+  assert getattr(store, method)() == 3
+  for revision in (1, 2, 3):
+    claimed = store.claim_pending(0)
+    assert claimed.revision == revision
+    assert store.claim_pending(0) is None  # successors remain blocked while this claim is active
+    assert store.acknowledge(event_id, revision, {item.role: item.sha256 for item in claimed.media})
+
+
+@pytest.mark.parametrize("last_attempt_at,eligible", (
+  (None, True), ("2026-09-03T23:59:59+00:00", True),
+  (NOW, False), ("2026-09-04T00:00:01+00:00", False),
+))
+def test_retry_pending_honors_drain_cutoff_and_server_floor(tmp_path, last_attempt_at, eligible) -> None:
+  store = SentryStore(tmp_path / "outbox.sqlite3")
+  event_id = begin(store)
+  finish_complete(store, event_id)
+  store.schedule_retry(event_id, 1, next_attempt_at=1000, retry_after_at=500, error="retry later", http_status=503)
+  with store.connection:
+    store.connection.execute("UPDATE revisions SET last_attempt_at=? WHERE event_id=?", (last_attempt_at, event_id))
+
+  assert store.retry_pending(attempted_before=NOW) == int(eligible)
+  assert tuple(store.connection.execute(
+    "SELECT next_attempt_at, retry_after_at, last_error, last_http_status FROM revisions WHERE event_id=?", (event_id,),
+  ).fetchone()) == (500 if eligible else 1000, 500, "retry later", 503)
+
+
+def test_retry_schedule_enforces_server_floor_and_manual_retry_explicitly_clears_it(tmp_path) -> None:
+  store = SentryStore(tmp_path / "outbox.sqlite3")
+  event_id = begin(store)
+  finish_complete(store, event_id)
+  store.schedule_retry(event_id, 1, next_attempt_at=100, retry_after_at=500, error="rate limited", http_status=429)
+  assert store.next_pending(499) is None
+  assert store.retry_pending() == 1
+  assert store.next_pending(499) is None
+  assert store.retry_all() == 1
+  assert tuple(store.connection.execute(
+    "SELECT next_attempt_at, retry_after_at, last_error FROM revisions WHERE event_id=?", (event_id,),
+  ).fetchone()) == (0, 0, None)
+  assert store.claim_pending(0).event_id == event_id
+  store.schedule_retry(event_id, 1, next_attempt_at=600, retry_after_at=900, error="rate limited again", http_status=429)
+  store.schedule_retry(event_id, 1, next_attempt_at=700, error="network failed")
+  assert tuple(store.connection.execute(
+    "SELECT next_attempt_at, retry_after_at FROM revisions WHERE event_id=?", (event_id,),
+  ).fetchone()) == (700, 0)
+
+
 @pytest.mark.parametrize("schema_version", [1, 2])
 def test_cannot_change_event_schema_between_revisions(tmp_path, schema_version) -> None:
   store = SentryStore(tmp_path / "outbox.sqlite3")
@@ -263,6 +353,8 @@ def create_legacy_outbox(path):
               for table in ("events", "revisions", "media")}
   for row in snapshot["events"]:
     del row["schema_version"]
+  for row in snapshot["revisions"]:
+    del row["retry_after_at"]
   files = {item["path"]: type(path)(item["path"]).read_bytes() for item in snapshot["media"] if item["path"]}
   store.connection.execute("PRAGMA foreign_keys=OFF")
   store.connection.executescript("DROP TABLE media; DROP TABLE revisions; DROP TABLE events;" + LEGACY_SCHEMA)
@@ -281,17 +373,23 @@ def assert_migrated_legacy(store, snapshot):
     actual = [dict(row) for row in store.connection.execute(f"SELECT * FROM {table}")]
     if table == "events":
       assert all(row.pop("schema_version") == 1 for row in actual)
+    elif table == "revisions":
+      assert all(row.pop("retry_after_at") == 0 for row in actual)
     assert actual == snapshot[table]
   assert store.connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
   assert store.connection.execute("PRAGMA foreign_key_check").fetchall() == []
-  assert store.connection.execute("PRAGMA user_version").fetchone()[0] == 2
+  assert store.connection.execute("PRAGMA user_version").fetchone()[0] == 3
   assert store.connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
   assert store.connection.execute("PRAGMA synchronous").fetchone()[0] == 2
 
 
-def test_legacy_migration_preserves_every_row_and_immutable_wire_payload(tmp_path) -> None:
+@pytest.mark.parametrize("legacy_version", (0, 1))
+def test_legacy_migration_preserves_every_row_and_immutable_wire_payload(tmp_path, legacy_version) -> None:
   path = tmp_path / "outbox.sqlite3"
   pending, acknowledged, snapshot, files = create_legacy_outbox(path)
+  with sqlite3.connect(path) as version_connection:
+    version_connection.execute(f"PRAGMA user_version={legacy_version}")
+  version_connection.close()
   for _ in range(3):
     store = SentryStore(path, run_maintenance=False)
     assert_migrated_legacy(store, snapshot)
@@ -311,6 +409,133 @@ def test_legacy_migration_preserves_every_row_and_immutable_wire_payload(tmp_pat
   ).fetchone()[0] == next(row["metadata_json"] for row in snapshot["revisions"] if row["event_id"] == pending)
   fresh_event = begin(recovered, schema_version=2)
   begin(recovered, fresh_event, revision=2, kind="follow_up", schema_version=2)
+
+
+def create_schema_two_outbox(path):
+  store = SentryStore(path)
+  future = datetime.now(UTC).timestamp() + 3600
+  event_ids = {}
+  for name, state, status, deadline, wire_schema in (
+    ("http", "ready", 503, future, 1), ("network", "ready", None, future, 2),
+    ("expired_http", "ready", 429, 1, 2), ("active", "uploading", 503, future, 2),
+    ("terminal", "terminal", 422, future, 1), ("capturing", "capturing", None, 0, 2),
+    ("acknowledged", "acknowledged", 200, 0, 1),
+  ):
+    event_id = event_ids[name] = begin(store, schema_version=wire_schema)
+    if state != "capturing":
+      finish_complete(store, event_id)
+    with store.connection:
+      store.connection.execute(
+        "UPDATE revisions SET state=?, attempts=?, next_attempt_at=?, last_attempt_at=?, last_http_status=? WHERE event_id=?",
+        (state, 0 if state == "capturing" else 7, deadline, NOW, status, event_id),
+      )
+  begin(store, event_ids["network"], revision=2, kind="follow_up", schema_version=2)
+  finish_complete(store, event_ids["network"], revision=2)
+  store.schedule_retry(event_ids["network"], 2, next_attempt_at=future, error="HTTP retry", http_status=503)
+  # Build the former v2 schema using SQLite's own DDL, only in this temporary
+  # fixture; production migration only adds the new column and never drops it.
+  store.connection.execute("BEGIN IMMEDIATE")
+  with store.connection:
+    store.connection.execute("ALTER TABLE revisions DROP COLUMN retry_after_at")
+    store.connection.execute("PRAGMA user_version=2")
+  snapshot = {table: [dict(row) for row in store.connection.execute(f"SELECT * FROM {table}")]
+              for table in ("events", "revisions", "media")}
+  files = {row["path"]: Path(row["path"]).read_bytes() for row in snapshot["media"] if row["path"]}
+  store.close()
+  return event_ids, snapshot, files
+
+
+def assert_migrated_schema_two(store, snapshot, files):
+  for table in ("events", "revisions", "media"):
+    actual = [dict(row) for row in store.connection.execute(f"SELECT * FROM {table}")]
+    if table == "revisions":
+      for row in actual:
+        expected_floor = row["next_attempt_at"] if row["state"] == "ready" and row["last_http_status"] is not None and row["next_attempt_at"] > 1 else 0
+        assert row.pop("retry_after_at") == expected_floor
+    assert actual == snapshot[table]
+  assert store.connection.execute("PRAGMA user_version").fetchone()[0] == 3
+  assert store.connection.execute("PRAGMA foreign_key_check").fetchall() == []
+  assert store.connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+  assert {name: Path(name).read_bytes() for name in files} == files
+
+
+def test_schema_two_migration_preserves_both_wire_schemas_claims_and_server_deadlines(tmp_path) -> None:
+  path = tmp_path / "outbox.sqlite3"
+  event_ids, snapshot, files = create_schema_two_outbox(path)
+  for _ in range(3):
+    store = SentryStore(path, run_maintenance=False)
+    assert_migrated_schema_two(store, snapshot, files)
+    store.close()
+  store = SentryStore(path, run_maintenance=False)
+  store.retry_pending()
+  deadlines = {row["event_id"]: row["next_attempt_at"] for row in store.connection.execute("SELECT * FROM revisions WHERE revision=1")}
+  assert deadlines[event_ids["http"]] > datetime.now(UTC).timestamp()
+  assert deadlines[event_ids["active"]] == deadlines[event_ids["http"]]
+  assert deadlines[event_ids["network"]] == deadlines[event_ids["expired_http"]] == 0
+  assert store.revision_state(event_ids["active"], 1) == "uploading"
+
+
+@pytest.mark.parametrize("fail_statement", (
+  "ALTER TABLE revisions ADD COLUMN retry_after_at", "UPDATE revisions SET retry_after_at=next_attempt_at", "PRAGMA user_version=3",
+))
+def test_schema_two_migration_failure_rolls_back_column_version_and_every_row(tmp_path, monkeypatch, fail_statement) -> None:
+  path = tmp_path / "outbox.sqlite3"
+  _, snapshot, files = create_schema_two_outbox(path)
+  original_connect = sqlite3.connect
+
+  class FailingConnection(sqlite3.Connection):
+    def execute(self, sql, parameters=()):
+      result = super().execute(sql, parameters)
+      if sql.strip().startswith(fail_statement):
+        raise sqlite3.OperationalError("simulated schema-three migration failure")
+      return result
+
+  with monkeypatch.context() as patch:
+    patch.setattr(sqlite3, "connect", lambda *args, **kwargs: original_connect(*args, factory=FailingConnection, **kwargs))
+    with pytest.raises(sqlite3.OperationalError, match="migration failure"):
+      SentryStore(path, run_maintenance=False)
+  verifier = original_connect(path)
+  verifier.row_factory = sqlite3.Row
+  try:
+    assert verifier.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert "retry_after_at" not in {row["name"] for row in verifier.execute("PRAGMA table_info(revisions)")}
+    for table, rows in snapshot.items():
+      assert [dict(row) for row in verifier.execute(f"SELECT * FROM {table}")] == rows
+  finally:
+    verifier.close()
+  migrated = SentryStore(path, run_maintenance=False)
+  assert_migrated_schema_two(migrated, snapshot, files)
+
+
+@pytest.mark.parametrize("crash_statement", ("ALTER TABLE revisions ADD COLUMN retry_after_at", "PRAGMA user_version=3"))
+def test_process_death_during_schema_two_migration_preserves_queue(tmp_path, crash_statement) -> None:
+  path = tmp_path / "outbox.sqlite3"
+  _, snapshot, files = create_schema_two_outbox(path)
+  program = """
+import os
+import sqlite3
+import sys
+from openpilot.system.sentryd.store import SentryStore
+original_connect = sqlite3.connect
+class CrashConnection(sqlite3.Connection):
+  def execute(self, sql, parameters=()):
+    result = super().execute(sql, parameters)
+    if sql.strip().startswith(sys.argv[2]):
+      os._exit(77)
+    return result
+sqlite3.connect = lambda *args, **kwargs: original_connect(*args, factory=CrashConnection, **kwargs)
+SentryStore(sys.argv[1], run_maintenance=False)
+"""
+  result = subprocess.run([sys.executable, "-c", program, str(path), crash_statement], timeout=10, check=False)
+  assert result.returncode == 77
+  verifier = sqlite3.connect(path)
+  try:
+    assert verifier.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert "retry_after_at" not in {row[1] for row in verifier.execute("PRAGMA table_info(revisions)")}
+  finally:
+    verifier.close()
+  migrated = SentryStore(path, run_maintenance=False)
+  assert_migrated_schema_two(migrated, snapshot, files)
 
 
 def test_concurrent_legacy_initializers_migrate_once_without_losing_rows(tmp_path) -> None:
@@ -349,7 +574,7 @@ def test_concurrent_first_time_initializers_create_private_database(tmp_path) ->
     store = None
     try:
       store = SentryStore(path, run_maintenance=False)
-      assert store.connection.execute("PRAGMA user_version").fetchone()[0] == 2
+      assert store.connection.execute("PRAGMA user_version").fetchone()[0] == 3
       assert store.connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
       opened.wait(timeout=5)
     except Exception:
@@ -381,7 +606,7 @@ def test_current_schema_open_does_not_request_a_migration_write_lock(tmp_path, m
   reopened = SentryStore(path, run_maintenance=False)
   assert "BEGIN IMMEDIATE" not in statements
   assert "PRAGMA foreign_key_check" not in statements
-  assert "PRAGMA user_version=2" not in statements
+  assert "PRAGMA user_version=3" not in statements
   reopened.close()
   initial.close()
 
@@ -436,7 +661,7 @@ def test_wal_failure_is_bounded_and_closes_connection(tmp_path, monkeypatch, cod
 
 
 @pytest.mark.parametrize("fail_statement", [
-  "INSERT INTO sentry_revisions_v2", "DROP TABLE revisions", "ALTER TABLE sentry_revisions_v2", "PRAGMA user_version=2",
+  "INSERT INTO sentry_revisions_v2", "DROP TABLE revisions", "ALTER TABLE sentry_revisions_v2", "PRAGMA user_version=3",
 ])
 def test_legacy_migration_failure_rolls_back_schema_and_rows(tmp_path, monkeypatch, fail_statement) -> None:
   path = tmp_path / "outbox.sqlite3"
@@ -469,7 +694,7 @@ def test_legacy_migration_failure_rolls_back_schema_and_rows(tmp_path, monkeypat
   assert_migrated_legacy(restarted, snapshot)
 
 
-@pytest.mark.parametrize("crash_statement", ["DROP TABLE revisions", "ALTER TABLE sentry_revisions_v2", "PRAGMA user_version=2"])
+@pytest.mark.parametrize("crash_statement", ["DROP TABLE revisions", "ALTER TABLE sentry_revisions_v2", "PRAGMA user_version=3"])
 def test_process_death_during_migration_recovers_the_complete_legacy_outbox(tmp_path, crash_statement) -> None:
   path = tmp_path / "outbox.sqlite3"
   _, _, snapshot, files = create_legacy_outbox(path)
@@ -518,12 +743,12 @@ def test_legacy_quota_rewrite_does_not_upgrade_wire_schema(tmp_path) -> None:
 def test_future_database_schema_is_not_downgraded(tmp_path) -> None:
   path = tmp_path / "outbox.sqlite3"
   store = SentryStore(path)
-  store.connection.execute("PRAGMA user_version=3")
+  store.connection.execute("PRAGMA user_version=4")
   store.close()
   with pytest.raises(ValueError, match="future"):
     SentryStore(path)
   with sqlite3.connect(path) as connection:
-    assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
 
 
 def test_revision_timestamps_are_clamped_to_server_ordering_invariants(tmp_path) -> None:
@@ -660,6 +885,8 @@ def test_attempted_payload_is_immutable_but_bytes_are_hard_capped(tmp_path) -> N
   assert {item["local_omission_reason"] for item in retained} == {"queue_quota"}
   assert store.stats().media_bytes == 0
   assert store.retry_terminal() == 0
+  assert store.retry_pending() == 0
+  assert store.retry_all() == 0
 
 
 def test_known_terminal_payload_can_be_rewritten_as_queue_quota_omission(tmp_path) -> None:
