@@ -14,7 +14,7 @@ from pathlib import Path
 from uuid import uuid4
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 3
 CURRENT_CONSENT_VERSION = 1
 DEFAULT_ROOT = "/data/sentry"
 MAX_CONFIG_FILE_SIZE = 128
@@ -33,7 +33,6 @@ CONFIG_FIELDS = (
   "motion_threshold_mps2",
   "warning_persistence_seconds",
   "wait_for_driver_exit",
-  "infer_lock_from_flashes",
 )
 
 LEGACY_FIELDS = (
@@ -56,7 +55,6 @@ class SentryConfig:
   motion_threshold_mps2: float = 0.04
   warning_persistence_seconds: float = WARNING_PERSISTENCE_SECONDS
   wait_for_driver_exit: bool = True
-  infer_lock_from_flashes: bool = False
 
   @property
   def effective_enabled(self) -> bool:
@@ -98,7 +96,7 @@ def _serialize_field(name: str, value: object) -> str:
     if type(value) is not int or value != SCHEMA_VERSION:
       raise SentryConfigError(f"unsupported schema version: {value!r}")
     return str(value)
-  if name in ("enabled", "wait_for_driver_exit", "infer_lock_from_flashes"):
+  if name in ("enabled", "wait_for_driver_exit"):
     if type(value) is not bool:
       raise SentryConfigError(f"{name} must be a boolean")
     return "1" if value else "0"
@@ -173,7 +171,7 @@ class SentryConfigStore:
       else:
         current = replace(current, wait_for_driver_exit=staged == "1")
         self._fsync_directory(self.config_dir)
-    if current.schema_version < 3:
+    if current.schema_version < SCHEMA_VERSION:
       # The fixed confirmation rule replaces every valid legacy warning delay.
       # A retry after a crash may already see 1: sync that staged value and its
       # directory entry before committing the new schema marker.
@@ -183,17 +181,6 @@ class SentryConfigStore:
         self._read_field_locked("warning_persistence_seconds", sync=True)
         self._fsync_directory(self.config_dir)
       current = replace(current, warning_persistence_seconds=WARNING_PERSISTENCE_SECONDS)
-    if current.schema_version < SCHEMA_VERSION:
-      # Flash inference is opt-in. Recover only a valid staged choice after a
-      # crash, syncing both the file and its directory before the schema marker.
-      staged = self._read_field_locked("infer_lock_from_flashes", missing_value="", sync=True)
-      if staged == "":
-        self._write_field_locked("infer_lock_from_flashes", current.infer_lock_from_flashes)
-      elif staged not in ("0", "1"):
-        raise SentryConfigError("infer_lock_from_flashes must be 0 or 1")
-      else:
-        current = replace(current, infer_lock_from_flashes=staged == "1")
-        self._fsync_directory(self.config_dir)
       self._write_field_locked("schema_version", SCHEMA_VERSION)
       current = replace(current, schema_version=SCHEMA_VERSION)
     return current
@@ -235,13 +222,6 @@ class SentryConfigStore:
       current = self._migrate_locked(self._load_locked())
       self._write_field_locked("wait_for_driver_exit", value)
       return replace(current, wait_for_driver_exit=value)
-
-  def set_infer_lock_from_flashes(self, value: bool) -> SentryConfig:
-    _serialize_field("infer_lock_from_flashes", value)
-    with self._prepared_exclusive_lock():
-      current = self._migrate_locked(self._load_locked())
-      self._write_field_locked("infer_lock_from_flashes", value)
-      return replace(current, infer_lock_from_flashes=value)
 
   def reset(self) -> tuple[SentryConfig, Path | None]:
     if self._ensure_directory(self.root):
@@ -325,27 +305,23 @@ class SentryConfigStore:
   def _load_locked(self) -> SentryConfig:
     self._validate_directory(self.config_dir, "Sentry configuration directory")
     schema_version = _parse_canonical_integer(self._read_field_locked("schema_version"), "schema_version")
-    if schema_version not in (1, 2, 3, SCHEMA_VERSION):
+    if schema_version not in (1, 2, SCHEMA_VERSION):
       raise SentryConfigError(f"unsupported Sentry configuration schema version: {schema_version}")
     values = {name: self._read_field_locked(name) for name in CONFIG_FIELDS
-              if name not in ("schema_version", "wait_for_driver_exit", "infer_lock_from_flashes")}
+              if name not in ("schema_version", "wait_for_driver_exit")}
     values["wait_for_driver_exit"] = self._read_field_locked(
       "wait_for_driver_exit", missing_value="1" if schema_version == 1 else None)
-    values["infer_lock_from_flashes"] = self._read_field_locked(
-      "infer_lock_from_flashes", missing_value="0" if schema_version < 4 else None)
     if values["enabled"] not in ("0", "1"):
       raise SentryConfigError("enabled must be 0 or 1")
     if values["wait_for_driver_exit"] not in ("0", "1"):
       raise SentryConfigError("wait_for_driver_exit must be 0 or 1")
-    if values["infer_lock_from_flashes"] not in ("0", "1"):
-      raise SentryConfigError("infer_lock_from_flashes must be 0 or 1")
     consent = _parse_canonical_integer(values["capture_upload_consent_version"],
                                        "capture_upload_consent_version")
     if consent < 0 or consent > CURRENT_CONSENT_VERSION:
       raise SentryConfigError("invalid capture/upload consent version")
     threshold = _parse_canonical_choice(values["motion_threshold_mps2"], READABLE_MOTION_THRESHOLDS,
                                         "motion_threshold_mps2")
-    warning_choices = LEGACY_WARNING_PERSISTENCE if schema_version < 3 else ALLOWED_WARNING_PERSISTENCE
+    warning_choices = LEGACY_WARNING_PERSISTENCE if schema_version < SCHEMA_VERSION else ALLOWED_WARNING_PERSISTENCE
     warning = _parse_canonical_choice(values["warning_persistence_seconds"], warning_choices,
                                       "warning_persistence_seconds")
     return SentryConfig(
@@ -355,7 +331,6 @@ class SentryConfigStore:
       motion_threshold_mps2=threshold,
       warning_persistence_seconds=warning,
       wait_for_driver_exit=values["wait_for_driver_exit"] == "1",
-      infer_lock_from_flashes=values["infer_lock_from_flashes"] == "1",
     )
 
   def _read_field_locked(self, name: str, *, missing_value: str | None = None, sync: bool = False) -> str:
@@ -406,7 +381,6 @@ class SentryConfigStore:
       ("motion_threshold_mps2", config.motion_threshold_mps2),
       ("warning_persistence_seconds", config.warning_persistence_seconds),
       ("wait_for_driver_exit", config.wait_for_driver_exit),
-      ("infer_lock_from_flashes", config.infer_lock_from_flashes),
       ("enabled", config.enabled),
     )
     for name, value in fields:

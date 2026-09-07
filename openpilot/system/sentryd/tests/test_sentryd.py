@@ -88,9 +88,6 @@ class FailingStore:
   def get_door_pause(self):
     return False
 
-  def get_lock_control(self):
-    return "none", None
-
   def close_open_events(self):
     return 0
 

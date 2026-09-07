@@ -356,34 +356,6 @@ class SentryStore:
     with self.connection:
       self.connection.execute("UPDATE runtime_state SET door_pause_active=0, door_event_id=NULL, door_converted=0 WHERE singleton=1")
 
-  def get_lock_control(self) -> tuple[str, str | None]:
-    row = self.connection.execute("SELECT lock_control, inferred_lock_state FROM runtime_state WHERE singleton=1").fetchone()
-    if row is None:
-      raise ValueError("missing Sentry runtime state")
-    state, inferred_state = row
-    self._validate_lock_control(state, inferred_state)
-    return state, inferred_state
-
-  def set_lock_control(self, state: str, inferred_state: str | None, *, clear_door_pause: bool = False) -> None:
-    """Persist the restart gate and inferred lock state without changing queued work."""
-    self._validate_lock_control(state, inferred_state)
-    if type(clear_door_pause) is not bool:
-      raise ValueError("clear_door_pause must be a boolean")
-    assignments = "lock_control=?, inferred_lock_state=?"
-    if clear_door_pause:
-      assignments += ", door_pause_active=0, door_event_id=NULL, door_converted=0"
-    with self.connection:
-      updated = self.connection.execute(f"UPDATE runtime_state SET {assignments} WHERE singleton=1", (state, inferred_state))
-      if updated.rowcount != 1:
-        raise ValueError("missing Sentry runtime state")
-
-  @staticmethod
-  def _validate_lock_control(state: str, inferred_state: str | None) -> None:
-    if type(state) is not str or (inferred_state is not None and type(inferred_state) is not str):
-      raise ValueError("invalid Sentry lock control state")
-    if (state, inferred_state) not in (("none", None), ("unlock_pause", "unlocked"), ("rearm", "locked"), ("rearm", "unlocked")):
-      raise ValueError("invalid Sentry lock control state")
-
   def start_door_event(self, *, event_id: str, detected_at: str, message: str,
                        provisional_event_id: str | None = None) -> tuple[str, bool]:
     """Atomically reserve a silent door capture and pause, optionally retaining the first pair."""
@@ -1118,9 +1090,9 @@ class SentryStore:
     # Every upload worker uses a new connection. Already-migrated readers must not take
     # a schema write lock or rescan all queued media on each one-second poll.
     version = self.connection.execute("PRAGMA user_version").fetchone()[0]
-    if version == 5:
+    if version == 4:
       return
-    if version > 5:
+    if version > 4:
       raise ValueError("unsupported future Sentry outbox schema")
     # SQLite cannot widen an existing CHECK constraint in place. Disable FK
     # actions only on this connection, then serialize discovery and the complete
@@ -1131,19 +1103,12 @@ class SentryStore:
     try:
       self.connection.execute("BEGIN IMMEDIATE")
       version = self.connection.execute("PRAGMA user_version").fetchone()[0]
-      if version == 5:
+      if version == 4:
         # A concurrent initializer completed migration while we waited.
         self.connection.commit()
         return
-      if version > 5:
+      if version > 4:
         raise ValueError("unsupported future Sentry outbox schema")
-      if version == 4:
-        # The lock gate adds no event/revision fields. Leave immutable payloads,
-        # upload claims and all media untouched on the deployed-v4 upgrade path.
-        self._migrate_lock_control()
-        self.connection.execute("PRAGMA user_version=5")
-        self.connection.commit()
-        return
       self.connection.execute(
         """
         CREATE TABLE IF NOT EXISTS events (
@@ -1219,33 +1184,15 @@ class SentryStore:
         """
       )
       self.connection.execute("INSERT OR IGNORE INTO runtime_state(singleton) VALUES (1)")
-      self._migrate_lock_control()
       if self.connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
         raise sqlite3.IntegrityError("Sentry outbox migration found invalid foreign keys")
-      self.connection.execute("PRAGMA user_version=5")
+      self.connection.execute("PRAGMA user_version=4")
       self.connection.commit()
     except Exception:
       self.connection.rollback()
       raise
     finally:
       self.connection.execute("PRAGMA foreign_keys=ON")
-
-  def _migrate_lock_control(self) -> None:
-    columns = {row["name"] for row in self.connection.execute("PRAGMA table_info(runtime_state)")}
-    if "lock_control" not in columns:
-      self.connection.execute(
-        "ALTER TABLE runtime_state ADD COLUMN lock_control TEXT NOT NULL DEFAULT 'none' " +
-        "CHECK(lock_control IN ('none', 'unlock_pause', 'rearm'))"
-      )
-    if "inferred_lock_state" not in columns:
-      self.connection.execute(
-        """
-        ALTER TABLE runtime_state ADD COLUMN inferred_lock_state TEXT
-        CHECK((lock_control='none' AND inferred_lock_state IS NULL)
-          OR (lock_control='unlock_pause' AND inferred_lock_state IS NOT NULL AND inferred_lock_state='unlocked')
-          OR (lock_control='rearm' AND inferred_lock_state IS NOT NULL AND inferred_lock_state IN ('locked', 'unlocked')))
-        """
-      )
 
   def _create_revision_table(self, table: str) -> None:
     if table not in ("revisions", "sentry_revisions_v2"):

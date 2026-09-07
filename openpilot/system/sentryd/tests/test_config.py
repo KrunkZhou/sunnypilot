@@ -18,12 +18,9 @@ def test_initializes_individual_private_files_and_requires_consent(tmp_path) -> 
   config = store.initialize()
   assert not config.effective_enabled
   assert config.wait_for_driver_exit
-  assert not config.infer_lock_from_flashes
   assert (store.config_dir / "wait_for_driver_exit").read_text() == "1\n"
-  assert (store.config_dir / "infer_lock_from_flashes").read_text() == "0\n"
   assert sorted(path.name for path in store.config_dir.iterdir()) == [
-    "capture_upload_consent_version", "enabled", "infer_lock_from_flashes", "motion_threshold_mps2", "schema_version",
-    "wait_for_driver_exit", "warning_persistence_seconds",
+    "capture_upload_consent_version", "enabled", "motion_threshold_mps2", "schema_version", "wait_for_driver_exit", "warning_persistence_seconds",
   ]
   assert all((path.stat().st_mode & 0o777) == 0o600 for path in store.config_dir.iterdir())
   assert (store.root.stat().st_mode & 0o777) == 0o700
@@ -75,8 +72,6 @@ def test_consent_is_committed_before_enablement(tmp_path, monkeypatch) -> None:
   ("set_warning_persistence", "warning_persistence_seconds", 1.0),
   ("set_wait_for_driver_exit", "wait_for_driver_exit", False),
   ("set_wait_for_driver_exit", "wait_for_driver_exit", True),
-  ("set_infer_lock_from_flashes", "infer_lock_from_flashes", False),
-  ("set_infer_lock_from_flashes", "infer_lock_from_flashes", True),
 ])
 def test_every_allowed_tuning_value_round_trips(tmp_path, setter_name, attribute, value) -> None:
   store = make_store(tmp_path)
@@ -126,7 +121,7 @@ def test_post_replace_directory_sync_failure_surfaces_but_new_value_is_authorita
 
 @pytest.mark.parametrize(("field", "value"), [
   ("enabled", "yes\n"),
-  ("schema_version", "5\n"),
+  ("schema_version", "4\n"),
   ("schema_version", "01\n"),
   ("capture_upload_consent_version", "+1\n"),
   ("motion_threshold_mps2", "nan\n"),
@@ -143,9 +138,6 @@ def test_post_replace_directory_sync_failure_surfaces_but_new_value_is_authorita
   ("wait_for_driver_exit", "true\n"),
   ("wait_for_driver_exit", "2\n"),
   ("wait_for_driver_exit", "01\n"),
-  ("infer_lock_from_flashes", "true\n"),
-  ("infer_lock_from_flashes", "2\n"),
-  ("infer_lock_from_flashes", "01\n"),
 ])
 def test_invalid_configuration_fails_closed_without_rewrite(tmp_path, field, value) -> None:
   store = make_store(tmp_path)
@@ -364,7 +356,7 @@ def test_high_migration_never_overwrites_incomplete_or_corrupt_configuration(tmp
   if corruption == "missing":
     (store.config_dir / "enabled").unlink()
   elif corruption == "future":
-    (store.config_dir / "schema_version").write_text("5\n")
+    (store.config_dir / "schema_version").write_text("4\n")
   elif corruption == "invalid":
     (store.config_dir / "warning_persistence_seconds").write_text("bad\n")
   else:
@@ -506,7 +498,6 @@ def test_unlinked_held_lock_cannot_be_replaced_by_an_ordinary_reader(tmp_path) -
 
 def downgrade_to_schema_one(store):
   (store.config_dir / "wait_for_driver_exit").unlink()
-  (store.config_dir / "infer_lock_from_flashes").unlink()
   (store.config_dir / "schema_version").write_text("1\n")
 
 
@@ -530,7 +521,7 @@ def test_schema_one_migration_preserves_config_and_queue(tmp_path, entrypoint, l
   lock_inode = store.lock_path.stat().st_ino
 
   result = getattr(store, entrypoint)()
-  assert result.schema_version == SCHEMA_VERSION == 4
+  assert result.schema_version == SCHEMA_VERSION == 3
   assert result.warning_persistence_seconds == 1.0
   assert (store.config_dir / "warning_persistence_seconds").read_text() == "1\n"
   assert result.wait_for_driver_exit and result.effective_enabled
@@ -549,7 +540,6 @@ def test_schema_one_migration_preserves_config_and_queue(tmp_path, entrypoint, l
   ("set_motion_threshold", (0.08,), "motion_threshold_mps2", 0.08),
   ("set_warning_persistence", (1.0,), "warning_persistence_seconds", 1.0),
   ("set_wait_for_driver_exit", (False,), "wait_for_driver_exit", False),
-  ("set_infer_lock_from_flashes", (True,), "infer_lock_from_flashes", True),
 ])
 def test_setters_complete_pending_schema_migration(tmp_path, method, args, attribute, value):
   store = make_store(tmp_path)
@@ -570,7 +560,7 @@ def test_driver_exit_setter_rejects_non_boolean_types(tmp_path, value):
   assert store.load().wait_for_driver_exit
 
 
-@pytest.mark.parametrize("schema", [1, 2, 3, 4])
+@pytest.mark.parametrize("schema", [1, 2, 3])
 @pytest.mark.parametrize("corruption", ["malformed", "oversized", "symlink", "directory", "fifo", "permissions"])
 def test_driver_exit_configuration_fails_closed_without_repair(tmp_path, schema, corruption):
   store = make_store(tmp_path)
@@ -599,7 +589,7 @@ def test_driver_exit_configuration_fails_closed_without_repair(tmp_path, schema,
   assert (store.config_dir / "schema_version").read_text() == f"{schema}\n"
 
 
-@pytest.mark.parametrize("schema", [2, 3, 4])
+@pytest.mark.parametrize("schema", [2, 3])
 def test_current_and_schema_two_missing_driver_exit_field_is_not_migrated_or_repaired(tmp_path, schema):
   store = make_store(tmp_path)
   store.initialize()
@@ -729,7 +719,7 @@ def test_concurrent_schema_one_migration_commits_once(tmp_path, monkeypatch):
     thread.join(timeout=2)
   assert not any(thread.is_alive() for thread in threads)
   assert errors == [] and results == [SentryConfig()] * 4
-  assert writes == [("wait_for_driver_exit", True), ("infer_lock_from_flashes", False), ("schema_version", SCHEMA_VERSION)]
+  assert writes == [("wait_for_driver_exit", True), ("schema_version", SCHEMA_VERSION)]
 
 
 def test_schema_marker_directory_sync_failure_surfaces_without_erasing_complete_configuration(tmp_path, monkeypatch):
@@ -782,7 +772,7 @@ def test_legacy_warning_migrates_to_fixed_one_without_changing_other_settings(tm
   lock_inode = store.lock_path.stat().st_ino
   (store.root / "outbox.sqlite3").write_bytes(b"retained queue")
   result = store.load()
-  assert result.schema_version == SCHEMA_VERSION
+  assert result.schema_version == 3
   assert result.warning_persistence_seconds == 1.0
   assert result.enabled is enabled and result.capture_upload_consent_version == consent
   assert result.wait_for_driver_exit is driver_exit and result.motion_threshold_mps2 == 0.08
@@ -834,10 +824,10 @@ def test_fixed_warning_migration_crash_keeps_old_marker_and_retries(tmp_path, mo
   monkeypatch.setattr(store, "_fsync_directory", original_sync)
   monkeypatch.setattr(store, "_write_field_locked", original_write)
   result = store.load()
-  assert result.schema_version == SCHEMA_VERSION and result.warning_persistence_seconds == 1.0 and result.effective_enabled
+  assert result.schema_version == 3 and result.warning_persistence_seconds == 1.0 and result.effective_enabled
 
 
-@pytest.mark.parametrize("schema", [1, 2, 3, 4, 5])
+@pytest.mark.parametrize("schema", [1, 2, 4])
 @pytest.mark.parametrize("corruption", ["invalid", "oversized", "symlink", "fifo", "permissions"])
 def test_warning_migration_never_repairs_corrupt_or_future_configuration(tmp_path, schema, corruption):
   store = make_store(tmp_path)
@@ -863,234 +853,3 @@ def test_warning_migration_never_repairs_corrupt_or_future_configuration(tmp_pat
       action()
   assert (warning.lstat().st_ino, warning.lstat().st_mode) == (original.st_ino, original.st_mode)
   assert marker.read_text() == f"{schema}\n"
-
-
-@pytest.mark.parametrize("schema", [1, 2, 3])
-@pytest.mark.parametrize("enabled", [False, True])
-@pytest.mark.parametrize("driver_exit", [False, True])
-def test_flash_migration_defaults_off_and_preserves_existing_configuration_and_data(tmp_path, schema, enabled, driver_exit):
-  store = make_store(tmp_path)
-  store.initialize()
-  store.enable_with_consent()
-  store.set_enabled(enabled)
-  store.set_wait_for_driver_exit(driver_exit)
-  store.set_motion_threshold(0.08)
-  field = store.config_dir / "infer_lock_from_flashes"
-  field.unlink()
-  (store.config_dir / "schema_version").write_text(f"{schema}\n")
-  before = {path.name: (path.read_bytes(), path.stat().st_ino) for path in store.config_dir.iterdir() if path.name != "schema_version"}
-  (store.root / "outbox.sqlite3").write_bytes(b"pending uploads")
-  media = store.root / "media"
-  media.mkdir(mode=0o700)
-  (media / "wide.jpg").write_bytes(b"pending capture")
-  lock_inode = store.lock_path.stat().st_ino
-  migrated = store.load()
-  assert migrated.schema_version == 4 and not migrated.infer_lock_from_flashes
-  assert migrated.effective_enabled is enabled and migrated.capture_upload_consent_version == 1
-  assert migrated.wait_for_driver_exit is driver_exit and migrated.motion_threshold_mps2 == 0.08
-  assert {name: ((store.config_dir / name).read_bytes(), (store.config_dir / name).stat().st_ino) for name in before} == before
-  assert field.read_text() == "0\n" and field.stat().st_mode & 0o777 == 0o600
-  assert store.lock_path.stat().st_ino == lock_inode
-  assert (store.root / "outbox.sqlite3").read_bytes() == b"pending uploads"
-  assert (media / "wide.jpg").read_bytes() == b"pending capture"
-  assert not store.legacy_params_dir.exists()  # The new setting never creates durable Params.
-  flash_inode = field.stat().st_ino
-  assert store.initialize() == migrated and field.stat().st_ino == flash_inode
-
-
-@pytest.mark.parametrize("value", [0, 1, "0", "1", None, [], 0.0])
-def test_flash_setter_requires_actual_boolean_without_writing(tmp_path, value):
-  store = make_store(tmp_path)
-  store.initialize()
-  before = {path.name: path.read_bytes() for path in store.config_dir.iterdir()}
-  with pytest.raises(SentryConfigError, match="must be a boolean"):
-    store.set_infer_lock_from_flashes(value)
-  assert {path.name: path.read_bytes() for path in store.config_dir.iterdir()} == before
-
-
-@pytest.mark.parametrize("schema", [1, 2, 3, 4, 5])
-@pytest.mark.parametrize("corruption", ["malformed", "oversized", "symlink", "directory", "fifo", "permissions"])
-def test_flash_configuration_corruption_and_future_schema_fail_closed_without_repair(tmp_path, schema, corruption):
-  store = make_store(tmp_path)
-  store.initialize()
-  marker = store.config_dir / "schema_version"
-  marker.write_text(f"{schema}\n")
-  field = store.config_dir / "infer_lock_from_flashes"
-  if corruption == "malformed":
-    field.write_text("true\n")
-  elif corruption == "oversized":
-    field.write_bytes(b"0" * 129)
-  elif corruption == "symlink":
-    field.unlink()
-    field.symlink_to(tmp_path / "missing-target")
-  elif corruption == "directory":
-    field.unlink()
-    field.mkdir(mode=0o700)
-  elif corruption == "fifo":
-    field.unlink()
-    os.mkfifo(field, mode=0o600)
-  else:
-    field.chmod(0o640)
-  original = field.lstat()
-  for operation in (store.initialize, store.load, lambda: store.set_infer_lock_from_flashes(False)):
-    with pytest.raises(SentryConfigError):
-      operation()
-  assert (field.lstat().st_ino, field.lstat().st_mode) == (original.st_ino, original.st_mode)
-  assert marker.read_text() == f"{schema}\n"
-
-
-def test_schema_four_missing_flash_field_requires_explicit_reset_and_keeps_outbox(tmp_path):
-  store = make_store(tmp_path)
-  store.initialize()
-  store.set_infer_lock_from_flashes(True)
-  (store.root / "outbox.sqlite3").write_bytes(b"queued events")
-  field = store.config_dir / "infer_lock_from_flashes"
-  field.unlink()
-  for operation in (store.initialize, store.load, lambda: store.set_infer_lock_from_flashes(False)):
-    with pytest.raises(SentryConfigError, match="missing.*infer_lock_from_flashes"):
-      operation()
-  assert not field.exists()
-  reset, quarantined = store.reset()
-  assert reset == SentryConfig() and quarantined is not None
-  assert not reset.infer_lock_from_flashes and not reset.effective_enabled
-  assert (store.root / "outbox.sqlite3").read_bytes() == b"queued events"
-
-
-@pytest.mark.parametrize("schema", [1, 2, 3])
-@pytest.mark.parametrize("value", ["0", "1"])
-def test_flash_migration_preserves_and_syncs_valid_staged_value_before_marker(tmp_path, monkeypatch, schema, value):
-  store = make_store(tmp_path)
-  store.initialize()
-  (store.config_dir / "schema_version").write_text(f"{schema}\n")
-  field = store.config_dir / "infer_lock_from_flashes"
-  field.write_text(value + "\n")
-  inode = field.stat().st_ino
-  operations = []
-  original_fsync, original_write = os.fsync, store._write_field_locked
-
-  def record_fsync(fd):
-    operations.append(("fsync", os.fstat(fd).st_ino))
-    original_fsync(fd)
-
-  def record_write(name, value):
-    operations.append(("write", name))
-    original_write(name, value)
-
-  monkeypatch.setattr(os, "fsync", record_fsync)
-  monkeypatch.setattr(store, "_write_field_locked", record_write)
-  result = store.load()
-  assert result.schema_version == 4 and result.infer_lock_from_flashes is (value == "1")
-  assert field.stat().st_ino == inode and ("write", "infer_lock_from_flashes") not in operations
-  sync_file_index = operations.index(("fsync", inode))
-  sync_directory_index = operations.index(("fsync", store.config_dir.stat().st_ino), sync_file_index + 1)
-  assert sync_file_index < sync_directory_index < operations.index(("write", "schema_version"))
-
-
-@pytest.mark.parametrize("failure_stage", ["new_file", "new_directory", "marker", "staged_file", "staged_directory"])
-def test_flash_migration_sync_failure_keeps_old_marker_and_recovers_staged_choice(tmp_path, monkeypatch, failure_stage):
-  store = make_store(tmp_path)
-  store.initialize()
-  store.enable_with_consent()
-  marker = store.config_dir / "schema_version"
-  marker.write_text("3\n")
-  field = store.config_dir / "infer_lock_from_flashes"
-  if failure_stage.startswith("staged"):
-    field.write_text("1\n")
-  else:
-    field.unlink()
-  original_fsync, original_sync, original_write = os.fsync, store._fsync_directory, store._write_field_locked
-
-  def fail_sync(_fd):
-    raise OSError(28, "simulated flash fsync failure")
-
-  def fail_directory(path):
-    if path == store.config_dir:
-      raise SentryConfigError("simulated flash directory fsync failure")
-    original_sync(path)
-
-  def fail_marker(name, value):
-    if name == "schema_version":
-      assert field.read_text() == "0\n"
-      raise SentryConfigError("simulated crash before schema marker")
-    original_write(name, value)
-
-  if failure_stage.endswith("file"):
-    monkeypatch.setattr(os, "fsync", fail_sync)
-  elif failure_stage.endswith("directory"):
-    monkeypatch.setattr(store, "_fsync_directory", fail_directory)
-  else:
-    monkeypatch.setattr(store, "_write_field_locked", fail_marker)
-  with pytest.raises(SentryConfigError, match="simulated"):
-    store.load()
-  assert marker.read_text() == "3\n"
-  monkeypatch.setattr(os, "fsync", original_fsync)
-  monkeypatch.setattr(store, "_fsync_directory", original_sync)
-  monkeypatch.setattr(store, "_write_field_locked", original_write)
-  result = store.load()
-  assert result.schema_version == 4 and result.effective_enabled
-  assert result.infer_lock_from_flashes is failure_stage.startswith("staged")
-
-
-@pytest.mark.parametrize("warning", ["0.5", "2", "5"])
-def test_flash_migration_does_not_reopen_legacy_warning_values_in_schema_three(tmp_path, warning):
-  store = make_store(tmp_path)
-  store.initialize()
-  (store.config_dir / "schema_version").write_text("3\n")
-  (store.config_dir / "infer_lock_from_flashes").unlink()
-  field = store.config_dir / "warning_persistence_seconds"
-  field.write_text(warning + "\n")
-  with pytest.raises(SentryConfigError, match="warning_persistence_seconds"):
-    store.load()
-  assert field.read_text() == warning + "\n"
-  assert not (store.config_dir / "infer_lock_from_flashes").exists()
-  assert (store.config_dir / "schema_version").read_text() == "3\n"
-
-
-def test_flash_migration_revalidates_an_intervening_selection_under_writer_lock(tmp_path, monkeypatch):
-  store = make_store(tmp_path)
-  store.initialize()
-  (store.config_dir / "schema_version").write_text("3\n")
-  (store.config_dir / "infer_lock_from_flashes").unlink()
-  original_lock = store._prepared_exclusive_lock
-  writer = make_store(tmp_path)
-
-  @contextmanager
-  def intervening_selection():
-    writer.set_infer_lock_from_flashes(True)
-    with original_lock():
-      yield
-
-  monkeypatch.setattr(store, "_prepared_exclusive_lock", intervening_selection)
-  assert store.load().infer_lock_from_flashes
-  assert (store.config_dir / "infer_lock_from_flashes").read_text() == "1\n"
-
-
-def test_concurrent_flash_migration_commits_default_off_once(tmp_path, monkeypatch):
-  store = make_store(tmp_path)
-  store.initialize()
-  (store.config_dir / "schema_version").write_text("3\n")
-  (store.config_dir / "infer_lock_from_flashes").unlink()
-  original_write = store._write_field_locked
-  writes, errors, results = [], [], []
-  barrier = threading.Barrier(4)
-
-  def record_write(name, value):
-    writes.append((name, value))
-    original_write(name, value)
-
-  def load():
-    try:
-      barrier.wait(timeout=2)
-      results.append(store.load())
-    except Exception as exc:
-      errors.append(exc)
-
-  monkeypatch.setattr(store, "_write_field_locked", record_write)
-  threads = [threading.Thread(target=load) for _ in range(4)]
-  for thread in threads:
-    thread.start()
-  for thread in threads:
-    thread.join(timeout=2)
-  assert not any(thread.is_alive() for thread in threads)
-  assert errors == [] and results == [SentryConfig()] * 4
-  assert writes == [("infer_lock_from_flashes", False), ("schema_version", SCHEMA_VERSION)]

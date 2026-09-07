@@ -19,7 +19,6 @@ from openpilot.system.sentryd.config import SentryConfig, SentryConfigError, Sen
 from openpilot.system.sentryd.detector import RESET_TIME_SECONDS, WARNING_TRIGGER_COUNT, MotionDetector
 from openpilot.system.sentryd.diagnostics import log_capture_diagnostic
 from openpilot.system.sentryd.door import DriverDoorSource
-from openpilot.system.sentryd.flash import FlashDetector
 from openpilot.system.sentryd.runtime import (
   clear_runtime,
   runtime_enabled,
@@ -46,7 +45,6 @@ REPEAT_CAPTURE_SECONDS = 1.0
 MAX_FOLLOW_UP_REVISIONS = 20
 EVENT_SCHEMA_VERSION = 2
 DOOR_PAUSE_SECONDS = 300.0
-UNLOCK_PAUSE_SECONDS = 3600.0
 
 
 @dataclass
@@ -103,16 +101,6 @@ class SentryMode:
     self.door_queue_drained = True
     self.door_closed_at: float | None = None
     self.pending_door_event: tuple[str, str, str] | None = None
-    self.deferred_door_event: tuple[str, str, str] | None = None
-    self.flash_detector = FlashDetector()
-    self.light_generation: int | None = None
-    self.light_error: str | None = None
-    self.flash_result: str | None = None
-    self.lock_control = "none"
-    self.last_lock_inference: str | None = None
-    self.unlock_pause_until: float | None = None
-    self.lock_arm_started_at: float | None = None
-    self.pending_lock_control: tuple[str, str | None, bool] | None = None
 
     self.config = SentryConfig()
     self.config_error: str | None = None
@@ -167,19 +155,6 @@ class SentryMode:
     except (OSError, sqlite3.Error, ValueError) as exc:
       self.door_paused = True
       self._record_persistence_failure("Could not recover Sentry door pause", exc)
-    try:
-      self.lock_control, self.last_lock_inference = self.store.get_lock_control()
-      if self.lock_control == "unlock_pause":
-        self.unlock_pause_until = self.clock() + UNLOCK_PAUSE_SECONDS
-      if self.lock_control != "none":
-        self.driver_exit_completed = True
-    except (OSError, sqlite3.Error, ValueError) as exc:
-      # Never turn an unreadable persisted suppression marker into capture.
-      self.lock_control = "unlock_pause"
-      self.last_lock_inference = "unlocked"
-      self.unlock_pause_until = self.clock() + UNLOCK_PAUSE_SECONDS
-      self.pending_lock_control = ("unlock_pause", "unlocked", False)
-      self._record_persistence_failure("Could not recover Sentry lock control", exc)
 
   def _new_detector(self) -> MotionDetector:
     return MotionDetector(
@@ -253,121 +228,21 @@ class SentryMode:
       self._reset_driver_exit()
     elif previous.effective_enabled != current.effective_enabled:
       self._reset_driver_exit()
-      self.flash_detector.reset(require_quiet=True)
-      self.flash_result = None
-      self.deferred_door_event = None
-    if previous.infer_lock_from_flashes != current.infer_lock_from_flashes:
-      self.flash_detector.reset(require_quiet=True)
-      self.flash_result = None
-      self.deferred_door_event = None
-      self._close_active_episode()
-      self.detector.reset()
-      self.arm_started_at = now if current.effective_enabled else None
-      self._reset_driver_exit()
-    if (self.config_error is None and not current.infer_lock_from_flashes
-        and (self.lock_control != "none" or self.pending_lock_control is not None)):
-      self._request_lock_control("none", None, now, clear_door_pause=False)
-      self._reset_driver_exit()
 
   def _reset_driver_exit(self) -> None:
     self.driver_exit_started_at = None
     self.driver_door_open_seen = False
     # A durable door pause was entered only after arming. Telemetry recovery
     # must not add a new driver-exit gate on top of its five-minute wait.
-    self.driver_exit_completed = self.door_paused or self.lock_control != "none"
-    self.lock_arm_started_at = None
+    self.driver_exit_completed = self.door_paused
     self.door_observation_started_at = None
     self.door_previous = None
     self.door_samples = []
 
-  def _flash_classifying(self) -> bool:
-    return self.config.infer_lock_from_flashes and (
-      self.flash_detector.pending or self.flash_result is not None or not self.door_queue_drained)
-
-  def _flash_blocks_automatic(self) -> bool:
-    return self._flash_classifying() or self.pending_lock_control is not None or self.lock_control != "none"
-
-  def _request_lock_control(self, state: str, inferred: str | None, now: float, *, clear_door_pause: bool = True) -> None:
-    # Publish the in-memory hold before the fallible transaction. Retries never
-    # restart a countdown; only a newly recognized unlock or daemon restart does.
-    self.lock_control = state
-    self.last_lock_inference = inferred
-    self.unlock_pause_until = now + UNLOCK_PAUSE_SECONDS if state == "unlock_pause" else None
-    self.lock_arm_started_at = None
-    self.pending_lock_control = (state, inferred, clear_door_pause)
-    self.flash_result = None
-    self.deferred_door_event = None
-    self.detector.reset()
-    self.arm_started_at = None
-    if state != "none":
-      self.driver_exit_completed = True
-    self._persist_lock_control()
-
-  def _persist_lock_control(self) -> bool:
-    if self.pending_lock_control is None:
-      return True
-    state, inferred, clear_door_pause = self.pending_lock_control
-    try:
-      self.store.set_lock_control(state, inferred, clear_door_pause=clear_door_pause)
-    except (OSError, sqlite3.Error, ValueError) as exc:
-      self._record_persistence_failure("Could not persist Sentry lock control", exc)
-      return False
-    if clear_door_pause:
-      self.door_paused = False
-      self.door_closed_at = None
-      self.pending_door_event = None
-    self.pending_lock_control = None
-    self.persistence_error = None
-    # The suppression/rearm marker is durable before discarding the held pair.
-    # A crash in between will recover the marker and discard provisional work.
-    self._close_active_episode()
-    return True
-
-  def _advance_lock_control(self, now: float) -> bool:
-    if not self._persist_lock_control():
-      return False
-    if self.lock_control == "unlock_pause":
-      self.state = "unlock_paused"
-      self.state_error = None
-      if self.unlock_pause_until is None or now < self.unlock_pause_until or self._flash_classifying():
-        return False
-      self._request_lock_control("rearm", "unlocked", now)
-      if self.pending_lock_control is not None:
-        return False
-    if self.lock_control == "rearm":
-      if self.door_previous is None or self.door_previous or not self.door_queue_drained:
-        self.lock_arm_started_at = None
-        self.arm_started_at = None
-        self.state = "lock_waiting_for_doors"
-        self.state_error = None  # Door availability is exposed in lock_detection, not as a daemon failure.
-        return False
-      if self.lock_arm_started_at is None:
-        self.lock_arm_started_at = now
-        self.detector.reset()
-      self.arm_started_at = max(self.lock_arm_started_at, self.cap_rearm_until - ARM_DELAY_SECONDS)
-      self.state = "arming"
-      self.state_error = None
-      if (now < self.arm_started_at + ARM_DELAY_SECONDS or self.cap_pending_event_id is not None
-          or self._flash_classifying()):
-        return False
-      try:
-        self.store.set_lock_control("none", None)
-      except (OSError, sqlite3.Error, ValueError) as exc:
-        self._record_persistence_failure("Could not finish Sentry lock arming", exc)
-        return False
-      self.lock_control = "none"
-      self.lock_arm_started_at = None
-      self.driver_exit_completed = True
-      self.detector.reset()
-      self.persistence_error = None
-    return not self._flash_classifying()
-
-  def _monitoring_ready(self, now: float, *, ignore_flash: bool = False) -> bool:
+  def _monitoring_ready(self, now: float) -> bool:
     return (self.config.effective_enabled and not self.door_paused and self.pending_door_event is None
-            and self.lock_control == "none" and self.pending_lock_control is None
-            and (ignore_flash or not self._flash_classifying())
             and (not self.config.wait_for_driver_exit or self.driver_exit_completed)
-            and self.arm_started_at is not None and now >= self.arm_started_at + ARM_DELAY_SECONDS
+            and self.arm_started_at is not None and now - self.arm_started_at >= ARM_DELAY_SECONDS
             and now >= self.cap_rearm_until)
 
   def _poll_doors(self, now: float) -> None:
@@ -380,77 +255,32 @@ class SentryMode:
       generation = getattr(self.door_source, "generation", 0)
       if generation != self.door_generation:
         self.door_previous = None
-        self.lock_arm_started_at = None
         if self.door_generation is not None and self.door_paused:
           self.door_closed_at = None
         self.door_generation = generation
     except (OSError, RuntimeError, ValueError) as exc:
       samples = []
       self.door_previous = None
-      self.lock_arm_started_at = None
-      self.flash_detector.reset(require_quiet=True)
-      self.flash_result = None
       if self.door_paused:
         self.door_closed_at = None
       self.door_queue_drained = False
       self.door_error = f"Could not read door CAN data: {str(exc)[:256]}"
-    if self.config.infer_lock_from_flashes:
-      self._poll_flash_samples(now)
     self.door_samples.extend(samples)
     for sample in samples:
       opened = sample.open_doors
       newly_open = opened - self.door_previous if self.door_previous is not None else frozenset()
       self.door_previous = opened
-      if opened and self.lock_control == "rearm":
-        self.lock_arm_started_at = None
-        self.arm_started_at = None
-      if newly_open and self._monitoring_ready(now, ignore_flash=True):
-        event = (str(uuid4()), self._utc_now(), "Door opened: " + ", ".join(sorted(newly_open)) + ".")
-        if self._flash_classifying():
-          if self.deferred_door_event is None:
-            self.deferred_door_event = event
-        else:
-          self.pending_door_event = event
-          self.door_paused = True  # Block confirmation even if its durable write fails.
-          self.door_closed_at = None
+      if newly_open and self._monitoring_ready(now):
+        self.pending_door_event = (str(uuid4()), self._utc_now(), "Door opened: " + ", ".join(sorted(newly_open)) + ".")
+        self.door_paused = True  # Block confirmation even if its durable write fails.
+        self.door_closed_at = None
       if self.door_paused:
         if opened:
           self.door_closed_at = None
         elif self.door_closed_at is None:
           self.door_closed_at = sample.monotonic_time
-    if self.deferred_door_event is not None and self._monitoring_ready(now):
-      self.pending_door_event = self.deferred_door_event
-      self.deferred_door_event = None
-      self.door_paused = True
-      # A close processed during classification remains a valid observation.
-      self.door_closed_at = now if self.door_previous == frozenset() else None
-    if self.pending_door_event is not None and not self._flash_blocks_automatic():
+    if self.pending_door_event is not None:
       self._persist_door_event()
-
-  def _poll_flash_samples(self, now: float) -> None:
-    generation = getattr(self.door_source, "light_generation", 0)
-    if generation != self.light_generation:
-      if self.light_generation is not None or generation > 0:
-        # The first real receiver batch can already contain a discontinuity
-        # followed by the suffix of a burst. Its generation is not a baseline.
-        self.flash_detector.reset(require_quiet=True)
-      self.flash_result = None
-      self.light_generation = generation
-    self.light_error = getattr(self.door_source, "light_error", "Indicator CAN samples are unavailable")
-    for sample in getattr(self.door_source, "light_samples", ()):
-      result = self.flash_detector.update(sample)
-      if self.flash_detector.error is not None:
-        self.flash_result = None
-      if result is not None:
-        self.flash_result = result
-    self.flash_detector.tick(now)
-    if self.flash_detector.error is not None:
-      self.flash_result = None
-    # Drain the complete CAN batch before acting: a queued hazards-active or
-    # third pulse must never lose to a prematurely accepted one-flash lock.
-    if self.flash_result is not None and self.door_queue_drained:
-      inference = self.flash_result
-      self._request_lock_control("unlock_pause" if inference == "unlocked" else "rearm", inference, now)
 
   def _persist_door_event(self) -> None:
     event_id, detected_at, message = self.pending_door_event
@@ -478,7 +308,6 @@ class SentryMode:
     self.state = "door_paused"
     self.state_error = self.door_error if self.door_closed_at is None else None
     if (self.pending_door_event is not None or not self.door_queue_drained or self.door_closed_at is None
-        or self._flash_blocks_automatic()
         or now - self.door_closed_at < DOOR_PAUSE_SECONDS):
       return False
     try:
@@ -577,7 +406,7 @@ class SentryMode:
     if self.discard_pending and detection in ("motion", "warning", "alarm"):
       return
     if detection == "motion" and self.active_event_id is None:
-      if self.door_paused or self._flash_blocks_automatic() or self.capture_queue or (self.active_capture is not None and self.active_capture.job is not None):
+      if self.door_paused or self.capture_queue or (self.active_capture is not None and self.active_capture.job is not None):
         self.detector.reset()
         return
       event_id = str(uuid4())
@@ -618,7 +447,7 @@ class SentryMode:
       # Drain again before releasing the upload hold, including a door edge
       # queued while the accelerometer/configuration work ran.
       self._poll_doors(self.clock())
-      if self.door_paused or self._flash_blocks_automatic() or not self.door_queue_drained or self.active_event_id is None:
+      if self.door_paused or not self.door_queue_drained or self.active_event_id is None:
         return
       try:
         confirmed = self.store.confirm_event(self.active_event_id)
@@ -658,7 +487,7 @@ class SentryMode:
     recent_motion = self.active_event_id is not None and self._recent_motion(now)
     if not busy and active is not None and not recent_motion and not self.pending_alarm:
       active.idle_stop.set()
-    if (self.door_paused or self._flash_blocks_automatic() or not self.active_confirmed or self.active_event_id is None
+    if (self.door_paused or not self.active_confirmed or self.active_event_id is None
         or self.active_episode_started_at is None or busy or now < self.next_capture_at):
       return
     if self.next_revision > 1 + MAX_FOLLOW_UP_REVISIONS:
@@ -692,9 +521,6 @@ class SentryMode:
 
   def _start_capture_if_needed(self) -> None:
     if not self.capture_queue:
-      return
-    if (self._flash_blocks_automatic() and not self.active_confirmed
-        and self.capture_queue[0].event_id == self.active_event_id):
       return
     if self.clock() < self.capture_queue[0].not_before:
       return
@@ -1019,7 +845,6 @@ class SentryMode:
         "seconds_remaining": (max(0.0, RESET_TIME_SECONDS - (now - self.detector.first_motion_at))
                               if self.detector.first_motion_at is not None else 0.0),
       },
-      "lock_detection": self._lock_status(now),
     }
     error = self.config_error or self.persistence_error or self.runtime_error or self.state_error
     if error:
@@ -1034,33 +859,6 @@ class SentryMode:
       self.last_status_published_at = now
     except (OSError, RuntimeError):
       cloudlog.exception("Could not publish Sentry runtime status")
-
-  def _lock_status(self, now: float) -> dict[str, object]:
-    if not self.config.infer_lock_from_flashes:
-      state = "disabled"
-    elif self.lock_control == "unlock_pause":
-      state = "unlock_paused"
-    elif self._flash_classifying():
-      state = "classifying"
-    elif self.lock_control == "rearm":
-      state = "waiting_for_doors" if self.lock_arm_started_at is None else "arming"
-    elif self.light_error or self.flash_detector.error:
-      state = "unavailable"
-    else:
-      state = "armed" if self._monitoring_ready(now) else "idle"
-    return {
-      "enabled": self.config.infer_lock_from_flashes,
-      "state": state,
-      "inferred_state": self.last_lock_inference,
-      "pulse_count": self.flash_detector.pulse_count,
-      "pause_seconds_remaining": (max(0.0, self.unlock_pause_until - now)
-                                  if self.lock_control == "unlock_pause" and self.unlock_pause_until is not None else
-                                  max(0.0, self.arm_started_at + ARM_DELAY_SECONDS - now)
-                                  if self.lock_control == "rearm" and self.arm_started_at is not None else None),
-      "error": ((self.door_error or "Waiting for fresh door/trunk CAN data.")
-                if self.lock_control == "rearm" and self.door_previous is None else
-                self.light_error or self.flash_detector.error) if self.config.infer_lock_from_flashes else None,
-    }
 
   def _accelerometer_error(self, now: float) -> str | None:
     """Validate real sample freshness without treating slow consumption as a failed IMU."""
@@ -1111,16 +909,10 @@ class SentryMode:
       # A failed durable cancellation may never become confirmation of the
       # same UUID after the detector has reset. Retry even during door pause.
       self._close_active_episode()
-    self._persist_lock_control()
     self.door_samples = []
     if onroad:
       self._close_active_episode()
       self.pending_door_event = None
-      self.deferred_door_event = None
-      self.flash_result = None
-      self.flash_detector.reset(require_quiet=True)
-      if self.ignition_error is None and (self.lock_control != "none" or self.pending_lock_control is not None):
-        self._request_lock_control("none", None, now)
       if self.door_paused and self.ignition_error is None:
         try:
           self.store.clear_door_pause()
@@ -1136,14 +928,12 @@ class SentryMode:
       # Door edges take priority over capture finalization, upload claims, and
       # the tenth motion sample. This also keeps polling after the exit latch.
       self._poll_doors(now)
-      self._advance_lock_control(now)
       self._door_pause_ready(now)
     else:
       self._close_active_episode()
       self.pending_door_event = None
 
-    enabled = (self.config.effective_enabled and not onroad and not self.door_paused
-               and self.lock_control != "unlock_pause" and self.pending_lock_control is None)
+    enabled = self.config.effective_enabled and not onroad and not self.door_paused
     if enabled != self.last_runtime_enabled or now - self.last_runtime_check >= CONFIG_REFRESH_SECONDS:
       self.last_runtime_check = now
       try:
@@ -1169,9 +959,8 @@ class SentryMode:
       self.state_error = self.ignition_error
       self.detector.reset()
       self.arm_started_at = None
-      if self.ignition_error is None:
-        self.cap_pending_event_id = None
-        self.cap_rearm_until = float("-inf")
+      self.cap_pending_event_id = None
+      self.cap_rearm_until = float("-inf")
       self._reset_driver_exit()
       self._write_status(now)
       return
@@ -1189,11 +978,6 @@ class SentryMode:
       self.capture_abort_event.clear()
     self._start_capture_if_needed()
     now = self.clock()
-    if self.lock_control != "none" or self.pending_lock_control is not None:
-      self._advance_lock_control(now)
-      if self.lock_control != "none" or self.pending_lock_control is not None:
-        self._write_status(now)
-        return
     if self.door_paused:
       self.state = "door_paused"
       self._write_status(now)
@@ -1204,7 +988,7 @@ class SentryMode:
     now = self.clock()
     if self.arm_started_at is None:
       self.arm_started_at = now
-    if now < self.arm_started_at + ARM_DELAY_SECONDS or now < self.cap_rearm_until:
+    if now - self.arm_started_at < ARM_DELAY_SECONDS or now < self.cap_rearm_until:
       self.state = "arming"
       self.state_error = None
       self._write_status(now)
@@ -1274,8 +1058,6 @@ class SentryMode:
     self._schedule_motion_capture(now)
     if self.door_paused:
       self.state = "door_paused"
-    elif self._flash_classifying():
-      self.state = "flash_classifying"
     self._write_status(now)
 
   def run(self, stop_event: threading.Event | None = None) -> None:
