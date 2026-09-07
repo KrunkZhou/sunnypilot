@@ -633,6 +633,315 @@ CREATE TABLE media (
 """
 
 
+LOCK_CONTROLS = (("none", None), ("unlock_pause", "unlocked"), ("rearm", "locked"), ("rearm", "unlocked"))
+
+
+@pytest.mark.parametrize("control", LOCK_CONTROLS)
+@pytest.mark.parametrize("run_maintenance", (False, True))
+def test_lock_control_survives_worker_open_and_daemon_restart(tmp_path, control, run_maintenance) -> None:
+  path = tmp_path / "outbox.sqlite3"
+  store = SentryStore(path)
+  assert store.get_lock_control() == ("none", None)
+  event_id = begin(store)
+  finish_complete(store, event_id)
+  door_id = str(uuid4())
+  store.start_door_event(event_id=door_id, detected_at=NOW, message="Door opened.")
+  finish_complete(store, door_id)
+  snapshot = {table: [dict(row) for row in store.connection.execute(f"SELECT * FROM {table}")]
+              for table in ("events", "revisions", "media")}
+  store.set_lock_control(*control)
+  store.close()
+  reopened = SentryStore(path, run_maintenance=run_maintenance)
+  assert reopened.get_lock_control() == control
+  assert reopened.get_door_pause()
+  for table, expected in snapshot.items():
+    assert [dict(row) for row in reopened.connection.execute(f"SELECT * FROM {table}")] == expected
+  reopened.clear_door_pause()
+  assert reopened.get_lock_control() == control
+  reopened.close()
+
+
+@pytest.mark.parametrize("state,inferred", (
+  ("none", "locked"), ("none", "unlocked"), ("unlock_pause", None), ("unlock_pause", "locked"), ("rearm", None),
+  ("unknown", None), ("locked", "locked"), ("none", False), (False, None), ([], None), ("rearm", []),
+))
+def test_lock_control_rejects_invalid_pairs_without_mutation(tmp_path, state, inferred) -> None:
+  store = SentryStore(tmp_path / "outbox.sqlite3")
+  store.set_lock_control("rearm", "locked")
+  with pytest.raises(ValueError, match="lock control"):
+    store.set_lock_control(state, inferred, clear_door_pause=True)
+  assert store.get_lock_control() == ("rearm", "locked")
+  store.close()
+
+
+@pytest.mark.parametrize("control", LOCK_CONTROLS[1:])
+def test_lock_control_survives_provisional_startup_cleanup_but_worker_does_not_discard(tmp_path, control) -> None:
+  path = tmp_path / "outbox.sqlite3"
+  store = SentryStore(path)
+  event_id = begin(store, provisional=True)
+  finish_complete(store, event_id)
+  store.set_lock_control(*control)
+  store.close()
+  worker = SentryStore(path, run_maintenance=False)
+  assert worker.get_lock_control() == control
+  assert worker.revision_state(event_id, 1) == "provisional_ready"
+  assert worker.claim_pending(10 ** 12) is None
+  worker.close()
+  restarted = SentryStore(path)
+  assert restarted.get_lock_control() == control
+  assert restarted.revision_state(event_id, 1) is None
+  assert list(restarted.media_root.iterdir()) == []
+  restarted.close()
+
+
+@pytest.mark.parametrize("clear", (None, 0, 1, "true"))
+def test_lock_control_requires_boolean_clear_option(tmp_path, clear) -> None:
+  store = SentryStore(tmp_path / "outbox.sqlite3")
+  with pytest.raises(ValueError, match="boolean"):
+    store.set_lock_control("unlock_pause", "unlocked", clear_door_pause=clear)
+  assert store.get_lock_control() == ("none", None)
+  store.close()
+
+
+@pytest.mark.parametrize("state,inferred", (
+  ("none", "locked"), ("unlock_pause", None), ("unlock_pause", "locked"), ("rearm", None), ("rearm", "unknown"), ("unknown", None),
+))
+def test_lock_control_database_constraint_rejects_invalid_pairs(tmp_path, state, inferred) -> None:
+  store = SentryStore(tmp_path / "outbox.sqlite3")
+  with pytest.raises(sqlite3.IntegrityError), store.connection:
+    store.connection.execute("UPDATE runtime_state SET lock_control=?, inferred_lock_state=?", (state, inferred))
+  assert store.get_lock_control() == ("none", None)
+  # Reads also reject invalid stored values instead of reporting an unpaused state.
+  store.connection.execute("PRAGMA ignore_check_constraints=ON")
+  with store.connection:
+    store.connection.execute("UPDATE runtime_state SET lock_control=?, inferred_lock_state=?", (state, inferred))
+  with pytest.raises(ValueError, match="lock control"):
+    store.get_lock_control()
+  store.close()
+
+
+def test_lock_control_and_door_pause_clear_are_atomic_on_failure(tmp_path, monkeypatch) -> None:
+  path = tmp_path / "outbox.sqlite3"
+  store = SentryStore(path)
+  store.start_door_event(event_id=str(uuid4()), detected_at=NOW, message="Door opened.")
+  store.set_lock_control("rearm", "locked")
+  before = dict(store.connection.execute("SELECT * FROM runtime_state").fetchone())
+  store.close()
+  original_connect = sqlite3.connect
+
+  class FailingConnection(sqlite3.Connection):
+    def execute(self, sql, parameters=()):
+      result = super().execute(sql, parameters)
+      if sql.startswith("UPDATE runtime_state SET lock_control="):
+        raise sqlite3.OperationalError("simulated gate write failure")
+      return result
+
+  with monkeypatch.context() as patch:
+    patch.setattr(sqlite3, "connect", lambda *args, **kwargs: original_connect(*args, factory=FailingConnection, **kwargs))
+    store = SentryStore(path, run_maintenance=False)
+    with pytest.raises(sqlite3.OperationalError, match="gate write"):
+      store.set_lock_control("unlock_pause", "unlocked", clear_door_pause=True)
+    assert dict(store.connection.execute("SELECT * FROM runtime_state").fetchone()) == before
+    store.close()
+  store = SentryStore(path, run_maintenance=False)
+  store.set_lock_control("unlock_pause", "unlocked", clear_door_pause=True)
+  assert store.get_lock_control() == ("unlock_pause", "unlocked")
+  assert not store.get_door_pause()
+  assert tuple(store.connection.execute("SELECT door_event_id, door_converted FROM runtime_state").fetchone()) == (None, 0)
+  store.close()
+
+
+def test_concurrent_lock_control_updates_never_tear_pairs_or_erase_door_pause(tmp_path) -> None:
+  path = tmp_path / "outbox.sqlite3"
+  initial = SentryStore(path)
+  initial.start_door_event(event_id=str(uuid4()), detected_at=NOW, message="Door opened.")
+  barrier = threading.Barrier(4)
+
+  def update_or_read(index):
+    store = SentryStore(path, run_maintenance=False)
+    try:
+      barrier.wait(timeout=5)
+      for iteration in range(40):
+        if index < 2:
+          store.set_lock_control(*LOCK_CONTROLS[(iteration + index) % len(LOCK_CONTROLS)])
+        assert store.get_lock_control() in LOCK_CONTROLS
+        assert store.get_door_pause()
+    finally:
+      store.close()
+
+  with ThreadPoolExecutor(max_workers=4) as pool:
+    futures = [pool.submit(update_or_read, index) for index in range(4)]
+    for future in futures:
+      future.result(timeout=15)
+  assert initial.get_lock_control() in LOCK_CONTROLS
+  assert initial.get_door_pause()
+  initial.close()
+
+
+def create_schema_four_outbox(path, *, door_pause=True):
+  create_schema_three_outbox(path)
+  store = SentryStore(path, run_maintenance=False)
+  for state in ("provisional_capturing", "provisional_ready", "discarding"):
+    event_id = begin(store, schema_version=2, provisional=True)
+    if state != "provisional_capturing":
+      finish_complete(store, event_id)
+    if state == "discarding":
+      assert store.discard_event(event_id)
+  manual_id = begin(store, source="manual_test", schema_version=2)
+  finish_complete(store, manual_id)
+  provisional_id = begin(store, schema_version=2, provisional=True)
+  finish_complete(store, provisional_id)
+  store.start_door_event(event_id=str(uuid4()), provisional_event_id=provisional_id, detected_at=NOW, message="Door opened.")
+  finish_complete(store, provisional_id, 2)
+  if not door_pause:
+    store.clear_door_pause()
+  pause = tuple(store.connection.execute("SELECT singleton, door_pause_active, door_event_id, door_converted FROM runtime_state").fetchone())
+  # Recreate the deployed v4 runtime table independently: no lock-control fields
+  # existed. Queue payloads deliberately use noncanonical JSON to detect rewrites.
+  with store.connection:
+    for row in store.connection.execute("SELECT event_id, revision, metadata_json FROM revisions WHERE metadata_json IS NOT NULL").fetchall():
+      store.connection.execute("UPDATE revisions SET metadata_json=? WHERE event_id=? AND revision=?",
+                               (json.dumps(json.loads(row["metadata_json"]), indent=1) + "\n", row["event_id"], row["revision"]))
+    store.connection.execute("DROP TABLE runtime_state")
+    store.connection.execute("""
+      CREATE TABLE runtime_state (
+        singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+        door_pause_active INTEGER NOT NULL DEFAULT 0 CHECK(door_pause_active IN (0, 1)),
+        door_event_id TEXT,
+        door_converted INTEGER NOT NULL DEFAULT 0 CHECK(door_converted IN (0, 1)),
+        CHECK((door_pause_active=0 AND door_event_id IS NULL AND door_converted=0)
+          OR (door_pause_active=1 AND door_event_id IS NOT NULL))
+      )
+    """)
+    store.connection.execute("INSERT INTO runtime_state VALUES (?, ?, ?, ?)", pause)
+    store.connection.execute("PRAGMA user_version=4")
+  snapshot = {table: [dict(row) for row in store.connection.execute(f"SELECT * FROM {table}")]
+              for table in ("events", "revisions", "media", "runtime_state")}
+  files = {row["path"]: Path(row["path"]).read_bytes() for row in snapshot["media"] if row["path"]}
+  store.close()
+  return snapshot, files
+
+
+def assert_migrated_schema_four(store, snapshot, files):
+  for table, expected in snapshot.items():
+    actual = [dict(row) for row in store.connection.execute(f"SELECT * FROM {table}")]
+    if table == "runtime_state":
+      assert actual[0].pop("lock_control") == "none"
+      assert actual[0].pop("inferred_lock_state") is None
+    assert actual == expected
+  assert {name: Path(name).read_bytes() for name in files} == files
+  assert store.get_lock_control() == ("none", None)
+  assert store.connection.execute("PRAGMA user_version").fetchone()[0] == 5
+  assert store.connection.execute("PRAGMA foreign_key_check").fetchall() == []
+  assert store.connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+
+
+@pytest.mark.parametrize("door_pause", (False, True))
+def test_schema_four_migration_preserves_all_payload_bytes_claims_and_door_pause(tmp_path, door_pause) -> None:
+  path = tmp_path / "outbox.sqlite3"
+  snapshot, files = create_schema_four_outbox(path, door_pause=door_pause)
+  with sqlite3.connect(path) as connection:
+    schema = connection.execute("SELECT name, rootpage, sql FROM sqlite_master WHERE name IN ('events', 'revisions', 'media')").fetchall()
+  connection.close()
+  for _ in range(2):
+    store = SentryStore(path, run_maintenance=False)
+    assert_migrated_schema_four(store, snapshot, files)
+    assert [tuple(row) for row in store.connection.execute(
+      "SELECT name, rootpage, sql FROM sqlite_master WHERE name IN ('events', 'revisions', 'media')"
+    )] == schema  # v4 upgrade must not rebuild any queued table, even identically.
+    store.close()
+
+
+@pytest.mark.parametrize("fail_statement", (
+  "ALTER TABLE runtime_state ADD COLUMN lock_control", "ALTER TABLE runtime_state ADD COLUMN inferred_lock_state", "PRAGMA user_version=5",
+))
+def test_schema_four_migration_failure_rolls_back_runtime_columns_and_version(tmp_path, monkeypatch, fail_statement) -> None:
+  path = tmp_path / "outbox.sqlite3"
+  snapshot, files = create_schema_four_outbox(path)
+  original_connect = sqlite3.connect
+
+  class FailingConnection(sqlite3.Connection):
+    def execute(self, sql, parameters=()):
+      result = super().execute(sql, parameters)
+      if sql.strip().startswith(fail_statement):
+        raise sqlite3.OperationalError("simulated schema-five migration failure")
+      return result
+
+  with monkeypatch.context() as patch:
+    patch.setattr(sqlite3, "connect", lambda *args, **kwargs: original_connect(*args, factory=FailingConnection, **kwargs))
+    with pytest.raises(sqlite3.OperationalError, match="schema-five"):
+      SentryStore(path, run_maintenance=False)
+  with sqlite3.connect(path) as verifier:
+    verifier.row_factory = sqlite3.Row
+    assert verifier.execute("PRAGMA user_version").fetchone()[0] == 4
+    for table, expected in snapshot.items():
+      assert [dict(row) for row in verifier.execute(f"SELECT * FROM {table}")] == expected
+  verifier.close()
+  store = SentryStore(path, run_maintenance=False)
+  assert_migrated_schema_four(store, snapshot, files)
+  store.close()
+
+
+@pytest.mark.parametrize("crash_statement", (
+  "ALTER TABLE runtime_state ADD COLUMN lock_control", "ALTER TABLE runtime_state ADD COLUMN inferred_lock_state", "PRAGMA user_version=5",
+))
+def test_process_death_during_schema_four_migration_keeps_previous_runtime_and_queue(tmp_path, crash_statement) -> None:
+  path = tmp_path / "outbox.sqlite3"
+  snapshot, files = create_schema_four_outbox(path)
+  program = """
+import os
+import sqlite3
+import sys
+from openpilot.system.sentryd.store import SentryStore
+original_connect = sqlite3.connect
+class CrashConnection(sqlite3.Connection):
+  def execute(self, sql, parameters=()):
+    result = super().execute(sql, parameters)
+    if sql.strip().startswith(sys.argv[2]):
+      os._exit(77)
+    return result
+sqlite3.connect = lambda *args, **kwargs: original_connect(*args, factory=CrashConnection, **kwargs)
+SentryStore(sys.argv[1], run_maintenance=False)
+"""
+  result = subprocess.run([sys.executable, "-c", program, str(path), crash_statement], timeout=10, check=False)
+  assert result.returncode == 77
+  with sqlite3.connect(path) as verifier:
+    verifier.row_factory = sqlite3.Row
+    assert verifier.execute("PRAGMA user_version").fetchone()[0] == 4
+    for table, expected in snapshot.items():
+      assert [dict(row) for row in verifier.execute(f"SELECT * FROM {table}")] == expected
+  verifier.close()
+  store = SentryStore(path, run_maintenance=False)
+  assert_migrated_schema_four(store, snapshot, files)
+  store.close()
+
+
+def test_concurrent_schema_four_initializers_preserve_runtime_and_queue(tmp_path) -> None:
+  path = tmp_path / "outbox.sqlite3"
+  snapshot, files = create_schema_four_outbox(path)
+  barrier = threading.Barrier(4)
+  opened = threading.Barrier(4)
+
+  def initialize():
+    barrier.wait(timeout=5)
+    store = None
+    try:
+      store = SentryStore(path, run_maintenance=False)
+      assert_migrated_schema_four(store, snapshot, files)
+      opened.wait(timeout=5)
+    except Exception:
+      opened.abort()
+      raise
+    finally:
+      if store is not None:
+        store.close()
+
+  with ThreadPoolExecutor(max_workers=4) as pool:
+    futures = [pool.submit(initialize) for _ in range(4)]
+    for future in futures:
+      future.result(timeout=15)
+
+
 def create_schema_three_outbox(path):
   store = SentryStore(path)
   future = datetime.now(UTC).timestamp() + 3600
@@ -671,7 +980,7 @@ def assert_migrated_schema_three(store, snapshot, files):
   for table, expected in snapshot.items():
     assert [dict(row) for row in store.connection.execute(f"SELECT * FROM {table}")] == expected
   assert {name: Path(name).read_bytes() for name in files} == files
-  assert store.connection.execute("PRAGMA user_version").fetchone()[0] == 4
+  assert store.connection.execute("PRAGMA user_version").fetchone()[0] == 5
   assert store.connection.execute("PRAGMA foreign_key_check").fetchall() == []
   assert store.connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
   assert not store.get_door_pause()
@@ -692,7 +1001,7 @@ def test_schema_three_migration_preserves_claims_wire_bytes_and_exact_retry_floo
 @pytest.mark.parametrize("fail_statement", (
   "INSERT INTO sentry_revisions_v2", "DROP TABLE revisions", "ALTER TABLE sentry_revisions_v2",
   "INSERT INTO sentry_events_v4", "DROP TABLE events", "ALTER TABLE sentry_events_v4", "CREATE TABLE IF NOT EXISTS runtime_state",
-  "PRAGMA user_version=4",
+  "PRAGMA user_version=5",
 ))
 def test_schema_three_migration_failure_rolls_back_every_table_and_floor(tmp_path, monkeypatch, fail_statement) -> None:
   path = tmp_path / "outbox.sqlite3"
@@ -721,7 +1030,7 @@ def test_schema_three_migration_failure_rolls_back_every_table_and_floor(tmp_pat
   assert_migrated_schema_three(store, snapshot, files)
 
 
-@pytest.mark.parametrize("crash_statement", ("DROP TABLE events", "PRAGMA user_version=4"))
+@pytest.mark.parametrize("crash_statement", ("DROP TABLE events", "PRAGMA user_version=5"))
 def test_process_death_during_schema_three_migration_retains_old_queue(tmp_path, crash_statement) -> None:
   path = tmp_path / "outbox.sqlite3"
   snapshot, files = create_schema_three_outbox(path)
@@ -790,7 +1099,7 @@ def assert_migrated_legacy(store, snapshot):
     assert actual == snapshot[table]
   assert store.connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
   assert store.connection.execute("PRAGMA foreign_key_check").fetchall() == []
-  assert store.connection.execute("PRAGMA user_version").fetchone()[0] == 4
+  assert store.connection.execute("PRAGMA user_version").fetchone()[0] == 5
   assert store.connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
   assert store.connection.execute("PRAGMA synchronous").fetchone()[0] == 2
 
@@ -865,7 +1174,7 @@ def assert_migrated_schema_two(store, snapshot, files):
         expected_floor = row["next_attempt_at"] if row["state"] == "ready" and row["last_http_status"] is not None and row["next_attempt_at"] > 1 else 0
         assert row.pop("retry_after_at") == expected_floor
     assert actual == snapshot[table]
-  assert store.connection.execute("PRAGMA user_version").fetchone()[0] == 4
+  assert store.connection.execute("PRAGMA user_version").fetchone()[0] == 5
   assert store.connection.execute("PRAGMA foreign_key_check").fetchall() == []
   assert store.connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
   assert {name: Path(name).read_bytes() for name in files} == files
@@ -888,7 +1197,7 @@ def test_schema_two_migration_preserves_both_wire_schemas_claims_and_server_dead
 
 
 @pytest.mark.parametrize("fail_statement", (
-  "ALTER TABLE revisions ADD COLUMN retry_after_at", "UPDATE revisions SET retry_after_at=next_attempt_at", "PRAGMA user_version=4",
+  "ALTER TABLE revisions ADD COLUMN retry_after_at", "UPDATE revisions SET retry_after_at=next_attempt_at", "PRAGMA user_version=5",
 ))
 def test_schema_two_migration_failure_rolls_back_column_version_and_every_row(tmp_path, monkeypatch, fail_statement) -> None:
   path = tmp_path / "outbox.sqlite3"
@@ -919,7 +1228,7 @@ def test_schema_two_migration_failure_rolls_back_column_version_and_every_row(tm
   assert_migrated_schema_two(migrated, snapshot, files)
 
 
-@pytest.mark.parametrize("crash_statement", ("ALTER TABLE revisions ADD COLUMN retry_after_at", "PRAGMA user_version=4"))
+@pytest.mark.parametrize("crash_statement", ("ALTER TABLE revisions ADD COLUMN retry_after_at", "PRAGMA user_version=5"))
 def test_process_death_during_schema_two_migration_preserves_queue(tmp_path, crash_statement) -> None:
   path = tmp_path / "outbox.sqlite3"
   _, snapshot, files = create_schema_two_outbox(path)
@@ -986,7 +1295,7 @@ def test_concurrent_first_time_initializers_create_private_database(tmp_path) ->
     store = None
     try:
       store = SentryStore(path, run_maintenance=False)
-      assert store.connection.execute("PRAGMA user_version").fetchone()[0] == 4
+      assert store.connection.execute("PRAGMA user_version").fetchone()[0] == 5
       assert store.connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
       opened.wait(timeout=5)
     except Exception:
@@ -1018,7 +1327,7 @@ def test_current_schema_open_does_not_request_a_migration_write_lock(tmp_path, m
   reopened = SentryStore(path, run_maintenance=False)
   assert "BEGIN IMMEDIATE" not in statements
   assert "PRAGMA foreign_key_check" not in statements
-  assert "PRAGMA user_version=4" not in statements
+  assert "PRAGMA user_version=5" not in statements
   reopened.close()
   initial.close()
 
@@ -1073,7 +1382,7 @@ def test_wal_failure_is_bounded_and_closes_connection(tmp_path, monkeypatch, cod
 
 
 @pytest.mark.parametrize("fail_statement", [
-  "INSERT INTO sentry_revisions_v2", "DROP TABLE revisions", "ALTER TABLE sentry_revisions_v2", "PRAGMA user_version=4",
+  "INSERT INTO sentry_revisions_v2", "DROP TABLE revisions", "ALTER TABLE sentry_revisions_v2", "PRAGMA user_version=5",
 ])
 def test_legacy_migration_failure_rolls_back_schema_and_rows(tmp_path, monkeypatch, fail_statement) -> None:
   path = tmp_path / "outbox.sqlite3"
@@ -1106,7 +1415,7 @@ def test_legacy_migration_failure_rolls_back_schema_and_rows(tmp_path, monkeypat
   assert_migrated_legacy(restarted, snapshot)
 
 
-@pytest.mark.parametrize("crash_statement", ["DROP TABLE revisions", "ALTER TABLE sentry_revisions_v2", "PRAGMA user_version=4"])
+@pytest.mark.parametrize("crash_statement", ["DROP TABLE revisions", "ALTER TABLE sentry_revisions_v2", "PRAGMA user_version=5"])
 def test_process_death_during_migration_recovers_the_complete_legacy_outbox(tmp_path, crash_statement) -> None:
   path = tmp_path / "outbox.sqlite3"
   _, _, snapshot, files = create_legacy_outbox(path)
@@ -1155,12 +1464,12 @@ def test_legacy_quota_rewrite_does_not_upgrade_wire_schema(tmp_path) -> None:
 def test_future_database_schema_is_not_downgraded(tmp_path) -> None:
   path = tmp_path / "outbox.sqlite3"
   store = SentryStore(path)
-  store.connection.execute("PRAGMA user_version=5")
+  store.connection.execute("PRAGMA user_version=6")
   store.close()
   with pytest.raises(ValueError, match="future"):
     SentryStore(path)
   with sqlite3.connect(path) as connection:
-    assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
 
 
 def test_revision_timestamps_are_clamped_to_server_ordering_invariants(tmp_path) -> None:

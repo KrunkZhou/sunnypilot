@@ -34,6 +34,15 @@ DOOR_PAUSE_HELP = (
   "New motion capture pauses until all doors and the trunk have stayed closed for 5 minutes. " +
   "Earlier confirmed events keep their normal delivery and alerts."
 )
+LOCK_DETECTION_HELP = (
+  "Optional, off by default: infer lock/unlock from indicator flashes while parked on a validated Audi MQB CAN profile. " +
+  "This is a heuristic, not a verified door-lock signal; vehicle behavior can differ. " +
+  "One qualifying flash infers locked and starts 90 seconds of arming after all doors and the trunk close. " +
+  "Two qualifying flashes infer unlocked and pause all automatic motion and door captures for 60 minutes. " +
+  "Hazard flashes are ignored. Restarting during an unlock pause restarts the full 60 minutes. " +
+  "Manual tests and queued uploads continue during the pause."
+)
+LOCK_DETECTION_STATES = ("flash_classifying", "unlock_paused", "lock_waiting_for_doors")
 DRIVER_EXIT_STATUS = {
   "waiting_for_door_open": (
     "waiting for door open",
@@ -64,6 +73,8 @@ class SentryConsentLayoutMici(NavScroller):
       GreyBigButton("unconfirmed photos", "Without confirmation, the first pair is discarded after 60 seconds, unless a door opens."),
       GreyBigButton("silent door photos", "A door or trunk opening keeps any pending first pair and captures a new pair. Both upload without an alert."),
       GreyBigButton("door pause", "New motion capture resumes after all doors and the trunk stay closed for 5 minutes."),
+      GreyBigButton("optional flash detection",
+                    "Off by default. Indicator flashes can infer lock/unlock on validated Audi MQB vehicles; this is only a heuristic."),
       GreyBigButton("capture limit", "First capture plus up to 20 more revisions per episode, then 90 seconds to rearm."),
       GreyBigButton("alert frequency", "Only the first capture in each motion episode sends a webhook alert."),
       GreyBigButton("upload to your RTZ server", "Captures wait securely on this device while offline and upload when connectivity returns."),
@@ -92,6 +103,11 @@ class SentryLayoutMici(NavScroller):
     self._confirmation.set_click_callback(self._show_confirmation)
     self._wait_for_driver_exit = BigToggle("wait for driver exit", "door open + close before arming",
                                          self.config.wait_for_driver_exit, self._on_wait_for_driver_exit)
+    self._infer_lock_from_flashes = BigToggle("Lock/unlock flash detection", "heuristic · Audi MQB only",
+                                             self.config.infer_lock_from_flashes, self._on_infer_lock_from_flashes)
+    self._infer_lock_from_flashes.set_enabled(lambda: ui_state.is_offroad() and self.config_error is None)
+    self._lock_status = BigButton("lock/unlock inference", "disabled")
+    self._lock_status.set_click_callback(self._show_lock_detection)
     self._status = BigButton("Sentry status", "starting", self.icon)
     self._status.set_click_callback(self._show_status)
     self._queue = BigButton("upload queue", "0 pending")
@@ -111,6 +127,8 @@ class SentryLayoutMici(NavScroller):
       self._sensitivity,
       self._confirmation,
       self._wait_for_driver_exit,
+      self._infer_lock_from_flashes,
+      self._lock_status,
       self._status,
       self._queue,
       self._manual_test,
@@ -145,6 +163,7 @@ class SentryLayoutMici(NavScroller):
     self._sensitivity.set_value(next(
       name for name, threshold in SENSITIVITY_TO_THRESHOLD.items() if threshold == config.motion_threshold_mps2))
     self._wait_for_driver_exit.set_checked(config.wait_for_driver_exit)
+    self._infer_lock_from_flashes.set_checked(config.infer_lock_from_flashes)
     self._refresh_status()
 
   def _refresh_status(self) -> None:
@@ -161,8 +180,17 @@ class SentryLayoutMici(NavScroller):
       state = "confirming motion"
     elif state_key == "door_paused":
       state = self._door_pause_text(status)
+    elif state_key in LOCK_DETECTION_STATES:
+      state = self._lock_detection_text(status)
     self._status.set_value(state)
     self._confirmation.set_value(self._confirmation_text(status) if state == "confirming motion" else "10 motion samples")
+    if not ui_state.is_offroad() or not self.config.infer_lock_from_flashes:
+      lock_state = "disabled"
+    elif self.config_error or self._runtime_status_error(status):
+      lock_state = "status unavailable"
+    else:
+      lock_state = self._lock_detection_text(status)
+    self._lock_status.set_value(lock_state)
     try:
       stats = read_outbox_stats()
       queued = f"{stats.pending} pending / {stats.media_bytes / (1024 * 1024):.1f} MB"
@@ -192,6 +220,13 @@ class SentryLayoutMici(NavScroller):
 
   def _on_wait_for_driver_exit(self, enabled: bool) -> None:
     self._write_config(lambda: self.store.set_wait_for_driver_exit(enabled))
+
+  def _on_infer_lock_from_flashes(self, enabled: bool) -> None:
+    # A touch may finish after ignition changed; never change this heuristic onroad.
+    if not ui_state.is_offroad():
+      self._refresh_controls()
+      return
+    self._write_config(lambda: self.store.set_infer_lock_from_flashes(enabled))
 
   def _write_config(self, operation) -> None:
     try:
@@ -243,7 +278,23 @@ class SentryLayoutMici(NavScroller):
       description = f"{CONFIRMATION_HELP}\n\n{DOOR_PAUSE_HELP}"
       if self.config.wait_for_driver_exit:
         description += " After ignition switches off, open and close the driver's door to start the 90-second arming timer."
+    if ui_state.is_offroad() and not self.config_error and not runtime_error and self.config.infer_lock_from_flashes:
+      description += f"\n\n{self._lock_detection_description(status)}"
     gui_app.push_widget(BigDialog("Sentry status", description))
+
+  def _show_lock_detection(self) -> None:
+    status = get_status(self.volatile_params) or {}
+    if not ui_state.is_offroad() or self.config_error or self._runtime_status_error(status):
+      self._show_status()  # Configuration, ignition and daemon errors retain priority.
+      return
+    gui_app.push_widget(BigDialog("Lock/unlock flash detection", self._lock_detection_description(status)))
+
+  def _lock_detection_description(self, status: dict) -> str:
+    description = f"{self._lock_detection_text(status)}.\n\n{LOCK_DETECTION_HELP}"
+    lock = status.get("lock_detection")
+    if isinstance(lock, dict) and isinstance(lock.get("error"), str) and lock["error"]:
+      description += f"\n\n{lock['error']}"
+    return description
 
   def _show_confirmation(self) -> None:
     gui_app.push_widget(BigDialog("motion confirmation", f"{CONFIRMATION_HELP}\n\n{DOOR_PAUSE_HELP}"))
@@ -273,6 +324,39 @@ class SentryLayoutMici(NavScroller):
     if type(seconds) not in (int, float) or not math.isfinite(seconds):
       return "waiting for door status"
     return f"door pause · {math.ceil(max(0, min(seconds, 300)))} sec left"
+
+  @staticmethod
+  def _lock_detection_text(status: dict) -> str:
+    lock = status.get("lock_detection")
+    if not isinstance(lock, dict):
+      return "status unavailable"
+    if lock.get("enabled") is not True or lock.get("state") == "disabled":
+      return "disabled"
+    state = lock.get("state")
+    if state == "unavailable":
+      return "flash signal unavailable"
+    if state == "classifying":
+      count = lock.get("pulse_count")
+      if type(count) is int and 0 <= count <= 10:
+        return f"classifying · {count} {'pulse' if count == 1 else 'pulses'}"
+      return "classifying flashes"
+    if state in ("unlock_paused", "arming"):
+      label = "unlock pause" if state == "unlock_paused" else "lock arming"
+      seconds = lock.get("pause_seconds_remaining")
+      if type(seconds) in (int, float) and math.isfinite(seconds):
+        seconds = max(0, min(seconds, 3600 if state == "unlock_paused" else 90))
+        remaining = f"{math.ceil(seconds / 60)} min" if state == "unlock_paused" and seconds > 60 else f"{math.ceil(seconds)} sec"
+        return f"{label} · {remaining} left"
+      return label
+    if state == "waiting_for_doors":
+      return "lock · waiting for doors"
+    if state == "armed":
+      inferred = lock.get("inferred_state")
+      return f"inferred {inferred} · armed" if inferred in ("locked", "unlocked") else "armed · waiting for flashes"
+    if state == "idle":
+      inferred = lock.get("inferred_state")
+      return f"inferred {inferred}" if inferred in ("locked", "unlocked") else "waiting for flashes"
+    return "status unavailable"
 
   @staticmethod
   def _runtime_status_error(status: dict) -> str | None:
