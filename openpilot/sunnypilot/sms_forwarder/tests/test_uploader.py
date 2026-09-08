@@ -1,6 +1,12 @@
 from dataclasses import replace
+
+import jwt
+import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ec, rsa
+
 from openpilot.sunnypilot.sms_forwarder.store import QueuedMessage
-from openpilot.sunnypilot.sms_forwarder.uploader import ES256DeviceApi, RTZUploader
+from openpilot.sunnypilot.sms_forwarder.uploader import RTZUploader
 
 
 MESSAGE = QueuedMessage(
@@ -75,12 +81,40 @@ def test_batch_is_limited_to_50_and_512_kib() -> None:
   assert len(payload["messages"]) == len(accepted)
 
 
-def test_production_uploader_loads_only_the_es256_key(monkeypatch, tmp_path) -> None:
+@pytest.mark.parametrize("key_names, algorithm", [
+  (("id_rsa",), "RS256"),
+  (("id_rsa", "id_ecdsa"), "RS256"),
+  (("id_ecdsa",), "ES256"),
+])
+def test_production_upload_uses_registration_key(monkeypatch, tmp_path, key_names, algorithm) -> None:
   key_directory = tmp_path / "comma"
   key_directory.mkdir()
-  (key_directory / "id_rsa").write_text("legacy RSA private")
-  (key_directory / "id_rsa.pub").write_text("legacy RSA public")
-  (key_directory / "id_ecdsa").write_text("ECDSA private")
-  (key_directory / "id_ecdsa.pub").write_text("ECDSA public")
-  monkeypatch.setattr("openpilot.sunnypilot.sms_forwarder.uploader.Paths.persist_root", lambda: str(tmp_path))
-  assert ES256DeviceApi.get_key_pair() == ("ES256", "ECDSA private", "ECDSA public")
+  public_keys = {}
+  for name in key_names:
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048) if name == "id_rsa" else ec.generate_private_key(ec.SECP256R1())
+    (key_directory / name).write_bytes(key.private_bytes(
+      serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption(),
+    ))
+    public_keys[name] = key.public_key().public_bytes(serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo)
+    (key_directory / f"{name}.pub").write_bytes(public_keys[name])
+  monkeypatch.setattr("openpilot.common.api.base.Paths.persist_root", lambda: str(tmp_path))
+  requests = []
+
+  def post_message(method, url, **kwargs):
+    requests.append((method, url, kwargs))
+    assert method == "POST"
+    assert url.endswith("/v1/devices/dongle/sms")
+    authorization = kwargs["headers"]["Authorization"]
+    assert authorization.startswith("JWT ")
+    token = authorization.removeprefix("JWT ")
+    assert jwt.get_unverified_header(token)["alg"] == algorithm
+    claims = jwt.decode(token, public_keys[key_names[0]], algorithms=[algorithm], options={"require": ["identity", "iat", "nbf", "exp"]})
+    assert claims["identity"] == "dongle"
+    assert kwargs["json"] == {"messages": [MESSAGE.api_dict()]}
+    return FakeResponse(200, {"accepted": [MESSAGE.message_id]})
+
+  monkeypatch.setattr("openpilot.common.api.base.requests.request", post_message)
+  store = FakeStore([MESSAGE])
+  assert RTZUploader("dongle", store).upload_once() is True
+  assert len(requests) == 1
+  assert store.acknowledged == [MESSAGE.message_id]

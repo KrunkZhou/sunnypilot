@@ -2,6 +2,8 @@
 
 This service reads human-readable inbound SMS messages from the Comma 4 modem, stores them durably, and forwards them to the configured `API_HOST`. It runs automatically on Comma 4, both onroad and offroad. There is no setting or Params key.
 
+Uploads use the same primary device key as normal API registration: RSA (`RS256`) when a complete RSA key pair is present, otherwise ECDSA (`ES256`). RTZ verifies that key against the device's registered public key. RSA-registered devices need this uploader update.
+
 The service deliberately does not modify the main modem implementation or enable unsolicited modem notifications. It shares `/dev/shm/modem.lock`, polls `SM` and `ME` storage in PDU mode, and keeps both the modem slot and its SQLite copy until RTZ acknowledges the normalized message. The queue is stored at `/data/sms_forwarder/queue.sqlite3`.
 
 Only SMS-DELIVER text using GSM 7-bit or UCS-2 is forwarded. Binary, MMS, provisioning, status reports, malformed PDUs, and incomplete multipart messages stay on the modem and are never uploaded or deleted.

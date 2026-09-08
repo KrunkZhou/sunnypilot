@@ -5,32 +5,17 @@ import json
 import requests
 
 from openpilot.common.api.base import BaseApi
-from openpilot.common.api.comma_connect import API_HOST
-from openpilot.common.hardware.hw import Paths
+from openpilot.common.api.comma_connect import CommaConnectApi
 from openpilot.common.swaglog import cloudlog
 from openpilot.sunnypilot.sms_forwarder.store import MessageStore
-
-
-class ES256DeviceApi(BaseApi):
-  def __init__(self, dongle_id: str):
-    super().__init__(dongle_id, API_HOST)
-
-  @staticmethod
-  def get_key_pair() -> tuple[str, str, str] | tuple[None, None, None]:
-    private_path = Paths.persist_root() + "/comma/id_ecdsa"
-    public_path = private_path + ".pub"
-    try:
-      with open(private_path) as private, open(public_path) as public:
-        return "ES256", private.read(), public.read()
-    except OSError:
-      return None, None, None
 
 
 class RTZUploader:
   def __init__(self, dongle_id: str, store: MessageStore, api: BaseApi | None = None):
     self.dongle_id = dongle_id
     self.store = store
-    self.api = api or ES256DeviceApi(dongle_id)
+    # Match registration's primary key selection, including RSA on legacy devices.
+    self.api = api or CommaConnectApi(dongle_id)
 
   def upload_once(self) -> bool | None:
     messages = self.store.pending(50)
