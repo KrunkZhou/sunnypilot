@@ -224,7 +224,10 @@ def jsonrpc_handler(end_event: threading.Event, localProxyHandler = None) -> Non
       data = recv_queue.get(timeout=1)
       msg = loads(data)
       if is_call(msg):
-        cloudlog.event("athena.jsonrpc_handler.call_method", data=data)
+        if msg.get("method") in ("getDeviceSettings", "setDeviceSetting", "getDeviceModels", "manageDeviceModels", "getDeviceMaps", "manageDeviceMaps"):
+          cloudlog.event("athena.jsonrpc_handler.call_method", method=msg["method"])
+        else:
+          cloudlog.event("athena.jsonrpc_handler.call_method", data=data)
         send_queue_push(handle(msg, dispatcher), SEND_PRIORITY_HIGH)
       elif is_response(msg):
         log_recv_queue.put_nowait(data)
@@ -371,6 +374,42 @@ def getMessage(service: str, timeout: int = 1000) -> dict:
     return cast(dict, ret.to_dict())
   finally:
     del socket
+
+
+@dispatcher.add_method
+def getDeviceSettings() -> dict:
+  from openpilot.sunnypilot.system.remote_settings import get_device_settings
+  return get_device_settings()
+
+
+@dispatcher.add_method
+def setDeviceSetting(key: str, value, expected_value, confirmed: bool = False) -> dict:
+  from openpilot.sunnypilot.system.remote_settings import set_device_setting
+  return set_device_setting(key, value, expected_value, confirmed)
+
+
+@dispatcher.add_method
+def getDeviceModels() -> dict:
+  from openpilot.sunnypilot.system.remote_models import get_device_models
+  return get_device_models()
+
+
+@dispatcher.add_method
+def manageDeviceModels(action: str, **kwargs) -> dict:
+  from openpilot.sunnypilot.system.remote_models import manage_device_models
+  return manage_device_models(action, **kwargs)
+
+
+@dispatcher.add_method
+def getDeviceMaps() -> dict:
+  from openpilot.sunnypilot.system.remote_maps import get_device_maps
+  return get_device_maps()
+
+
+@dispatcher.add_method
+def manageDeviceMaps(action: str, **kwargs) -> dict:
+  from openpilot.sunnypilot.system.remote_maps import manage_device_maps
+  return manage_device_maps(action, **kwargs)
 
 
 @dispatcher.add_method
