@@ -7,17 +7,23 @@ See the LICENSE.md file in the root directory for more details.
 import json
 import math
 import platform
+import time
 
 from openpilot.cereal import log
 from openpilot.common.params import Params
-from openpilot.sunnypilot.mapd.live_map_data.base_map_data import BaseMapData
+from openpilot.sunnypilot.mapd.live_map_data.base_map_data import BaseMapData, MAX_SPEED_LIMIT
+from openpilot.sunnypilot.mapd.live_map_data.speed_limit_database import SpeedLimitDatabase
 from openpilot.sunnypilot.navd.helpers import Coordinate
 
 
+MAX_DATABASE_LOCATION_AGE = 1.0  # seconds; mapd_manager polls location once per second.
+
+
 class OsmMapData(BaseMapData):
-  def __init__(self):
+  def __init__(self, speed_limit_database: SpeedLimitDatabase | None = None):
     super().__init__()
     self.mem_params = Params("/dev/shm/params") if platform.system() != "Darwin" else self.params
+    self.speed_limit_database = speed_limit_database if speed_limit_database is not None else SpeedLimitDatabase()
 
   def update_location(self) -> None:
     location = self.sm['liveLocationKalman']
@@ -41,7 +47,26 @@ class OsmMapData(BaseMapData):
     self.mem_params.put("LastGPSPosition", json.dumps(params), block=True)
 
   def get_current_speed_limit(self) -> float:
-    return float(self.mem_params.get("MapSpeedLimit") or 0.0)
+    try:
+      map_speed_limit = float(self.mem_params.get("MapSpeedLimit") or 0.0)
+    except (TypeError, ValueError):
+      map_speed_limit = 0.0
+    if 0.0 < map_speed_limit < MAX_SPEED_LIMIT:
+      return map_speed_limit
+
+    # The database is a fallback for the current limit, using only a live GPS fix.
+    location = self.sm['liveLocationKalman']
+    if not (self.sm.alive['liveLocationKalman'] and self.sm.valid['liveLocationKalman'] and
+            self.localizer_valid and location.gpsOK and location.calibratedOrientationNED.valid):
+      return 0.0
+    location_time = self.sm.logMonoTime['liveLocationKalman'] * 1e-9
+    # C++ locationd timestamps include suspend time on Linux (CLOCK_BOOTTIME).
+    now = time.clock_gettime(getattr(time, "CLOCK_BOOTTIME", time.CLOCK_MONOTONIC))
+    if location_time <= 0.0 or not 0.0 <= now - location_time <= MAX_DATABASE_LOCATION_AGE:
+      return 0.0
+
+    database_speed_limit = self.speed_limit_database.lookup(self.last_position, self.last_bearing)
+    return database_speed_limit if 0.0 < database_speed_limit < MAX_SPEED_LIMIT else 0.0
 
   def get_current_road_name(self) -> str:
     return str(self.mem_params.get("RoadName") or "")
