@@ -143,6 +143,7 @@ class SentryCapture:
     stage_seconds: dict[str, dict[str, float]] = {role: {} for role in CAMERA_STREAMS}
     receive_attempts = dict.fromkeys(CAMERA_STREAMS, 0)
     frame_received = dict.fromkeys(CAMERA_STREAMS, False)
+    connected_roles = set(clients)
     errors: dict[str, object] = {}
     encoder_timeout_role: str | None = None
 
@@ -151,7 +152,8 @@ class SentryCapture:
         return
       now = time.monotonic()
       if role in stages:
-        stage_seconds[role][stages[role]] = now - stage_started_at[role]
+        previous_stage = stages[role]
+        stage_seconds[role][previous_stage] = stage_seconds[role].get(previous_stage, 0.0) + now - stage_started_at[role]
       stages[role] = stage
       stage_started_at[role] = now
       log_capture_diagnostic("sentry_capture_stage", role=role, stage=stage,
@@ -180,18 +182,34 @@ class SentryCapture:
           if role not in clients:
             record_error(role, exc)
       for role, stream in CAMERA_STREAMS.items():
+        if role in media or role in omissions:
+          continue
+        if role in clients:
+          try:
+            connected = clients[role].is_connected()
+          except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as exc:
+            record_error(role, exc)
+            connected = False
+          if not connected:
+            # VisionIPC invalidates its buffer mapping when camerad restarts.
+            # Reconnect and warm the new mapping within the original lease.
+            del clients[role]
+            connected_at.pop(role, None)
+            set_stage(role, "discovery")
         if role not in clients and role not in omissions and stream in available:
           try:
             set_stage(role, "connect")
             client = self.client_factory("camerad", stream, True)
             if client.connect(False):
               clients[role] = client
+              connected_roles.add(role)
               connected_at[role] = self.clock()
               set_stage(role, "warmup")
               errors.pop(role, None)
           except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as exc:
             record_error(role, exc)
-            omissions[role] = "camera_unavailable"
+            # Camera startup can race discovery/connection. Keep trying until
+            # the existing deadline instead of finalizing the first hiccup.
 
       for role, client in clients.items():
         if role in media or role in omissions:
@@ -217,8 +235,12 @@ class SentryCapture:
         if remaining <= 0:
           break
         try:
+          # Leave each connected unfinished camera a share of the lease. Do
+          # not reserve encoding time for a camera that never connected.
+          pending_cameras = sum(pending_role not in media and pending_role not in omissions for pending_role in clients)
+          encode_timeout = remaining / pending_cameras
           with cloudlog.ctx(sentry_camera_role=role):
-            media[role] = self.encoder.encode(frame, remaining, lambda: abort_callback() or not self._is_offroad())
+            media[role] = self.encoder.encode(frame, encode_timeout, lambda: abort_callback() or not self._is_offroad())
           set_stage(role, "complete")
         except CaptureAborted as exc:
           record_error(role, exc)
@@ -240,10 +262,11 @@ class SentryCapture:
 
     for role in CAMERA_STREAMS:
       if role not in media and role not in omissions:
-        omissions[role] = "capture_timeout" if role in clients else "camera_unavailable"
+        omissions[role] = "capture_timeout" if role in connected_roles else "camera_unavailable"
     diagnostic_finished_at = time.monotonic()
     for role in CAMERA_STREAMS:
-      stage_seconds[role][stages[role]] = diagnostic_finished_at - stage_started_at[role]
+      stage = stages[role]
+      stage_seconds[role][stage] = stage_seconds[role].get(stage, 0.0) + diagnostic_finished_at - stage_started_at[role]
     log_capture_diagnostic("sentry_capture_result", elapsed_seconds=diagnostic_finished_at - diagnostic_started_at,
                            encoder_timeout_role=encoder_timeout_role, cameras={role: {
                              "stage": stages[role], "stage_seconds": stage_seconds[role],
