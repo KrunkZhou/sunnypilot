@@ -44,6 +44,9 @@ class Client:
   def connect(self, _blocking):
     return True
 
+  def is_connected(self):
+    return True
+
   def recv(self, _timeout):
     return SimpleNamespace()
 
