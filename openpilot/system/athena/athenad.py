@@ -812,6 +812,12 @@ def getGithubUsername() -> str:
 
 
 @dispatcher.add_method
+def getVehicleState() -> dict:
+  from openpilot.system.vehicle_telemetryd.state import get_vehicle_state
+  return get_vehicle_state()
+
+
+@dispatcher.add_method
 def getNotCar() -> bool:
   cp_bytes = Params().get("CarParamsPersistent")
   if cp_bytes is not None:

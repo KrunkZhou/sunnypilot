@@ -130,6 +130,7 @@ procs = [
   NativeProcess("encoderd", "openpilot/system/loggerd", ["./encoderd"], only_onroad),
   NativeProcess("stream_encoderd", "openpilot/system/loggerd", ["./encoderd", "--stream"], or_(livestream, notcar)),
   PythonProcess("logmessaged", "openpilot.system.logmessaged", always_run),
+  PythonProcess("vehicle_telemetryd", "openpilot.system.vehicle_telemetryd.vehicle_telemetryd", always_run),
 
   NativeProcess("camerad", "openpilot/system/camerad", ["./camerad"], or_(driverview, or_(livestream, sentry_capture)), enabled=not WEBCAM),
   PythonProcess("webcamerad", "openpilot.system.camerad.webcam.camerad", driverview, enabled=WEBCAM),
