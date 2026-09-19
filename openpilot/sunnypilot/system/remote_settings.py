@@ -5,7 +5,6 @@ on the device. Native UI callbacks with persistent side effects are handled by a
 small adapter below rather than importing UI code into Athena.
 """
 # JSON booleans must not pass integer checks; preserve exact primitive types.
-# ruff: noqa: E721
 from __future__ import annotations
 
 import math
@@ -26,6 +25,7 @@ _UNKNOWN = object()
 _TYPES = {0: "string", 1: "bool", 2: "int", 3: "float"}
 _COMPARE = {"==": operator.eq, "!=": operator.ne, "<": operator.lt, "<=": operator.le, ">": operator.gt, ">=": operator.ge}
 _WIDGETS = {"toggle", "option", "multiple_button", "info"}
+_MODEL_SETTINGS = {"LaneTurnDesire", "LaneTurnValue", "LagdToggle", "LagdToggleDelay", "CameraOffset", "NeuralNetworkLateralControl"}
 _BLOCKED = {"AdbEnabled", "SshEnabled", "GithubUsername", "GithubSshKeys", "OnroadCycleRequested", "ParamsVersion",
             "HasAcceptedTerms", "HasAcceptedTermsSP", "CompletedTrainingVersion", "CompletedSunnylinkConsentVersion"}
 _EXCLUSIVE = {
@@ -201,10 +201,11 @@ class Context:
 
 
 class RemoteSettings:
-  def __init__(self, params, schema: dict, capabilities, state=_live_state, prebuilt_path: Path | None = None):
+  def __init__(self, params, schema: dict, capabilities, state=_live_state, prebuilt_path: Path | None = None, custom_model=None):
     self.params, self.schema = params, schema
     self.capabilities, self.state = capabilities, state
     self.prebuilt_path = prebuilt_path
+    self.custom_model = custom_model or self._custom_model_available
     self.panels: list[dict] = []
     self.settings: dict[str, Setting] = {}
     if schema.get("schema_version") != "1.0":
@@ -221,6 +222,8 @@ class RemoteSettings:
         confirmation = container.get("description") or "Confirm this change. Use test maneuvers only in a closed environment."
       for item in container.get("items", []) + container.get("sub_items", []):
         key = item.get("key")
+        if panel == "models" and key not in _MODEL_SETTINGS:
+          continue
         if not isinstance(key, str) or not key or key in self.settings:
           raise ValueError("Invalid or duplicate device setting.")
         own_confirmation = confirmation
@@ -235,10 +238,8 @@ class RemoteSettings:
         children(section, panel, " / ".join(x for x in (label, title) if x), visibility, enablement, confirmation, remote)
 
     for panel in self.schema.get("panels", []):
-      if panel.get("id") == "models":
-        continue
       self.panels.append({"id": panel["id"], "title": panel.get("label", panel["id"]), "description": panel.get("description", "")})
-      children(panel, panel["id"], remote=panel.get("remote_configurable") is True)
+      children(panel, panel["id"], remote=panel.get("remote_configurable") is True or panel["id"] == "models")
     if self.schema.get("vehicle_settings"):
       self.panels.append({"id": "vehicle", "title": "Vehicle", "description": "Vehicle-specific settings"})
       for brand, group in self.schema["vehicle_settings"].items():
@@ -260,6 +261,13 @@ class RemoteSettings:
       return ""
     return value
 
+  def _custom_model_available(self):
+    try:
+      from openpilot.sunnypilot.models.helpers import get_active_bundle
+      return get_active_bundle(self.params) is not None
+    except Exception:
+      return False
+
   def _row(self, setting: Setting, context: Context) -> dict:
     item, key = setting.item, setting.item["key"]
     value = self._value(key, context)
@@ -280,6 +288,8 @@ class RemoteSettings:
       reason = context.reason([{"type": "not_engaged"}])
     if not reason and key == "RecordFront" and context.read("RecordFrontLock") is not False:
       reason = "Driver camera recording is locked on the device."
+    if not reason and key == "CameraOffset" and not self.custom_model():
+      reason = "Camera offset requires a selected custom model for the active hardware."
 
     title = item.get("title", key)
     suffix = item.get("title_param_suffix", {})
@@ -310,6 +320,12 @@ class RemoteSettings:
       unit = unit.get("metric" if context.read("IsMetric") is True else "imperial", "")
     if unit:
       row["unit"] = unit
+    if key == "LaneTurnValue":
+      # Stored and consumed in mph regardless of IsMetric. Native metric steps
+      # can leave hundredth-mph values, so integer-mph validation is incorrect.
+      row.update(min=5, max=20, step=0.01, unit="mph")
+    elif key == "LagdToggleDelay":
+      row["unit"] = "s"
     if "options" in item:
       row["options"] = []
       for option in item["options"]:
@@ -335,6 +351,8 @@ class RemoteSettings:
     if confirmation:
       row["confirmation"] = confirmation
     if item.get("needs_onroad_cycle"):
+      row["requires_restart"] = "Saved settings take effect on the next normal onroad cycle."
+    if key == "NeuralNetworkLateralControl":
       row["requires_restart"] = "Saved settings take effect on the next normal onroad cycle."
     if key == "DisableUpdates":
       row["requires_restart"] = "Reboot the device for this setting to take effect."

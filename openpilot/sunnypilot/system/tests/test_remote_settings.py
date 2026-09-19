@@ -67,7 +67,7 @@ def rows(snapshot):
 class TestRemoteSettings(unittest.TestCase):
   def service(self, items=None, values=None, **kwargs):
     params = FakeParams(values or {"QuietMode": False})
-    service = remote.RemoteSettings(params, schema(items or [toggle("QuietMode")]), lambda: {},
+    service = remote.RemoteSettings(params, schema(items or [toggle("QuietMode")]), dict,
                                     lambda: remote.DeviceState(False, False), **kwargs)
     return service, params
 
@@ -108,11 +108,12 @@ class TestRemoteSettings(unittest.TestCase):
         self.assertEqual(service.set_setting(key, True, False)["status"], "rejected")
     self.assertEqual(params.writes, [])
 
-  def test_models_excluded_nonremote_panel_readonly(self):
+  def test_models_allowlist_and_other_nonremote_panels_readonly(self):
     definition = schema([toggle("QuietMode")], remote_configurable=False)
-    definition["panels"].append({"id": "models", "items": [toggle("LagdToggle")]})
-    service = remote.RemoteSettings(FakeParams({"QuietMode": False}), definition, lambda: {}, lambda: remote.DeviceState(False, False))
-    self.assertNotIn("LagdToggle", rows(service.snapshot()))
+    definition["panels"].append({"id": "models", "items": [toggle("LagdToggle"), toggle("UnreviewedModelSetting")]})
+    service = remote.RemoteSettings(FakeParams({"QuietMode": False, "LagdToggle": True}), definition, dict, lambda: remote.DeviceState(False, False))
+    self.assertTrue(rows(service.snapshot())["LagdToggle"]["editable"])
+    self.assertNotIn("UnreviewedModelSetting", rows(service.snapshot()))
     self.assertFalse(rows(service.snapshot())["QuietMode"]["editable"])
 
   def test_offroad_and_disengagement_rules_are_independent(self):
@@ -220,7 +221,7 @@ class TestRemoteSettings(unittest.TestCase):
     definition = schema([], sections=[{"title": "Tests", "attestation_required": True, "description": "Danger: test only.",
                                        "items": [toggle("TestMode")]}])
     params = FakeParams({"TestMode": False})
-    service = remote.RemoteSettings(params, definition, lambda: {}, lambda: remote.DeviceState(False, False))
+    service = remote.RemoteSettings(params, definition, dict, lambda: remote.DeviceState(False, False))
     self.assertEqual(rows(service.snapshot())["TestMode"]["confirmation"], "Danger: test only.")
     for confirmed in (False, None, 1, "true"):
       self.assertEqual(service.set_setting("TestMode", True, False, confirmed)["status"], "rejected")
@@ -324,9 +325,9 @@ class TestRemoteSettings(unittest.TestCase):
     service = remote.RemoteSettings(params, definition, lambda: {"brand": "toyota"}, lambda: remote.DeviceState(False, False))
     snapshot = service.snapshot()
     self.assertEqual(snapshot["version"], 1)
-    self.assertEqual(len(rows(snapshot)), 82)
+    self.assertEqual(len(rows(snapshot)), 88)
     self.assertLess(len(json.dumps(snapshot, allow_nan=False)), 1024 * 1024)
-    self.assertNotIn("models", {panel["id"] for panel in snapshot["panels"]})
+    self.assertIn("models", {panel["id"] for panel in snapshot["panels"]})
     allowed = {"key", "title", "description", "section", "widget", "type", "value", "visible", "editable", "reason", "options",
                "min", "max", "step", "unit", "confirmation", "requires_restart"}
     for row in rows(snapshot).values():
