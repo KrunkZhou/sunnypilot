@@ -31,14 +31,31 @@ are always last-known.
 
 One JSON Params value, `VehicleTelemetryState`, holds the epoch, latest durable
 snapshot and latest pending upload. It lives in the **isolated persistent Params
-root** `Paths.persist_root()/vehicle_telemetry_params`, with native atomic write
-and fsync semantics. This checkout ships prebuilt native libraries without a
+root** `/data/vehicle_telemetry_params` on comma devices, with native atomic write
+and fsync semantics. AGNOS mounts `/persist` read-only; `/data` is writable by the
+comma user and survives firmware updates. PCs retain their existing writable
+`Paths.persist_root()/vehicle_telemetry_params` location.
+
+If the new on-device store is absent, a readable old
+`/persist/vehicle_telemetry_params/<params-prefix>/VehicleTelemetryState` is
+validated and imported with its readings, pending upload, and incremented epoch
+in one atomic write before the collector exposes new snapshots. Legacy files
+are never modified. A corrupt or unreadable legacy record fails closed; an
+existing new record always takes precedence. Athena can return legacy data as
+last-known before the collector imports it.
+
+This checkout ships prebuilt native libraries without a
 native build configuration. A narrow Params subclass recognizes only this JSON
 key, and strict reads reject corrupt data without logging its contents or
-silently resetting ordering. The key is also registered `PERSISTENT | DONT_LOG`
-for rebuilt libraries. Isolation is essential: older native maps would delete
-an unknown key in default Params on transitions, and log it without DONT_LOG.
+silently resetting ordering. The collector does not depend on the global Params
+registry recognizing this key, and the key does not enable or disable the daemon.
+Isolation is essential: older native maps would delete an unknown key in default
+Params on transitions, and log it without DONT_LOG.
 Ordinary device, road-state and CarParams reads still use default Params.
+
+The manager always starts this optional daemon, but its failure is excluded from
+driving's blocking `processNotRunning` check. Its stopped state remains visible
+in manager diagnostics; essential driving processes retain their existing checks.
 
 Persistence and queuing occur on vehicle selection, first valid reading, every
 30 seconds, and transition offroad. A restart first persists a new epoch before
@@ -59,5 +76,6 @@ pycapnp, numpy and ruff:
 
 ```sh
 PYTHONPATH=.:opendbc_repo:msgq_repo python -m unittest discover -s openpilot/system/vehicle_telemetryd/tests -v
+python -m unittest discover -s openpilot/selfdrive/selfdrived/tests -p test_optional_process_health.py -v
 ruff check openpilot/system/vehicle_telemetryd openpilot/system/athena/athenad.py openpilot/system/manager/process_config.py
 ```
