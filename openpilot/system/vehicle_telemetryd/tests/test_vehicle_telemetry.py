@@ -1,6 +1,5 @@
 import copy
 import json
-import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,9 +7,8 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from openpilot.system.vehicle_telemetryd.state import (
-  DURABLE_KEY, SnapshotStore, get_vehicle_state, runtime_path, telemetry_params, telemetry_storage_paths, valid_snapshot, vehicle_identity, write_runtime,
+  DURABLE_KEY, SnapshotStore, get_vehicle_state, runtime_path, telemetry_params, valid_snapshot, vehicle_identity, write_runtime,
 )
-from openpilot.system.vehicle_telemetryd import state as telemetry_state
 from openpilot.system.vehicle_telemetryd.vehicle_telemetryd import LatestUploader, read_current_car_params
 
 
@@ -231,16 +229,11 @@ class TestUpload(unittest.TestCase):
 
 
 class TestPrebuiltStorage(unittest.TestCase):
-  def setUp(self):
-    self.created_roots = []
-    created_roots = self.created_roots
-
+  def test_isolated_root_and_narrow_key_override_support_prebuilt_maps(self):
     class PrebuiltParams:
       def __init__(self, root):
         self.root = Path(root)
-        created_roots.append(self.root)
-        self.key_root = self.root / os.environ.get("OPENPILOT_PREFIX", "d")
-        self.key_root.mkdir(parents=True, exist_ok=True)
+        self.root.mkdir(parents=True, exist_ok=True)
 
       def check_key(self, key):
         raise KeyError("not in compiled key map")
@@ -249,18 +242,16 @@ class TestPrebuiltStorage(unittest.TestCase):
         raise KeyError("not in compiled key map")
 
       def get_param_path(self, key):
-        return str(self.key_root / key)
+        return str(self.root / key)
 
       def put(self, key, value, block=False):
         self.check_key(key)
         assert self.get_type(key) == 5
         Path(self.get_param_path(key)).write_text(json.dumps(value))
 
-    self.native_stub = SimpleNamespace(Params=PrebuiltParams, ParamKeyType=SimpleNamespace(JSON=5), UnknownKeyName=KeyError,
-                                      ensure_bytes=lambda key: key.encode() if isinstance(key, str) else key)
-
-  def test_isolated_root_and_narrow_key_override_support_prebuilt_maps(self):
-    with tempfile.TemporaryDirectory() as root, patch.dict("sys.modules", {"openpilot.common.params": self.native_stub}):
+    native_stub = SimpleNamespace(Params=PrebuiltParams, ParamKeyType=SimpleNamespace(JSON=5), UnknownKeyName=KeyError,
+                                  ensure_bytes=lambda key: key.encode() if isinstance(key, str) else key)
+    with tempfile.TemporaryDirectory() as root, patch.dict("sys.modules", {"openpilot.common.params": native_stub}):
       params = telemetry_params(str(Path(root) / "private_telemetry"))
       self.assertEqual(params.check_key(DURABLE_KEY), DURABLE_KEY.encode())
       self.assertEqual(params.get_type(DURABLE_KEY), 5)
@@ -277,96 +268,6 @@ class TestPrebuiltStorage(unittest.TestCase):
         with self.assertRaises(ValueError):
           SnapshotStore(params, 1001)
         self.assertEqual(Path(params.get_param_path(DURABLE_KEY)).read_text(), corrupt)
-
-  def test_default_device_path_avoids_read_only_persist_and_pc_path_is_unchanged(self):
-    paths = SimpleNamespace(persist_root=lambda: "/persist/")
-    hardware = SimpleNamespace(PC=False)
-    with patch.dict("sys.modules", {"openpilot.common.hardware": hardware, "openpilot.common.hardware.hw": SimpleNamespace(Paths=paths)}):
-      self.assertEqual(telemetry_storage_paths(), ("/data/vehicle_telemetry_params", "/persist/vehicle_telemetry_params"))
-      hardware.PC = True
-      paths.persist_root = lambda: "/home/test/.comma/persist"
-      self.assertEqual(telemetry_storage_paths(), ("/home/test/.comma/persist/vehicle_telemetry_params", None))
-
-  def test_legacy_readings_and_pending_upload_import_with_new_epoch_without_legacy_writes(self):
-    old_params = FakeParams()
-    old = SnapshotStore(old_params, 1000)
-    old.publish("vin:test", "AUDI_A3_MK3", True, False, {"fuel_liters": (22, 1001, "test")}, 1001)
-    old.queue_latest()
-    previous = old_params.get(DURABLE_KEY)
-    with tempfile.TemporaryDirectory() as root, patch.dict("sys.modules", {"openpilot.common.params": self.native_stub}), \
-         patch.dict("os.environ", {"OPENPILOT_PREFIX": "migration-test"}):
-      primary, legacy = Path(root) / "data", Path(root) / "persist"
-      legacy_file = legacy / "migration-test" / DURABLE_KEY
-      legacy_file.parent.mkdir(parents=True)
-      legacy_file.write_text(json.dumps(previous))
-      original = legacy_file.read_bytes()
-      with patch.object(telemetry_state, "telemetry_storage_paths", return_value=(str(primary), str(legacy))):
-        params = telemetry_params()
-      destination = Path(params.get_param_path(DURABLE_KEY))
-      self.assertEqual(params.get(DURABLE_KEY), previous)
-      self.assertFalse(destination.exists())  # Read-only getter does not import.
-      imported = SnapshotStore(params, 900)  # Clock rollback must not reuse old epoch.
-      self.assertEqual(imported.epoch, previous["collector_epoch"] + 1)
-      persisted = json.loads(destination.read_text())
-      self.assertEqual(persisted["collector_epoch"], imported.epoch)
-      self.assertEqual(persisted["snapshot"], previous["snapshot"])
-      self.assertEqual(persisted["pending"], previous["pending"])
-      self.assertEqual(legacy_file.read_bytes(), original)
-      self.assertEqual(self.created_roots, [primary])
-      legacy_file.write_text("corrupt legacy after successful migration")
-      restarted = SnapshotStore(params, 900)
-      self.assertEqual(restarted.epoch, imported.epoch + 1)
-
-  def test_absent_legacy_starts_fresh_without_creating_legacy_root(self):
-    with tempfile.TemporaryDirectory() as root, patch.dict("sys.modules", {"openpilot.common.params": self.native_stub}):
-      primary, legacy = Path(root) / "data", Path(root) / "persist"
-      with patch.object(telemetry_state, "telemetry_storage_paths", return_value=(str(primary), str(legacy))):
-        params = telemetry_params()
-      self.assertIsNone(params.get(DURABLE_KEY))
-      SnapshotStore(params, 1000)
-      self.assertFalse(legacy.exists())
-      self.assertEqual(self.created_roots, [primary])
-
-  def test_corrupt_or_unreadable_legacy_refuses_to_reset_epoch(self):
-    with tempfile.TemporaryDirectory() as root, patch.dict("sys.modules", {"openpilot.common.params": self.native_stub}):
-      primary, legacy = Path(root) / "data", Path(root) / "persist"
-      legacy_file = legacy / os.environ.get("OPENPILOT_PREFIX", "d") / DURABLE_KEY
-      legacy_file.parent.mkdir(parents=True)
-      with patch.object(telemetry_state, "telemetry_storage_paths", return_value=(str(primary), str(legacy))):
-        params = telemetry_params()
-      destination = Path(params.get_param_path(DURABLE_KEY))
-      for corrupt in ("", "{bad", "null", '{"collector_epoch": 0}', '{"collector_epoch": 123, "snapshot": {}}'):
-        legacy_file.write_text(corrupt)
-        with self.assertRaises(ValueError):
-          SnapshotStore(params, 1000)
-        self.assertFalse(destination.exists())
-        self.assertEqual(legacy_file.read_text(), corrupt)
-      read_bytes = Path.read_bytes
-
-      def read_guard(path):
-        if path == legacy_file:
-          raise PermissionError("legacy unreadable")
-        return read_bytes(path)
-
-      with patch.object(Path, "read_bytes", read_guard), self.assertRaises(PermissionError):
-        SnapshotStore(params, 1000)
-      self.assertFalse(destination.exists())
-
-  def test_failed_migration_write_does_not_expose_new_epoch(self):
-    old = SnapshotStore(FakeParams(), 1000)
-    old_value = old.params.get(DURABLE_KEY)
-    with tempfile.TemporaryDirectory() as root, patch.dict("sys.modules", {"openpilot.common.params": self.native_stub}):
-      primary, legacy = Path(root) / "data", Path(root) / "persist"
-      legacy_file = legacy / os.environ.get("OPENPILOT_PREFIX", "d") / DURABLE_KEY
-      legacy_file.parent.mkdir(parents=True)
-      legacy_file.write_text(json.dumps(old_value))
-      with patch.object(telemetry_state, "telemetry_storage_paths", return_value=(str(primary), str(legacy))):
-        params = telemetry_params()
-      params.put = lambda *args, **kwargs: None
-      with self.assertRaises(RuntimeError):
-        SnapshotStore(params, 1000)
-      self.assertFalse(Path(params.get_param_path(DURABLE_KEY)).exists())
-      self.assertEqual(params.get(DURABLE_KEY), old_value)
 
 
 class TestCollectorLifecycle(unittest.TestCase):

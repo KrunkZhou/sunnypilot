@@ -82,22 +82,12 @@ def valid_durable(stored) -> bool:
              for key in ("snapshot", "pending"))
 
 
-def telemetry_storage_paths() -> tuple[str, str | None]:
-  from openpilot.common.hardware import PC
-  from openpilot.common.hardware.hw import Paths
-
-  legacy_root = str(Path(Paths.persist_root()) / "vehicle_telemetry_params")
-  # AGNOS mounts /persist read-only. /data belongs to the comma user and
-  # survives firmware updates. Keep the existing writable location on PCs.
-  return (legacy_root, None) if PC else ("/data/vehicle_telemetry_params", legacy_root)
-
-
 def telemetry_params(root: str | None = None):
   from openpilot.common.params import ParamKeyType, Params, UnknownKeyName, ensure_bytes
 
-  legacy_root = None
   if root is None:
-    root, legacy_root = telemetry_storage_paths()
+    from openpilot.common.hardware.hw import Paths
+    root = str(Path(Paths.persist_root()) / "vehicle_telemetry_params")
 
   class VehicleTelemetryParams(Params):
     """One private durable key, compatible with older prebuilt libparams maps.
@@ -124,17 +114,7 @@ def telemetry_params(root: str | None = None):
       try:
         raw = Path(self.get_param_path(key)).read_bytes()
       except FileNotFoundError:
-        if legacy_root is None:
-          return None
-        # Read only: constructing legacy Params could try to create files on
-        # read-only /persist. SnapshotStore validates this bundle, then imports
-        # its state and incremented epoch atomically to the writable root before
-        # publishing. Athena can still read the legacy bundle as last-known.
-        legacy_path = Path(legacy_root) / os.environ.get("OPENPILOT_PREFIX", "d") / DURABLE_KEY
-        try:
-          raw = legacy_path.read_bytes()
-        except FileNotFoundError:
-          return None
+        return None
       # Params' normal JSON conversion logs malformed contents and returns
       # None. Neither is safe for private readings and monotonic ordering.
       try:
