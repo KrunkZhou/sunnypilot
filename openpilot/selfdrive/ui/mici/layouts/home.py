@@ -29,6 +29,14 @@ NETWORK_TYPES = {
   NetworkType.ethernet: "Ethernet",
 }
 
+CELLULAR_DATA_COLORS = {
+  NetworkType.cell2G: rl.Color(255, 150, 40, 255),
+  NetworkType.cell3G: rl.Color(255, 215, 60, 255),
+  NetworkType.cell4G: rl.Color(60, 170, 255, 255),
+  NetworkType.cell5G: rl.Color(190, 100, 255, 255),
+}
+ATHENA_PING_TIMEOUT_NS = 80_000_000_000  # Same heartbeat window as the CONNECT sidebar status.
+
 
 class AlertsPill(Widget):
   ICON_OFFSET = 12
@@ -75,11 +83,14 @@ class AlertsPill(Widget):
 
 
 class NetworkIcon(Widget):
+  ICON_WIDTH = 54
+
   def __init__(self):
     super().__init__()
-    self.set_rect(rl.Rectangle(0, 0, 54, 44))  # max size of all icons
+    self.set_rect(rl.Rectangle(0, 0, self.ICON_WIDTH + 12, 44))  # signal icon plus Athena indicator
     self._net_type = NetworkType.none
     self._net_strength = 0
+    self._athena_connected = False
 
     self._wifi_slash_txt = gui_app.texture("icons_mici/settings/network/wifi_strength_slash.png", 50, 44)
     self._wifi_none_txt = gui_app.texture("icons_mici/settings/network/wifi_strength_none.png", 50, 37)
@@ -94,14 +105,18 @@ class NetworkIcon(Widget):
     self._cell_full_txt = gui_app.texture("icons_mici/settings/network/cell_strength_full.png", 54, 36)
 
   def _update_state(self):
-    device_state = ui_state.sm['deviceState']
-    self._net_type = device_state.networkType
+    sm = ui_state.sm
+    device_state = sm['deviceState']
+    self._net_type = device_state.networkType.raw
     strength = device_state.networkStrength
     self._net_strength = max(0, min(5, strength.raw + 1)) if strength.raw > 0 else 0
+    last_ping = device_state.lastAthenaPingTime
+    self._athena_connected = (sm.alive['deviceState'] and sm.valid['deviceState'] and last_ping > 0 and
+                             0 <= time.monotonic_ns() - last_ping < ATHENA_PING_TIMEOUT_NS)
 
   def _render(self, _):
     # Cellular networkType requires an established modem data link, not just signal.
-    cellular_data_connected = self._net_type in (NetworkType.cell2G, NetworkType.cell3G, NetworkType.cell4G, NetworkType.cell5G)
+    cellular_data_color = CELLULAR_DATA_COLORS.get(self._net_type)
     if self._net_type == NetworkType.wifi:
       # There is no 1
       draw_net_txt = {0: self._wifi_none_txt,
@@ -109,7 +124,7 @@ class NetworkIcon(Widget):
                       3: self._wifi_medium_txt,
                       4: self._wifi_full_txt,
                       5: self._wifi_full_txt}.get(self._net_strength, self._wifi_low_txt)
-    elif cellular_data_connected:
+    elif cellular_data_color is not None:
       draw_net_txt = {0: self._cell_none_txt,
                       2: self._cell_low_txt,
                       3: self._cell_medium_txt,
@@ -118,7 +133,7 @@ class NetworkIcon(Widget):
     else:
       draw_net_txt = self._wifi_slash_txt
 
-    draw_x = self._rect.x + (self._rect.width - draw_net_txt.width) / 2
+    draw_x = self._rect.x + (self.ICON_WIDTH - draw_net_txt.width) / 2
     draw_y = self._rect.y + (self._rect.height - draw_net_txt.height) / 2
 
     if draw_net_txt == self._wifi_slash_txt:
@@ -126,8 +141,10 @@ class NetworkIcon(Widget):
       draw_y -= (self._wifi_slash_txt.height - self._wifi_none_txt.height) / 2
 
     rl.draw_texture_ex(draw_net_txt, rl.Vector2(draw_x, draw_y), 0.0, 1.0, rl.Color(255, 255, 255, int(255 * 0.9)))
-    if cellular_data_connected:
-      rl.draw_circle_v(rl.Vector2(self._rect.x + 8, self._rect.y + 9), 4, rl.Color(0, 200, 100, 255))
+    if cellular_data_color is not None:
+      rl.draw_circle_v(rl.Vector2(self._rect.x + 8, self._rect.y + 9), 4, cellular_data_color)
+    athena_color = rl.Color(0, 200, 100, 255) if self._athena_connected else rl.Color(100, 100, 100, 255)
+    rl.draw_circle_v(rl.Vector2(self._rect.x + self.ICON_WIDTH + 8, self._rect.y + 9), 4, athena_color)
 
 
 class MiciHomeLayout(Widget):
