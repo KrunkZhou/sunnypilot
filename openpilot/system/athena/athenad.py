@@ -377,6 +377,12 @@ def getMessage(service: str, timeout: int = 1000) -> dict:
 
 
 @dispatcher.add_method
+def getVehicleState() -> dict:
+  from openpilot.system.vehicle_telemetry.collector import get_vehicle_state
+  return get_vehicle_state()
+
+
+@dispatcher.add_method
 def getDeviceSettings() -> dict:
   from openpilot.sunnypilot.system.remote_settings import get_device_settings
   return get_device_settings()
@@ -1190,6 +1196,13 @@ def backoff(retries: int) -> int:
 
 
 def main(exit_event: threading.Event | None = None):
+  telemetry_stop = exit_event if exit_event is not None else threading.Event()
+  try:
+    from openpilot.system.vehicle_telemetry.collector import start_workers
+    start_workers(telemetry_stop)
+  except Exception:
+    cloudlog.exception("failed to start optional vehicle telemetry workers")
+
   try:
     set_core_affinity([0, 1, 2, 3])
   except Exception:
@@ -1218,6 +1231,9 @@ def main(exit_event: threading.Event | None = None):
                      duration=time.monotonic() - conn_start)
       conn_start = None
 
+      from openpilot.system.vehicle_telemetry.uploader import connection_recovered
+      connection_recovered()
+
       conn_retries = 0
       cur_upload_items.clear()
 
@@ -1236,6 +1252,8 @@ def main(exit_event: threading.Event | None = None):
       params.remove("LastAthenaPingTime")
 
     time.sleep(backoff(conn_retries))
+
+  telemetry_stop.set()
 
 
 if __name__ == "__main__":
