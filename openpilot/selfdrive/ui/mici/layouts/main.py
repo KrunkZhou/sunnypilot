@@ -10,12 +10,17 @@ from openpilot.selfdrive.ui.body.layouts.onroad import BodyLayout
 from openpilot.system.ui.widgets import Widget
 from openpilot.system.ui.widgets.scroller import Scroller
 from openpilot.system.ui.lib.application import gui_app
+from openpilot.selfdrive.ui.sunnypilot.ui_lock import UiLock, MiciUiLockHomeMixin
 
 if gui_app.sunnypilot_ui():
   from openpilot.selfdrive.ui.sunnypilot.mici.layouts.settings import SettingsLayoutSP as SettingsLayout
   from openpilot.selfdrive.ui.sunnypilot.mici.layouts.home import MiciHomeLayoutSP as MiciHomeLayout
 
 ONROAD_DELAY = 2.5  # seconds
+
+
+class LockableHomeLayout(MiciUiLockHomeMixin, MiciHomeLayout):
+  pass
 
 
 class MiciMainLayout(Scroller):
@@ -30,7 +35,9 @@ class MiciMainLayout(Scroller):
     self._setup = False
 
     # Initialize widgets
-    self._home_layout = MiciHomeLayout()
+    self._ui_lock = UiLock()
+    self._home_layout = LockableHomeLayout()
+    self._home_layout.ui_lock = self._ui_lock
     self._alerts_layout = MiciOffroadAlerts()
     self._settings_layout = SettingsLayout()
     self._car_onroad_layout = AugmentedRoadView(bookmark_callback=self._on_bookmark_clicked)
@@ -64,6 +71,8 @@ class MiciMainLayout(Scroller):
     if not self._onboarding_window.completed:
       gui_app.push_widget(self._onboarding_window)
 
+    gui_app.add_nav_stack_tick(self._handle_ui_lock)
+
     # initialize correct onroad layout
     self._on_body_changed()
 
@@ -74,7 +83,7 @@ class MiciMainLayout(Scroller):
 
   def _setup_callbacks(self):
     self._home_layout.set_callbacks(
-      on_settings=lambda: gui_app.push_widget(self._settings_layout),
+      on_settings=self._open_settings,
       on_alerts=lambda: self._scroll_to(self._alerts_layout),
       alert_count_callback=self._alerts_layout.active_alerts,
       max_severity_callback=self._alerts_layout.max_severity,
@@ -84,6 +93,25 @@ class MiciMainLayout(Scroller):
 
     device.add_interactive_timeout_callback(self._on_interactive_timeout)
     ui_state.add_on_body_changed_callbacks(self._on_body_changed)
+
+  def _open_settings(self):
+    if self._ui_lock.locked:
+      self._ui_lock.request_pin()
+    else:
+      gui_app.push_widget(self._settings_layout)
+
+  def _handle_ui_lock(self):
+    self._ui_lock.tick()
+    if gui_app.widget_in_stack(self._onboarding_window):
+      return
+    if self._ui_lock.locked and gui_app.widget_in_stack(self._settings_layout):
+      gui_app.pop_widgets_to(self, instant=True)
+      self._scroll_to(self._onroad_layout if ui_state.started else self._home_layout)
+    alert = None
+    if self._ui_lock.pin_open and ui_state.started and not ui_state.is_body:
+      alert = self._car_onroad_layout._alert_renderer.get_alert(ui_state.sm)
+    if self._ui_lock.preempt_for_driving(ui_state.started, ui_state.sm['carState'].standstill, alert):
+      self._scroll_to(self._onroad_layout)
 
   def _scroll_to(self, layout: Widget):
     layout_x = int(layout.rect.x)
@@ -135,6 +163,8 @@ class MiciMainLayout(Scroller):
     # Don't pop if onboarding
     if gui_app.widget_in_stack(self._onboarding_window):
       return
+
+    self._ui_lock.dismiss_pin()
 
     if ui_state.started:
       # Don't pop if at standstill

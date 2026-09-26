@@ -224,7 +224,8 @@ def jsonrpc_handler(end_event: threading.Event, localProxyHandler = None) -> Non
       data = recv_queue.get(timeout=1)
       msg = loads(data)
       if is_call(msg):
-        if msg.get("method") in ("getDeviceSettings", "setDeviceSetting", "getDeviceModels", "manageDeviceModels", "getDeviceMaps", "manageDeviceMaps"):
+        if msg.get("method") in ("getDeviceSettings", "setDeviceSetting", "getDeviceModels", "manageDeviceModels", "getDeviceMaps", "manageDeviceMaps",
+                                 "getDeviceUiLock", "applyDeviceUiLock"):
           cloudlog.event("athena.jsonrpc_handler.call_method", method=msg["method"])
         else:
           cloudlog.event("athena.jsonrpc_handler.call_method", data=data)
@@ -386,6 +387,22 @@ def getVehicleState() -> dict:
 def getDeviceSettings() -> dict:
   from openpilot.sunnypilot.system.remote_settings import get_device_settings
   return get_device_settings()
+
+
+def getDeviceUiLock() -> dict:
+  from openpilot.sunnypilot.system.ui_lock import get_device_ui_lock
+  return get_device_ui_lock()
+
+
+def applyDeviceUiLock(sequence: str, command_id: str, action: str, message: str = "", salt: str = "", verifier: str = "") -> dict:
+  from openpilot.sunnypilot.system.ui_lock import apply_device_ui_lock
+  return apply_device_ui_lock(sequence, command_id, action, message, salt, verifier)
+
+
+def register_ui_lock_methods() -> None:
+  # Sunnylink imports this module; register these commands only in primary Athena.
+  dispatcher.add_method(getDeviceUiLock)
+  dispatcher.add_method(applyDeviceUiLock)
 
 
 @dispatcher.add_method
@@ -1195,6 +1212,7 @@ def backoff(retries: int) -> int:
 
 
 def main(exit_event: threading.Event | None = None):
+  register_ui_lock_methods()
   telemetry_stop = exit_event if exit_event is not None else threading.Event()
   try:
     from openpilot.system.vehicle_telemetry.collector import start_workers
