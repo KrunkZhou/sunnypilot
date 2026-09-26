@@ -2,6 +2,7 @@ import pyray as rl
 import time
 
 from openpilot.common.api import Api
+from openpilot.common.api.comma_connect import CONNECT_HOST, CONNECT_DOMAIN
 from openpilot.common.qrcode import make_texture
 from openpilot.common.swaglog import cloudlog
 from openpilot.common.params import Params
@@ -34,7 +35,7 @@ class PairingDialog(Widget):
     except Exception:
       cloudlog.exception("Failed to get pairing token")
       token = ""
-    return f"https://rtz.krunk.cn/?pair={token}"
+    return f"{CONNECT_HOST}/?pair={token}"
 
   def _generate_qr_code(self) -> None:
     try:
@@ -98,9 +99,9 @@ class PairingDialog(Widget):
 
   def _render_instructions(self, rect: rl.Rectangle) -> None:
     instructions = [
-      tr("Go to https://rtz.krunk.cn on your phone"),
+      tr("Go to {} on your phone").format(CONNECT_HOST),
       tr("Click \"add new device\" and scan the QR code on the right"),
-      tr("Bookmark rtz.krunk.cn to your home screen to use it like an app"),
+      tr("Bookmark {} to your home screen to use it like an app").format(CONNECT_DOMAIN),
     ]
 
     font = gui_app.font(FontWeight.BOLD)
