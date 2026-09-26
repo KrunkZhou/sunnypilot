@@ -9,7 +9,7 @@ import time
 import uuid
 from pathlib import Path
 from collections import defaultdict
-from datetime import datetime, UTC, date
+from datetime import datetime, date
 from typing import NoReturn
 
 from openpilot.common.params import Params
@@ -19,6 +19,7 @@ from openpilot.common.swaglog import cloudlog
 from openpilot.common.hardware import HARDWARE
 from openpilot.common.utils import atomic_write
 from openpilot.common.version import get_build_metadata
+from openpilot.common.diagnostic_timing import DiagnosticTiming, capture_timing
 from openpilot.system.loggerd.config import STATS_DIR_FILE_LIMIT, STATS_SOCKET, STATS_FLUSH_TIME_S
 
 
@@ -113,7 +114,7 @@ class StatLogSP(StatLog):
 
 def main() -> NoReturn:
   dongle_id = Params().get("DongleId")
-  def get_influxdb_line(measurement: str, value: float | dict[str, float],  timestamp: datetime, tags: dict) -> str:
+  def get_influxdb_line(measurement: str, value: float | dict[str, float], timestamp: DiagnosticTiming, tags: dict) -> str:
     res = f"{measurement}"
     for k, v in tags.items():
       res += f",{k}={str(v)}"
@@ -123,9 +124,11 @@ def main() -> NoReturn:
       value = {'value': value}
 
     for k, v in value.items():
+      if k in ('rtzs_boot_id', 'rtzs_monotonic_ns'):
+        continue
       res += f"{k}={v},"
 
-    res += f"dongle_id=\"{dongle_id}\" {int(timestamp.timestamp() * 1e9)}\n"
+    res += f'dongle_id="{dongle_id}",{timestamp.stats_fields()} {timestamp.wall_time_ns}\n'
     return res
 
   # open statistics socket
@@ -186,7 +189,7 @@ def main() -> NoReturn:
       # flush when started state changes or after FLUSH_TIME_S
       if (time.monotonic() > last_flush_time + STATS_FLUSH_TIME_S) or (sm['deviceState'].started != started_prev):
         result = ""
-        current_time = datetime.now(UTC)
+        current_time = capture_timing()
         tags['started'] = sm['deviceState'].started
 
         for key, value in gauges.items():
