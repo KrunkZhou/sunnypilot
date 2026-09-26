@@ -10,6 +10,7 @@ from openpilot.selfdrive.ui.onroad.augmented_road_view import AugmentedRoadView
 from openpilot.selfdrive.ui.ui_state import device, ui_state
 from openpilot.selfdrive.ui.layouts.onboarding import OnboardingWindow
 from openpilot.selfdrive.ui.body.layouts.onroad import BodyLayout
+from openpilot.selfdrive.ui.sunnypilot.ui_lock import UiLock, BigUiLockHomeMixin
 
 if gui_app.sunnypilot_ui():
   from openpilot.selfdrive.ui.sunnypilot.layouts.settings.settings import SettingsLayoutSP as SettingsLayout
@@ -20,6 +21,10 @@ class MainState(IntEnum):
   HOME = 0
   SETTINGS = 1
   ONROAD = 2
+
+
+class LockableHomeLayout(BigUiLockHomeMixin, HomeLayout):
+  pass
 
 
 class MainLayout(Widget):
@@ -33,7 +38,9 @@ class MainLayout(Widget):
     self._prev_onroad = False
 
     # Initialize layouts
-    self._home_layout = HomeLayout()
+    self._ui_lock = UiLock()
+    self._home_layout = LockableHomeLayout()
+    self._home_layout.ui_lock = self._ui_lock
     self._home_body_layout = BodyLayout()
     self._layouts: dict[MainState, Widget] = {
       MainState.HOME: self._home_layout,
@@ -53,6 +60,8 @@ class MainLayout(Widget):
     self._onboarding_window = OnboardingWindow()
     if not self._onboarding_window.completed:
       gui_app.push_widget(self._onboarding_window)
+
+    gui_app.add_nav_stack_tick(self._handle_ui_lock)
 
   def _render(self, _):
     self._handle_onroad_transition()
@@ -85,6 +94,7 @@ class MainLayout(Widget):
       self._set_mode_for_state()
 
   def _set_mode_for_state(self):
+    self._ui_lock.dismiss_pin()
     # Don't go onroad if body, home is onroad
     if ui_state.is_body:
       self._set_current_layout(MainState.HOME)
@@ -107,6 +117,9 @@ class MainLayout(Widget):
       self._layouts[self._current_mode].show_event()
 
   def open_settings(self, panel_type: PanelType):
+    if self._ui_lock.locked:
+      self._ui_lock.request_pin()
+      return
     self._layouts[MainState.SETTINGS].set_current_panel(panel_type)
     self._set_current_layout(MainState.SETTINGS)
     self._sidebar.set_visible(False)
@@ -126,7 +139,23 @@ class MainLayout(Widget):
     self._layouts[MainState.HOME] = self._home_body_layout if ui_state.is_body else self._home_layout
     self._set_mode_for_state()
 
+  def _handle_ui_lock(self):
+    self._ui_lock.tick()
+    if gui_app.widget_in_stack(self._onboarding_window):
+      return
+    if self._ui_lock.locked and self._current_mode == MainState.SETTINGS:
+      gui_app.pop_widgets_to(self, instant=True)
+      self._set_mode_for_state()
+    alert = None
+    if self._ui_lock.pin_open and ui_state.started and not ui_state.is_body:
+      alert = self._layouts[MainState.ONROAD].alert_renderer.get_alert(ui_state.sm)
+    if self._ui_lock.preempt_for_driving(ui_state.started, ui_state.sm['carState'].standstill, alert):
+      self._set_mode_for_state()
+
   def _render_main_content(self):
+    if self._ui_lock.locked and self._current_mode == MainState.HOME and not ui_state.is_body:
+      self._home_layout.render(self._rect)
+      return
     # Render sidebar
     if self._sidebar.is_visible:
       self._sidebar.render(self._sidebar_rect)
