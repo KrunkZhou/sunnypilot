@@ -10,6 +10,7 @@ import time
 import uuid
 from pathlib import Path
 from collections import defaultdict
+from datetime import datetime, UTC
 
 from openpilot.common.params import Params
 from openpilot.cereal.messaging import SubMaster
@@ -18,7 +19,6 @@ from openpilot.common.swaglog import cloudlog
 from openpilot.common.hardware import HARDWARE
 from openpilot.common.utils import atomic_write
 from openpilot.common.version import get_build_metadata
-from openpilot.common.diagnostic_timing import DiagnosticTiming, capture_timing
 from openpilot.system.loggerd.config import STATS_DIR_FILE_LIMIT, STATS_SOCKET, STATS_FLUSH_TIME_S
 from openpilot.sunnypilot.system.statsd import METRIC_TYPE, StatLogSP
 from openpilot.common.realtime import Ratekeeper
@@ -104,7 +104,7 @@ def stats_main(end_event):
   comma_dongle_id = Params().get("DongleId")
   sunnylink_dongle_id = Params().get("SunnylinkDongleId")
 
-  def get_influxdb_line(measurement: str, value: float | dict[str, float], timestamp: DiagnosticTiming, tags: dict) -> str:
+  def get_influxdb_line(measurement: str, value: float | dict[str, float], timestamp: datetime, tags: dict) -> str:
     res = f"{measurement}"
     for k, v in tags.items():
       res += f",{k}={str(v)}"
@@ -114,15 +114,12 @@ def stats_main(end_event):
       value = {'value': value}
 
     for k, v in value.items():
-      if k in ('rtzs_boot_id', 'rtzs_monotonic_ns'):
-        continue
       res += f"{k}={str(v)},"
 
-    res += (f'sunnylink_dongle_id="{sunnylink_dongle_id}",comma_dongle_id="{comma_dongle_id}",' +
-            f'{timestamp.stats_fields()} {timestamp.wall_time_ns}\n')
+    res += f"sunnylink_dongle_id=\"{sunnylink_dongle_id}\",comma_dongle_id=\"{comma_dongle_id}\" {int(timestamp.timestamp() * 1e9)}\n"
     return res
 
-  def get_influxdb_line_raw(measurement: str, value: dict, timestamp: DiagnosticTiming, tags: dict) -> str:
+  def get_influxdb_line_raw(measurement: str, value: dict, timestamp: datetime, tags: dict) -> str:
     res = f"{measurement}"
     try:
       custom_tags = ""
@@ -132,8 +129,6 @@ def stats_main(end_event):
 
       fields = ""
       for k, v in value.items():
-        if k in ('rtzs_boot_id', 'rtzs_monotonic_ns'):
-          continue
         # Skip complex types - only keep simple scalar values
         if isinstance(v, (dict, list, bytes, bytearray)):
           continue
@@ -145,8 +140,7 @@ def stats_main(end_event):
       cloudlog.error(f"Unable to get influxdb line for: {value}")
       res += f",invalid=1 reason={e},"
 
-    res += (f'sunnylink_dongle_id="{sunnylink_dongle_id}",comma_dongle_id="{comma_dongle_id}",' +
-            f'{timestamp.stats_fields()} {timestamp.wall_time_ns}\n')
+    res += f"sunnylink_dongle_id=\"{sunnylink_dongle_id}\",comma_dongle_id=\"{comma_dongle_id}\" {int(timestamp.timestamp() * 1e9)}\n"
     return res
 
   # open statistics socket
@@ -213,7 +207,7 @@ def stats_main(end_event):
       # flush when started state changes or after FLUSH_TIME_S
       if (time.monotonic() > last_flush_time + STATS_FLUSH_TIME_S) or (sm['deviceState'].started != started_prev):
         result = ""
-        current_time = capture_timing()
+        current_time = datetime.now(UTC)
         tags['started'] = sm['deviceState'].started
 
         for key, value in raws.items():
