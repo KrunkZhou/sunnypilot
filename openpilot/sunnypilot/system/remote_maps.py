@@ -145,6 +145,9 @@ class RemoteMaps:
     actions = {}
     for action in sorted(ACTIONS):
       disabled = action_reason
+      if action != "delete" and not disabled and live.network_metered is not False:
+        disabled = ("Map downloads are unavailable on a metered connection. Connect to an unmetered network."
+                    if live.network_metered is True else "Map downloads require fresh device state confirming an unmetered connection.")
       if action == "check_updates" and not disabled and not _valid_region(selection):
         disabled = "Select a country and, for the United States, a state first."
       actions[action] = {"allowed": not disabled, **({"reason": disabled} if disabled else {})}

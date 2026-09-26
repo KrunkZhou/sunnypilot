@@ -73,6 +73,7 @@ def _supported_rule(rule: Any) -> bool:
 class DeviceState:
   started: bool | None = None
   engaged: bool | None = None
+  network_metered: bool | None = None
 
 
 def _message_value(message, service: str, now: float):
@@ -97,8 +98,10 @@ def _live_state() -> DeviceState:
     device = _message_value(message, "deviceState", time.monotonic())
     if device is None:
       return DeviceState()
+    metered = getattr(device, "networkMetered", None)
+    metered = metered if type(metered) is bool else None
     if not device.started:
-      return DeviceState(False, False)
+      return DeviceState(False, False, metered)
     controls = [messaging.recv_one_or_none(sockets[name]) for name in services[1:]]
     now = time.monotonic()
     # A deviceState sampled before a slow receive must still be fresh.
@@ -107,8 +110,8 @@ def _live_state() -> DeviceState:
     standard = _message_value(controls[0], "selfdriveState", now)
     sunny = _message_value(controls[1], "selfdriveStateSP", now)
     if (standard is not None and standard.enabled) or (sunny is not None and sunny.mads.enabled):
-      return DeviceState(True, True)
-    return DeviceState(True, False if standard is not None and sunny is not None else None)
+      return DeviceState(True, True, metered)
+    return DeviceState(True, False if standard is not None and sunny is not None else None, metered)
   except Exception:
     return DeviceState()
   finally:

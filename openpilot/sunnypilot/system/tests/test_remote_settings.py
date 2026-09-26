@@ -409,6 +409,17 @@ class TestPortableAthenaRegistration(unittest.TestCase):
         if not started:
           messaging.recv_one_or_none.assert_not_called()
 
+  def test_live_sampler_only_reports_valid_fresh_boolean_metering(self):
+    for metered, valid, age, expected in ((False, True, 0, False), (True, True, 0, True),
+                                         (None, True, 0, None), (0, True, 0, None), ("false", True, 0, None),
+                                         (False, False, 0, None), (False, True, 6, None)):
+      with self.subTest(metered=metered, valid=valid, age=age):
+        event = SimpleNamespace(valid=valid, logMonoTime=int((100 - age) * 1e9),
+                                deviceState=SimpleNamespace(started=False, networkMetered=metered))
+        messaging = SimpleNamespace(sub_sock=lambda service, **kwargs: service, recv_one=lambda service, event=event: event)
+        with patch.dict(sys.modules, {"openpilot.cereal": SimpleNamespace(messaging=messaging)}), patch.object(remote.time, "monotonic", return_value=100):
+          self.assertIs(remote._live_state().network_metered, expected)
+
 
 if __name__ == "__main__":
   unittest.main()

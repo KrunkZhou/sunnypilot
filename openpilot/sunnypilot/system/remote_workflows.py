@@ -41,7 +41,7 @@ class RequestState:
 
 
 class BackgroundSizeCache:
-  """Bounded metadata scans; RPC callers only read the last cached value."""
+  """Metadata scans run in bounded batches; RPC callers read the cached total."""
   def __init__(self, path: Path):
     self.path = Path(path)
     self.value: int | None = None
@@ -59,17 +59,25 @@ class BackgroundSizeCache:
   def _scan(self):
     value = 0
     visited = 0
-    deadline = time.monotonic() + 1.0
+    deadline = time.monotonic() + 0.05
+
+    def yield_if_needed():
+      nonlocal visited, deadline
+      visited += 1
+      if visited >= 1_000 or time.monotonic() >= deadline:
+        # Large or cold map trees may take many batches. Keep our position and
+        # give other work time to run instead of discarding an unfinished scan.
+        time.sleep(0.05)
+        visited = 0
+        deadline = time.monotonic() + 0.05
+
     try:
       pending = [self.path] if self.path.exists() else []
       while pending:
-        if time.monotonic() >= deadline:
-          raise TimeoutError("Cache size scan exceeded its time limit")
+        yield_if_needed()
         with os.scandir(pending.pop()) as entries:
           for entry in entries:
-            visited += 1
-            if visited > 100_000 or time.monotonic() >= deadline:
-              raise TimeoutError("Cache size scan exceeded its limit")
+            yield_if_needed()
             if entry.is_dir(follow_symlinks=False):
               pending.append(Path(entry.path))
             elif entry.is_file(follow_symlinks=False):

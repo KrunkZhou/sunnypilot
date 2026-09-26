@@ -4,7 +4,9 @@ import json
 import tempfile
 import threading
 import unittest
+from contextlib import nullcontext
 from datetime import datetime
+from itertools import count, repeat
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -42,7 +44,7 @@ class TestRemoteMaps(unittest.TestCase):
     self.store = RequestState()
     self.params = Params({"MapdVersion": "v1.12.0", "OsmLocationName": "CA", "IsOffroad": True})
     self.mem = Params()
-    self.live = DeviceState(False, False)
+    self.live = DeviceState(False, False, network_metered=False)
     self.service = maps.RemoteMaps(self.params, self.mem, self.store, state=lambda: self.live)
 
   def command(self, action="download", **kwargs):
@@ -196,6 +198,50 @@ class TestRemoteMaps(unittest.TestCase):
                                         expected_selection={"country": "CA", "state": None},
                                         expected_operation_id=None)["status"], "rejected")
     self.assertEqual(self.params.writes, [])
+
+  def test_metered_or_unknown_connection_blocks_download_and_updates_without_writes(self):
+    for metered in (True, None, 0, "false"):
+      with self.subTest(metered=metered):
+        self.live = DeviceState(False, False, network_metered=metered)
+        snapshot = self.service.snapshot()
+        for action in ("download", "check_updates"):
+          self.assertFalse(snapshot["actions"][action]["allowed"])
+          self.assertIn("unmetered", snapshot["actions"][action]["reason"])
+          result = self.command(action)
+          self.assertEqual(result["status"], "rejected")
+          self.assertEqual(result["message"], snapshot["actions"][action]["reason"])
+        self.assertTrue(snapshot["actions"]["delete"]["allowed"])
+        self.assertIsNone(snapshot["operation"])
+        self.assertEqual(self.params.writes, [])
+        self.assertEqual(self.mem.writes, [])
+
+  def test_delete_is_allowed_with_metered_or_unknown_connection(self):
+    for metered in (True, None):
+      with self.subTest(metered=metered):
+        self.live = DeviceState(False, False, network_metered=metered)
+        self.assertEqual(self.command("delete")["status"], "accepted")
+        self.assertTrue(self.params.values["Mapd_ClearCache"])
+        self.params.values.pop("Mapd_ClearCache")
+
+  def test_download_admission_rechecks_connection_and_recovers_without_queueing(self):
+    for action in ("download", "check_updates"):
+      with self.subTest(action=action):
+        self.setUp()
+        snapshot = self.service.snapshot()
+        self.assertTrue(snapshot["actions"][action]["allowed"])
+        args = {"expected_selection": snapshot["selection"], "expected_operation_id": None}
+        if action == "download":
+          args.update(country="US", state="CA", country_title="United States", state_title="California")
+        self.live = DeviceState(False, False, network_metered=True)
+        self.assertEqual(self.service.manage(action, **args)["status"], "rejected")
+        self.assertEqual(self.params.writes, [])
+        self.assertEqual(self.mem.writes, [])
+        self.live = DeviceState(False, False, network_metered=False)
+        recovered = self.service.snapshot()
+        self.assertTrue(recovered["actions"][action]["allowed"])
+        self.assertIsNone(recovered["operation"])
+        self.assertEqual(self.params.writes, [])
+        self.assertEqual(self.service.manage(action, **args)["status"], "accepted")
 
   def test_native_flags_and_even_malformed_markers_block_remote(self):
     for target, key, value in ((self.params, "OsmDbUpdatesCheck", True), (self.params, "Mapd_ClearCache", True),
@@ -375,17 +421,94 @@ class TestRemoteMaps(unittest.TestCase):
 
 
 class TestMapSizeCache(unittest.TestCase):
-  def test_size_scan_is_bounded_and_skips_symlinks(self):
+  def test_size_scan_counts_nested_files_and_skips_symlinks(self):
     with tempfile.TemporaryDirectory() as root:
       path = Path(root)
       (path / "one").write_bytes(b"abc")
       (path / "link").symlink_to(path / "one")
+      (path / "nested").mkdir()
+      (path / "nested" / "two").write_bytes(b"defg")
+      (path / "directory-link").symlink_to(path / "nested", target_is_directory=True)
       cache = workflows.BackgroundSizeCache(path)
-      with patch.object(workflows.time, "monotonic", side_effect=[0, 2, 3]):
+      cache._scan()
+      self.assertEqual(cache.value, 7)
+
+  def test_size_scan_completes_more_than_one_hundred_thousand_entries(self):
+    entry = SimpleNamespace(is_dir=lambda **kwargs: False, is_file=lambda **kwargs: True,
+                            stat=lambda **kwargs: SimpleNamespace(st_size=4096))
+    cache = workflows.BackgroundSizeCache(Path("unused"))
+    with patch.object(Path, "exists", return_value=True), \
+         patch.object(workflows.os, "scandir", return_value=nullcontext(repeat(entry, 100_001))), \
+         patch.object(workflows.time, "monotonic", return_value=0), \
+         patch.object(workflows.time, "sleep") as pause:
+      cache._scan()
+    self.assertEqual(cache.value, 4096 * 100_001)
+    self.assertEqual(pause.call_count, 100)
+
+  def test_slow_scan_resumes_after_time_budget_without_publishing_partial_total(self):
+    with tempfile.TemporaryDirectory() as root:
+      path = Path(root)
+      (path / "one").write_bytes(b"abc")
+      (path / "two").write_bytes(b"defg")
+      cache = workflows.BackgroundSizeCache(path)
+      cache.value = 99
+      clock = count()
+      with patch.object(workflows.time, "monotonic", side_effect=lambda: next(clock) * 2), \
+           patch.object(workflows.time, "sleep", side_effect=lambda _: self.assertEqual(cache.value, 99)) as pause:
+        cache._scan()
+      self.assertGreater(pause.call_count, 1)
+      self.assertEqual(cache.value, 7)
+
+  def test_failed_scan_does_not_publish_partial_total_and_can_retry(self):
+    with tempfile.TemporaryDirectory() as root:
+      path = Path(root)
+      (path / "one").write_bytes(b"abc")
+      cache = workflows.BackgroundSizeCache(path)
+      first = SimpleNamespace(is_dir=lambda **kwargs: False, is_file=lambda **kwargs: True,
+                              stat=lambda **kwargs: SimpleNamespace(st_size=4096))
+      failed = SimpleNamespace(is_dir=Mock(side_effect=OSError("unreadable entry")))
+      cache.value = 99
+      cache._running = True
+      with patch.object(workflows.os, "scandir", return_value=nullcontext(iter([first, failed]))):
         cache._scan()
       self.assertIsNone(cache.value)
+      self.assertFalse(cache._running)
       cache._scan()
       self.assertEqual(cache.value, 3)
+
+  def test_get_does_not_wait_for_scan_or_start_duplicate_workers(self):
+    with tempfile.TemporaryDirectory() as root:
+      cache = workflows.BackgroundSizeCache(Path(root))
+      entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+      original_scan = cache._scan
+
+      def scan():
+        entered.set()
+        release.wait(2)
+        try:
+          original_scan()
+        finally:
+          finished.set()
+
+      with patch.object(cache, "_scan", side_effect=scan) as worker:
+        try:
+          self.assertIsNone(cache.get())
+          self.assertTrue(entered.wait(1))
+          self.assertFalse(finished.is_set())
+          self.assertIsNone(cache.get())
+          self.assertIsNone(cache.get())
+          self.assertEqual(worker.call_count, 1)
+        finally:
+          release.set()
+          self.assertTrue(finished.wait(2))
+        self.assertEqual(cache.get(), 0)
+        self.assertEqual(worker.call_count, 1)
+
+  def test_missing_cache_reports_zero(self):
+    with tempfile.TemporaryDirectory() as root:
+      cache = workflows.BackgroundSizeCache(Path(root) / "missing")
+      cache._scan()
+      self.assertEqual(cache.value, 0)
 
 
 if __name__ == "__main__":
