@@ -13,7 +13,26 @@ from threading import local
 from collections import OrderedDict
 from contextlib import contextmanager
 
+from openpilot.common.diagnostic_timing import capture_timing
+
 LOG_TIMESTAMPS = "LOG_TIMESTAMPS" in os.environ
+
+
+def install_diagnostic_record_factory():
+  # Standard-library loggers can also reach swaglog through ForwardingHandler.
+  # Capture their timing at creation, before a queue or handler delays delivery.
+  previous_factory = logging.getLogRecordFactory()
+  if getattr(previous_factory, '_rtzs_diagnostic_timing', False):
+    return
+
+  def factory(*args, **kwargs):
+    timing = capture_timing()
+    record = previous_factory(*args, **kwargs)
+    record.diagnostic_timing = timing.log_fields()
+    return record
+
+  factory._rtzs_diagnostic_timing = True
+  logging.setLogRecordFactory(factory)
 
 def json_handler(obj):
   if isinstance(obj, np.bool_):
@@ -65,6 +84,7 @@ class SwagFormatter(logging.Formatter):
     record_dict['thread'] = record.thread
     record_dict['threadName'] = record.threadName
     record_dict['created'] = record.created
+    record_dict.update(getattr(record, 'diagnostic_timing', {}))
 
     return record_dict
 
@@ -123,6 +143,7 @@ def _srcfile():
 
 class SwagLogger(logging.Logger):
   def __init__(self):
+    install_diagnostic_record_factory()
     logging.Logger.__init__(self, "swaglog")
 
     self.global_ctx = {}

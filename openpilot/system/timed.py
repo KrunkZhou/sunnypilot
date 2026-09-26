@@ -9,6 +9,7 @@ from openpilot.common.time_helpers import min_date, MAX_DATE, system_time_valid
 from openpilot.common.swaglog import cloudlog
 from openpilot.common.params import Params
 from openpilot.common.gps import get_gps_location_service
+from openpilot.common.diagnostic_timing import gps_clock_anchor
 
 
 def set_time(new_time):
@@ -54,6 +55,11 @@ def main() -> NoReturn:
       continue
     if gps_time < min_date() or gps_time > MAX_DATE:
       continue
+
+    if sm.valid[gps_location_service]:
+      anchor = gps_clock_anchor(gps, sm.logMonoTime[gps_location_service])
+      if anchor is not None:
+        cloudlog.event("diagnostic.clock_anchor", **anchor)
 
     set_time(gps_time)
     time.sleep(10)

@@ -134,6 +134,31 @@ def test_interrupt_worker_publishes_after_gpio_permission_recovery(sensord):
   sensord.os.close.assert_called_once_with(41)
 
 
+def test_interrupt_clock_jump_keeps_warning_and_skips_sensor_batch(sensord, monkeypatch):
+  from openpilot.common import diagnostic_timing
+  monkeypatch.setattr(diagnostic_timing, "get_boot_id", lambda: "c08e8b38-8f57-4f39-a8c0-8bf894992b54")
+  event = threading.Event()
+  sensor = Mock()
+  sensord.os.read.return_value = bytes(sensord.gpioevent_data(3_000_000_000, 1))
+  wall_values = iter([2_000_000_000, 3_000_000_000])
+  mono_values = iter([1_000_000_000, 1_100_000_000])
+  sensord.time = types.SimpleNamespace(time_ns=lambda: next(wall_values), monotonic_ns=lambda: next(mono_values))
+
+  def poll(_):
+    event.set()
+    return [(41, sensord.select.POLLIN)]
+
+  sensord.select.poll.return_value.poll.side_effect = poll
+  sensord.interrupt_loop([(sensor, "accelerometer", True)], event)
+  sensord.cloudlog.warning.assert_called_once_with("time jumped: 1900000000 1000000000")
+  sensord.cloudlog.event.assert_called_once_with(
+    "diagnostic.clock_jump", version=1, clock="monotonic", boot_id="c08e8b38-8f57-4f39-a8c0-8bf894992b54",
+    old_offset_ns="1000000000", new_offset_ns="1900000000", monotonic_ns="1100000000",
+  )
+  sensor.get_event.assert_not_called()
+  sensord.os.close.assert_called_once_with(41)
+
+
 @pytest.mark.parametrize("failure_at", ["affinity", "register", "poll", "read"])
 def test_interrupt_descriptor_closes_if_setup_or_read_fails(sensord, failure_at):
   event = threading.Event()

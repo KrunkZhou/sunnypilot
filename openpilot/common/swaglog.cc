@@ -14,6 +14,7 @@
 #include "json11/json11.hpp"
 #include "common/version.h"
 #include "common/hardware/hw.h"
+#include "common/diagnostic_timing.h"
 
 #include "sunnypilot/common/version.h"
 
@@ -88,6 +89,10 @@ uint32_t NO_FRAME_ID = std::numeric_limits<uint32_t>::max();
 
 static void cloudlog_common(int levelnum, const char* filename, int lineno, const char* func,
                             char* msg_buf, const json11::Json::object &msg_j={}) {
+  const uint64_t wall_time_ns = nanos_since_epoch();
+  // Match Python swaglog, sensord, and the Python GPS publishers. Cereal C++
+  // logMonoTime uses CLOCK_BOOTTIME, which differs after suspend.
+  const uint64_t monotonic_ns = nanos_monotonic();
   static SwaglogState s;
 
   json11::Json::object log_j = json11::Json::object {
@@ -96,8 +101,11 @@ static void cloudlog_common(int levelnum, const char* filename, int lineno, cons
     {"filename", filename},
     {"lineno", lineno},
     {"funcname", func},
-    {"created", seconds_since_epoch()}
+    {"created", static_cast<double>(wall_time_ns) / 1e9},
+    {"wall_time_ns", std::to_string(wall_time_ns)},
+    {"monotonic_ns", std::to_string(monotonic_ns)}
   };
+  if (!get_kernel_boot_id().empty()) log_j["boot_id"] = get_kernel_boot_id();
   if (msg_j.empty()) {
     log_j["msg"] = msg_buf;
   } else {
