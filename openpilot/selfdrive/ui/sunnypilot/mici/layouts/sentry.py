@@ -25,17 +25,16 @@ WARNING_TO_SECONDS = {"0.5 sec": 0.5, "1 sec": 1.0, "2 sec": 2.0, "5 sec": 5.0}
 STATUS_STALE_SECONDS = 15.0
 DRIVER_EXIT_STATUS = {
   "waiting_for_door_open": (
-    "waiting for door open",
-    "Ignition is off. Open the driver's door, then close it after exiting. The 90-second arming timer starts when that door closes.",
+    "waiting door",
+    "Ignition is off, active after driver's door opened.",
   ),
   "waiting_for_door_close": (
-    "waiting for door close",
-    "The driver's door was opened after ignition switched off. Close it to start the 90-second arming timer.",
+    "waiting door close",
+    "The driver's door was opened.",
   ),
   "door_signal_unavailable": (
-    "door signal unavailable",
-    "A fresh driver's-door signal is unavailable. This can happen on USB power or with an unsupported vehicle. " +
-    "Sentry will wait and will not arm automatically. Turn off wait for driver exit to use the normal 90-second offroad arming timer.",
+    "waiting door",
+    "Waiting for door open. Might be unavailable",
   ),
 }
 
@@ -48,13 +47,8 @@ class SentryConsentLayoutMici(NavScroller):
     )
     self._scroller.add_widgets([
       GreyBigButton("Sentry Mode", "review before enabling", icon),
-      GreyBigButton("wait for driver exit", "On by default: after ignition turns off, open and close the driver's door to start the 90-second arming timer."),
-      GreyBigButton("parked camera capture", "Continuing motion captures wide-road and cabin photos with a one-second minimum interval."),
-      GreyBigButton("capture limit", "First capture plus up to 20 more revisions per episode, then 90 seconds to rearm."),
-      GreyBigButton("alert frequency", "Only the first capture in each motion episode sends a webhook alert."),
-      GreyBigButton("upload to your RTZ server", "Captures wait securely on this device while offline and upload when connectivity returns."),
-      GreyBigButton("privacy", "Anyone with owner or administrator access to your RTZ server can view retained Sentry captures."),
-      GreyBigButton("your choice", "Disable Sentry Mode at any time. Disabling does not erase already queued events."),
+      GreyBigButton("parked camera capture", "Motion captures wide-road and cabin photos."),
+      GreyBigButton("upload to your RTZ server", "Captures upload when connectivity returns."),
       accept,
     ])
 
@@ -72,20 +66,20 @@ class SentryLayoutMici(NavScroller):
       self.config_error = str(exc)
 
     self.icon = gui_app.texture("icons_mici/settings/device/cameras.png", 64, 64)
-    self._enable_toggle = BigToggle("parked Sentry Mode", "wide + cabin", self.config.effective_enabled, self._on_enabled)
-    self._sensitivity = BigMultiToggle("motion sensitivity", list(SENSITIVITY_TO_THRESHOLD), select_callback=self._on_sensitivity)
+    self._enable_toggle = BigToggle("sentry mode", "wide + cabin", self.config.effective_enabled, self._on_enabled)
+    self._sensitivity = BigMultiToggle("sensitivity", list(SENSITIVITY_TO_THRESHOLD), select_callback=self._on_sensitivity)
     self._warning = BigMultiToggle("warning status delay", list(WARNING_TO_SECONDS), select_callback=self._on_warning)
     self._wait_for_driver_exit = BigToggle("wait for driver exit", "door open + close before arming",
                                          self.config.wait_for_driver_exit, self._on_wait_for_driver_exit)
-    self._status = BigButton("Sentry status", "starting", self.icon)
+    self._status = BigButton("status", "starting", self.icon)
     self._status.set_click_callback(self._show_status)
     self._queue = BigButton("upload queue", "0 pending")
-    self._manual_test = BigButton("test Sentry alert", "capture + upload", self.icon)
+    self._manual_test = BigButton("test alert", "capture + upload", self.icon)
     self._manual_test.set_click_callback(lambda: self._send_command("manual_test"))
     self._manual_test.set_enabled(lambda: ui_state.is_offroad() and self.config.effective_enabled and self.config_error is None)
     self._retry = BigButton("retry failed uploads", "manual retry")
     self._retry.set_click_callback(lambda: self._send_command("retry_uploads"))
-    self._reset = BigButton("reset Sentry settings", "keeps queued captures")
+    self._reset = BigButton("reset Sentry settings", "keeps queued")
     self._reset.set_click_callback(self._confirm_reset)
 
     self._scroller.add_widgets([
@@ -200,7 +194,7 @@ class SentryLayoutMici(NavScroller):
     status = get_status(self.volatile_params) or {}
     runtime_error = self._runtime_status_error(status)
     if not ui_state.is_offroad():
-      description = "Sentry detection is disabled while ignition is on. Pending delivery resumes after parking."
+      description = "Sentry detection is disabled while ignition is on."
     elif self.config_error:
       reset_guidance = "Use reset Sentry settings to quarantine invalid configuration and restore safe defaults."
       description = f"{self.config_error}\n\n{reset_guidance}"
@@ -212,7 +206,7 @@ class SentryLayoutMici(NavScroller):
         description += f"\n\n{status['error']}"
     else:
       description = ("The first qualifying movement starts capture without waiting for warning. " +
-                     "Warning status delay changes the status only. Captures remain queued until RTZ acknowledges them.")
+                     "Warning status delay changes the status only.")
       if self.config.wait_for_driver_exit:
         description += " After ignition switches off, open and close the driver's door to start the 90-second arming timer."
     gui_app.push_widget(BigDialog("Sentry status", description))

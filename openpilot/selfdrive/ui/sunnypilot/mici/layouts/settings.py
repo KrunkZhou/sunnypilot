@@ -52,7 +52,7 @@ class SettingsLayoutSP(OP.SettingsLayout):
     models_btn.set_click_callback(lambda: gui_app.push_widget(models_panel))
 
     sentry_panel = SentryLayoutMici()
-    sentry_btn = SettingsBigButton("sentry", "parked alerts", gui_app.texture("icons_mici/settings/device/cameras.png", 64, 64))
+    sentry_btn = SettingsBigButton("sentry", "", gui_app.texture("icons_mici/settings/device/cameras.png", 64, 64))
     sentry_btn.set_click_callback(lambda: gui_app.push_widget(sentry_panel))
 
     # onroad: enable button sits at the front (left of toggles)
