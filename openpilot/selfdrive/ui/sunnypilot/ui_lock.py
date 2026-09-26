@@ -227,8 +227,10 @@ class UiLock:
   def render(self, rect):
     rl.draw_rectangle_rec(rect, rl.BLACK)
     title_size = 56 if not gui_app.big_ui() else 130
-    gui_label(rl.Rectangle(rect.x, rect.y + rect.height * 0.14, rect.width, rect.height * 0.35), "Locked", title_size,
-              font_weight=FontWeight.MEDIUM, alignment=TextAlignment.CENTER)
+    title_rect = rl.Rectangle(rect.x, rect.y + rect.height * 0.14, rect.width, rect.height * 0.35) if self.snapshot["message"] else rect
+    gui_label(title_rect, "Locked", title_size, font_weight=FontWeight.AUDIOWIDE, alignment=TextAlignment.CENTER)
+    if not self.snapshot["message"]:
+      return
     self._message.set_text(self.snapshot["message"])
     message_rect = rl.Rectangle(rect.x + 16, rect.y + rect.height * 0.5, rect.width - 32, rect.height * 0.48)
     layout = (self.snapshot["message"], message_rect.width, message_rect.height)
@@ -284,15 +286,15 @@ class BigUiLockHomeMixin:
       self.last_refresh = time.monotonic()
     self._lock_home_was_drawn = self.current_state == HomeLayoutState.HOME
     rl.draw_rectangle_rec(rect, rl.BLACK)
+    if self.current_state == HomeLayoutState.HOME:
+      self.ui_lock.render(self.content_rect if self.ui_lock.snapshot["message"] else rect)
     # Keep alert access and acknowledgements; omit all ordinary home/status data.
     for button, visible, button_rect in ((self._lock_alerts, self.alert_count > 0, self.alert_notif_rect),
                                          (self._lock_update, self.update_available, self.update_notif_rect)):
       if visible:
         button.set_enabled(self.enabled)
         button.render(button_rect)
-    if self.current_state == HomeLayoutState.HOME:
-      self.ui_lock.render(self.content_rect)
-    elif self.current_state == HomeLayoutState.ALERTS:
+    if self.current_state == HomeLayoutState.ALERTS:
       self._render_alerts_view()
     elif self.current_state == HomeLayoutState.UPDATE:
       self._render_update_view()
