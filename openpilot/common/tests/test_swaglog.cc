@@ -4,6 +4,7 @@
 #include <zmq.h>
 
 #include "common/hardware/hw.h"
+#include "common/diagnostic_timing.h"
 #include "common/swaglog.h"
 #include "common/tests/native_test.h"
 #include "json11/json11.hpp"
@@ -27,7 +28,11 @@ void test_swaglog() {
   CHECK(zmq_setsockopt(socket, ZMQ_RCVTIMEO, &timeout, sizeof(timeout)) == 0);
   CHECK(zmq_bind(socket, Path::swaglog_ipc().c_str()) == 0);
 
+  const uint64_t mono_before = nanos_monotonic();
+  const uint64_t wall_before = nanos_since_epoch();
   LOGD("native-cpp-log");
+  const uint64_t mono_after = nanos_monotonic();
+  const uint64_t wall_after = nanos_since_epoch();
 
   char buffer[4096] = {};
   const int size = zmq_recv(socket, buffer, sizeof(buffer), 0);
@@ -43,6 +48,16 @@ void test_swaglog() {
   CHECK(message["ctx"]["daemon"].string_value() == "swaglog_test");
   CHECK(message["ctx"]["dongle_id"].string_value() == "test_dongle_id");
   CHECK(message["ctx"]["dirty"].bool_value() == false);
+  const uint64_t mono = std::stoull(message["monotonic_ns"].string_value());
+  const uint64_t wall = std::stoull(message["wall_time_ns"].string_value());
+  CHECK(mono >= mono_before && mono <= mono_after);
+  CHECK(wall >= wall_before && wall <= wall_after);
+  CHECK(message["created"].number_value() == static_cast<double>(wall) / 1e9);
+  if (get_kernel_boot_id().empty()) {
+    CHECK(message.object_items().count("boot_id") == 0);
+  } else {
+    CHECK(message["boot_id"].string_value() == get_kernel_boot_id());
+  }
 
   CHECK(zmq_close(socket) == 0);
   CHECK(zmq_ctx_destroy(context) == 0);
