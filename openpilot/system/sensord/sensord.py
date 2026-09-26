@@ -11,7 +11,6 @@ from openpilot.common.utils import sudo_write
 from openpilot.common.realtime import config_realtime_process, Ratekeeper
 from openpilot.common.swaglog import cloudlog
 from openpilot.common.gpio import gpiochip_get_ro_value_fd, gpioevent_data
-from openpilot.common.diagnostic_timing import clock_jump
 
 from openpilot.system.sensord.sensors.i2c_sensor import Sensor
 from openpilot.system.sensord.sensors.lsm6ds3_accel import LSM6DS3_Accel
@@ -73,14 +72,9 @@ def interrupt_loop(sensors: list[tuple[Sensor, str, bool]], event: threading.Eve
       dat = os.read(fd, ctypes.sizeof(gpioevent_data)*16)
       evd = gpioevent_data.from_buffer_copy(dat)
 
-      wall_time_ns = time.time_ns()
-      monotonic_ns = time.monotonic_ns()
-      cur_offset = wall_time_ns - monotonic_ns
+      cur_offset = time.time_ns() - time.monotonic_ns()
       if abs(cur_offset - offset) > 10 * 1e6:  # ms
         cloudlog.warning(f"time jumped: {cur_offset} {offset}")
-        jump = clock_jump(offset, cur_offset, monotonic_ns)
-        if jump is not None:
-          cloudlog.event("diagnostic.clock_jump", **jump)
         offset = cur_offset
         continue
 
