@@ -1211,6 +1211,41 @@ def backoff(retries: int) -> int:
   return random.randrange(0, min(128, int(2 ** retries)))
 
 
+class RetryNetworkMonitor:
+  def __init__(self):
+    self.sm = messaging.SubMaster(['deviceState'])
+    self.network_type: int | None = None
+
+  def changed(self) -> bool:
+    self.sm.update(0)
+    if not self.sm.updated['deviceState'] or not self.sm.valid['deviceState']:
+      return False
+
+    previous = self.network_type
+    self.network_type = self.sm['deviceState'].networkType.raw
+    # The first offline report only establishes a baseline. Signal strength,
+    # metering, and traffic updates do not indicate a different connection.
+    return self.network_type != previous and (previous is not None or self.network_type != NetworkType.none)
+
+
+def wait_for_retry(delay: float, exit_event: threading.Event, clock_offset: float | None = None,
+                   network_changed: Callable[[], bool] | None = None) -> None:
+  if clock_offset is None and network_changed is None:
+    exit_event.wait(delay)
+    return
+
+  # Retry promptly when the connection changes or the boot-time clock is
+  # corrected, keeping the usual backoff while those conditions are unchanged.
+  deadline = time.monotonic() + delay
+  while not exit_event.is_set():
+    remaining = deadline - time.monotonic()
+    if remaining <= 0 or (network_changed is not None and network_changed()):
+      return
+    if clock_offset is not None and abs(time.time() - time.monotonic() - clock_offset) >= 5.0:  # noqa: TID251
+      return
+    exit_event.wait(min(remaining, 1.0))
+
+
 def main(exit_event: threading.Event | None = None):
   register_ui_lock_methods()
   telemetry_stop = exit_event if exit_event is not None else threading.Event()
@@ -1234,16 +1269,21 @@ def main(exit_event: threading.Event | None = None):
 
   conn_start = None
   conn_retries = 0
+  connected_once = False
+  network_monitor = RetryNetworkMonitor()
   while exit_event is None or not exit_event.is_set():
     try:
       if conn_start is None:
         conn_start = time.monotonic()
 
+      clock_offset = None if connected_once else time.time() - time.monotonic()  # noqa: TID251
+      network_monitor.changed()
       cloudlog.event("athenad.main.connecting_ws", ws_uri=ws_uri, retries=conn_retries)
       ws = create_connection(ws_uri,
                              cookie="jwt=" + api.get_token(),
                              enable_multithread=True,
                              timeout=30.0)
+      connected_once = True
       cloudlog.event("athenad.main.connected_ws", ws_uri=ws_uri, retries=conn_retries,
                      duration=time.monotonic() - conn_start)
       conn_start = None
@@ -1259,16 +1299,19 @@ def main(exit_event: threading.Event | None = None):
       ws.close()
     except (KeyboardInterrupt, SystemExit):
       break
-    except (ConnectionError, TimeoutError, WebSocketException):
+    except (ConnectionError, TimeoutError, WebSocketException) as error:
       conn_retries += 1
       params.remove("LastAthenaPingTime")
+      http_status = getattr(error, "status_code", None)
+      cloudlog.event("athenad.main.connection_failed", error_type=type(error).__name__, retries=conn_retries,
+                     http_status=http_status if isinstance(http_status, int) else None)
     except Exception:
       cloudlog.exception("athenad.main.exception")
 
       conn_retries += 1
       params.remove("LastAthenaPingTime")
 
-    time.sleep(backoff(conn_retries))
+    wait_for_retry(backoff(conn_retries), telemetry_stop, None if connected_once else clock_offset, network_monitor.changed)
 
   telemetry_stop.set()
 
