@@ -9,6 +9,7 @@ from openpilot.system.ui.lib.multilang import tr
 from openpilot.system.ui.lib.text_measure import measure_text_cached
 from openpilot.system.ui.widgets import Widget
 from openpilot.system.ui.widgets.label import Label
+from openpilot.selfdrive.ui.sunnypilot.external_navigation import navigation_turn_notice
 
 AlertSize = log.SelfdriveState.AlertSize
 AlertStatus = log.SelfdriveState.AlertStatus
@@ -105,7 +106,8 @@ class AlertRenderer(Widget):
 
     # No alert if size is none
     if ss.alertSize == 0:
-      return None
+      text = navigation_turn_notice(sm)
+      return Alert(text1=text, size=AlertSize.small, status=AlertStatus.normal) if text else None
 
     # Don't get old alert
     if recv_frame < ui_state.started_frame:
