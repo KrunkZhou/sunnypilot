@@ -481,11 +481,15 @@ class SentryMode:
       self.capture_queue.insert(0, active.job)
       self.active_capture = None
       return
+    result = active.result[0] if active.result else CaptureResult(
+      {}, {"wide": "capture_failed", "cabin": "capture_failed"})
     if self.capture_abort_reason is not None:
-      result = CaptureResult({}, {"wide": self.capture_abort_reason, "cabin": self.capture_abort_reason})
-    else:
-      result = active.result[0] if active.result else CaptureResult(
-        {}, {"wide": "capture_failed", "cabin": "capture_failed"})
+      # Cancellation stops unfinished camera work, but must not erase images
+      # already returned by the worker while the main loop was catching up or
+      # retrying a durable write. Keep those bytes without starting a recapture.
+      result = CaptureResult(result.media, {
+        role: self.capture_abort_reason for role in ("wide", "cabin") if role not in result.media
+      })
     try:
       self.store.finish_capture(active.job.event_id, active.job.revision, result.media, result.omissions)
       self.persistence_error = None
