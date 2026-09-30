@@ -1,3 +1,4 @@
+import hashlib
 import json
 import queue
 import sqlite3
@@ -268,6 +269,66 @@ def test_ignition_after_first_commit_does_not_erase_first_capture(mode):
   assert mode.active_capture is None
   assert mode.store.next_pending(0).metadata == first.metadata
   assert first.metadata["capture_status"] == "complete"
+
+
+@pytest.mark.parametrize("abort_reason", ["ignition_on", "stale_capture"])
+@pytest.mark.parametrize("captured_roles", [("wide", "cabin"), ("wide",), ()])
+def test_abort_before_finalization_preserves_completed_images(mode, abort_reason, captured_roles):
+  mode._process_detection("motion", 100.0)
+  job = mode.capture_queue.pop(0)
+  media = {role: MediaData(b"\xff\xd8" + role.encode() + b"\xff\xd9", 4, 2) for role in captured_roles}
+  results = [CaptureResult(media, {
+    role: "capture_timeout" for role in ("wide", "cabin") if role not in media
+  })] if media else []
+  thread = SimpleNamespace(is_alive=lambda: False, join=lambda _timeout: None)
+  mode.active_capture = ActiveCapture(job, thread, results)
+  mode.active_capture.request_started.set()
+  assert mode.store.next_pending(0) is None
+
+  mode._abort_capture_work(abort_reason)
+  mode._finish_capture_if_ready()
+
+  queued = mode.store.next_pending(0)
+  assert queued is not None
+  assert {item.role for item in queued.media} == set(captured_roles)
+  assert {item.role: item.sha256 for item in queued.media} == {
+    role: hashlib.sha256(captured.data).hexdigest() for role, captured in media.items()
+  }
+  assert {item["role"]: item["reason"] for item in queued.metadata["omitted_media"]} == {
+    role: abort_reason for role in ("wide", "cabin") if role not in captured_roles
+  }
+  assert queued.metadata["capture_status"] == ("complete" if len(media) == 2 else "partial" if media else "failed")
+  assert not mode.capture_queue and mode.active_capture is None
+  assert mode.capture.pairs == 0  # Cancellation must never trigger a recapture.
+
+
+def test_abort_during_persistence_retry_preserves_completed_images(mode, monkeypatch):
+  mode._process_detection("motion", 100.0)
+  mode._start_capture_if_needed()
+  finish = mode.store.finish_capture
+
+  def disk_full(*_args):
+    raise sqlite3.OperationalError("disk full")
+
+  monkeypatch.setattr(mode.store, "finish_capture", disk_full)
+  finish_pair(mode)
+  active = mode.active_capture
+  original_media = dict(active.result[0].media)
+  assert mode.store.next_pending(0) is None
+  mode._abort_capture_work("ignition_on")
+  active.thread.join(1)
+  monkeypatch.setattr(mode.store, "finish_capture", finish)
+  mode.test_now[0] = active.next_finalize_at
+  mode._finish_capture_if_ready()
+
+  queued = mode.store.next_pending(0)
+  assert queued.metadata["capture_status"] == "complete"
+  assert {item.role for item in queued.media} == set(original_media)
+  assert {item.role: item.sha256 for item in queued.media} == {
+    role: hashlib.sha256(captured.data).hexdigest() for role, captured in original_media.items()
+  }
+  assert not queued.metadata["omitted_media"]
+  assert mode.capture.pairs == 1 and mode.active_capture is None
 
 
 def test_session_expiring_while_request_is_queued_does_not_strand_revision(mode):
