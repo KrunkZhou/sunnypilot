@@ -15,6 +15,7 @@ from openpilot.system.ui.widgets import Widget
 from openpilot.system.ui.widgets.label import UnifiedLabel
 
 from openpilot.selfdrive.ui.sunnypilot.onroad.speed_limit import SpeedLimitAlertRenderer
+from openpilot.selfdrive.ui.sunnypilot.external_navigation import navigation_turn_notice
 
 AlertSize = log.SelfdriveState.AlertSize
 AlertStatus = log.SelfdriveState.AlertStatus
@@ -145,6 +146,10 @@ class AlertRenderer(Widget, SpeedLimitAlertRenderer):
 
     # No alert if size is none
     if ss.alertSize == 0:
+      text = navigation_turn_notice(sm)
+      if text:
+        self._prev_alert = Alert(text1=text, size=AlertSize.small, status=AlertStatus.normal)
+        return self._prev_alert
       return None
 
     # Return current alert

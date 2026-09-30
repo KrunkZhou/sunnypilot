@@ -16,6 +16,7 @@ from jeepney.low_level import MessageType
 from jeepney.wrappers import Properties
 
 from openpilot.common.swaglog import cloudlog
+from openpilot.sunnypilot.external_navigation.settings import read_network_revision, record_network_action
 from openpilot.system.ui.lib.networkmanager import (NM, NM_WIRELESS_IFACE, NM_802_11_AP_SEC_PAIR_WEP40,
                                                     NM_802_11_AP_SEC_PAIR_WEP104, NM_802_11_AP_SEC_GROUP_WEP40,
                                                     NM_802_11_AP_SEC_GROUP_WEP104, NM_802_11_AP_SEC_KEY_MGMT_PSK,
@@ -159,6 +160,7 @@ class WifiManager:
     self._networks: list[Network] = []  # an unsorted list of available Networks. a Network can be comprised of multiple APs
     self._active = True  # used to not run when not in settings
     self._exit = False
+    self._initial_state_ready = False
 
     # DBus connections
     try:
@@ -220,6 +222,7 @@ class WifiManager:
         self._add_tethering_connection()
 
       self._init_wifi_state()
+      self._initial_state_ready = True
 
       self._tethering_password = self._get_tethering_password()
       cloudlog.debug("WifiManager initialized")
@@ -305,6 +308,18 @@ class WifiManager:
   @property
   def tethering_password(self) -> str:
     return self._tethering_password
+
+  @property
+  def tethering_ssid(self) -> str:
+    return self._tethering_ssid
+
+  @property
+  def navigation_network_ready(self) -> bool:
+    return self._initial_state_ready and self._wifi_device is not None and self._tethering_ssid in self._connections
+
+  @staticmethod
+  def _record_manual_network_action():
+    record_network_action()
 
   def _set_connecting(self, ssid: str | None):
     # Called by user action, or sequentially from state change handler
@@ -632,11 +647,12 @@ class WifiManager:
     self._router_main.send_and_get_reply(new_method_call(settings_addr, 'AddConnection', 'a{sa{sv}}', (connection,)))
 
   def connect_to_network(self, ssid: str, password: str, hidden: bool = False):
+    self._record_manual_network_action()
     self._set_connecting(ssid)
 
     def worker():
       # Clear all connections that may already exist to the network we are connecting to
-      self.forget_connection(ssid, block=True)
+      self.forget_connection(ssid, block=True, manual=False)
 
       connection = {
         'connection': {
@@ -682,7 +698,9 @@ class WifiManager:
 
     threading.Thread(target=worker, daemon=True).start()
 
-  def forget_connection(self, ssid: str, block: bool = False):
+  def forget_connection(self, ssid: str, block: bool = False, manual: bool = True):
+    if manual:
+      self._record_manual_network_action()
     def worker():
       conn_path = self._connections.get(ssid, None)
       if conn_path is None:
@@ -698,10 +716,14 @@ class WifiManager:
     else:
       threading.Thread(target=worker, daemon=True).start()
 
-  def activate_connection(self, ssid: str, block: bool = False):
-    self._set_connecting(ssid)
-
+  def activate_connection(self, ssid: str, block: bool = False, manual: bool = True, expected_revision: str | None = None):
+    if manual:
+      self._record_manual_network_action()
     def worker():
+      if expected_revision is not None:
+        if read_network_revision() != expected_revision:
+          return
+      self._set_connecting(ssid)
       conn_path = self._connections.get(ssid, None)
       if conn_path is None or self._wifi_device is None:
         cloudlog.warning(f"Failed to activate connection for {ssid}: conn_path={conn_path}, wifi_device={self._wifi_device}")
@@ -725,6 +747,13 @@ class WifiManager:
   def _deactivate_connection(self, ssid: str):
     for active_conn in self._get_active_connections():
       conn_addr = DBusAddress(active_conn, bus_name=NM, interface=NM_ACTIVE_CONNECTION_IFACE)
+      # AP profiles have no SpecificObject access point. Match the saved profile
+      # first so hotspot deactivation also works during its activation phase.
+      profile_reply = self._router_main.send_and_get_reply(Properties(conn_addr).get('Connection'))
+      if (profile_reply.header.message_type != MessageType.error and
+          profile_reply.body[0][1] == self._connections.get(ssid)):
+        self._router_main.send_and_get_reply(new_method_call(self._nm, 'DeactivateConnection', 'o', (active_conn,)))
+        return
       reply = self._router_main.send_and_get_reply(Properties(conn_addr).get('SpecificObject'))
       if reply.header.message_type == MessageType.error:
         continue  # object gone (e.g. rapid connect/disconnect)
@@ -751,6 +780,7 @@ class WifiManager:
     return ssid in self._connections
 
   def set_tethering_password(self, password: str):
+    self._record_manual_network_action()
     def worker():
       conn_path = self._connections.get(self._tethering_ssid, None)
       if conn_path is None:
@@ -772,7 +802,7 @@ class WifiManager:
 
       self._tethering_password = password
       if self.is_tethering_active():
-        self.activate_connection(self._tethering_ssid, block=True)
+        self.activate_connection(self._tethering_ssid, block=True, manual=False)
 
     threading.Thread(target=worker, daemon=True).start()
 
@@ -800,10 +830,15 @@ class WifiManager:
   def set_ipv4_forward(self, enabled: bool):
     self._ipv4_forward = enabled
 
-  def set_tethering_active(self, active: bool):
+  def set_tethering_active(self, active: bool, manual: bool = True, block: bool = False, expected_revision: str | None = None):
+    if manual:
+      self._record_manual_network_action()
     def worker():
+      if expected_revision is not None:
+        if read_network_revision() != expected_revision:
+          return
       if active:
-        self.activate_connection(self._tethering_ssid, block=True)
+        self.activate_connection(self._tethering_ssid, block=True, manual=False)
 
         if not self._ipv4_forward:
           time.sleep(5)
@@ -812,7 +847,10 @@ class WifiManager:
       else:
         self._deactivate_connection(self._tethering_ssid)
 
-    threading.Thread(target=worker, daemon=True).start()
+    if block:
+      worker()
+    else:
+      threading.Thread(target=worker, daemon=True).start()
 
   def set_current_network_metered(self, metered: MeteredType):
     def worker():

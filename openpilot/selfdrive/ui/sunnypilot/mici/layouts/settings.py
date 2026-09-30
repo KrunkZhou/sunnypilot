@@ -12,6 +12,7 @@ from openpilot.selfdrive.ui.mici.widgets.dialog import BigConfirmationDialog, Bi
 from openpilot.selfdrive.ui.sunnypilot.mici.layouts.sunnylink import SunnylinkLayoutMici
 from openpilot.selfdrive.ui.sunnypilot.mici.layouts.models import ModelsLayoutMici
 from openpilot.selfdrive.ui.sunnypilot.mici.layouts.sentry import SentryLayoutMici
+from openpilot.selfdrive.ui.sunnypilot.mici.layouts.navigation import NavigationLayoutMici
 from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.system.ui.lib.application import gui_app, FontWeight
 from openpilot.system.ui.lib.multilang import tr
@@ -55,6 +56,10 @@ class SettingsLayoutSP(OP.SettingsLayout):
     sentry_btn = SettingsBigButton("sentry", "", gui_app.texture("icons_mici/settings/device/cameras.png", 64, 64))
     sentry_btn.set_click_callback(lambda: gui_app.push_widget(sentry_panel))
 
+    navigation_panel = NavigationLayoutMici()
+    navigation_btn = SettingsBigButton("navigation", "", gui_app.texture("icons_mici/settings/device/lkas.png", 64, 64))
+    navigation_btn.set_click_callback(lambda: gui_app.push_widget(navigation_panel))
+
     # onroad: enable button sits at the front (left of toggles)
     self._enable_offroad_btn_onroad = BigCircleButton(self.icon_offroad_enable, red=True)
     self._enable_offroad_btn_onroad.set_click_callback(lambda: self._handle_always_offroad(True))
@@ -73,6 +78,7 @@ class SettingsLayoutSP(OP.SettingsLayout):
 
     items.insert(1, models_btn)
     items.insert(2, sentry_btn)
+    items.insert(3, navigation_btn)
     items.insert(5, sunnylink_btn)
 
     # front slots (only one ever visible at a time): exit-always-offroad, then enable-onroad
