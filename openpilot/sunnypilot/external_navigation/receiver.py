@@ -11,6 +11,27 @@ from openpilot.sunnypilot.external_navigation.policy import RIGHT_BRANCH_TYPES
 from openpilot.sunnypilot.external_navigation.protocol import PORT, MAX_PACKET, UNKNOWN_AGE, ProtocolError, Receiver
 
 
+class PublicationSchedule:
+  """Publish accepted snapshots once per batch, plus idle/status updates at 5 Hz."""
+  def __init__(self):
+    self.next_status = 0.
+    self.pending = False
+
+  def receive(self, receiver: Receiver, packet: bytes, peer: tuple, now: int) -> None:
+    previous_received = receiver.received
+    receiver.receive(packet, peer, now)
+    # Only a fully validated snapshot/envelope advances received. HELLOs and
+    # rejected packets cannot increase publication rate or refresh source ages.
+    self.pending |= receiver.received != previous_received
+
+  def due(self, now: float) -> bool:
+    if not self.pending and now < self.next_status:
+      return False
+    self.pending = False
+    self.next_status = now + .2
+    return True
+
+
 def publish(pm, receiver: Receiver | None, now: int, status: str, rejection: str = '') -> None:
   from openpilot.cereal import messaging
   message = messaging.new_message('externalNavigationSP')
@@ -85,7 +106,8 @@ def main() -> None:
   signal.signal(signal.SIGTERM, stop)
   signal.signal(signal.SIGINT, stop)
   receiver, sock = None, None
-  next_config_read = next_address_read = next_publish = next_mode_read = 0.
+  next_config_read = next_address_read = next_mode_read = 0.
+  publication = PublicationSchedule()
   enabled = False
   address = None
   rejection, status = '', 'off'
@@ -143,7 +165,7 @@ def main() -> None:
               receiver.clear('socket_lost')
               break
             try:
-              receiver.receive(packet, peer, now)
+              publication.receive(receiver, packet, peer, now)
               rejection = ''
             except ProtocolError as exc:
               rejection = str(exc)  # Only fixed reason codes, never packet/secret contents.
@@ -156,11 +178,10 @@ def main() -> None:
               sock = None
               receiver.clear('send_failed')
           status = receiver.reason
-      if now_s >= next_publish:
+      if publication.due(now_s):
         publish(pm, receiver if enabled else None, now, status, rejection)
         if enabled:
           diagnostics.submit(receiver_record(receiver, now, status, rejection))
-        next_publish = now_s + .2
       time.sleep(.01)
   finally:
     if sock is not None:
