@@ -1,6 +1,8 @@
 import json
 
-from openpilot.sunnypilot.sms_forwarder.modem import ATResult, PDURead, SMSModem, pdu_digest
+import pytest
+
+from openpilot.sunnypilot.sms_forwarder.modem import ATResult, PDURead, SMSModem, StoredPDU, pdu_digest
 from openpilot.sunnypilot.sms_forwarder.tests.helpers import sms_deliver_pdu
 
 
@@ -36,9 +38,59 @@ def test_scans_sm_and_me_in_pdu_mode() -> None:
   ]
 
 
-def test_scan_retries_when_lock_or_modem_is_busy() -> None:
-  client = FakeClient({"AT+CMGF=0": [None]})
+@pytest.mark.parametrize("failure", [None, ATResult(False, ())])
+def test_scan_retries_when_lock_or_modem_is_busy(failure) -> None:
+  client = FakeClient({"AT+CMGF=0": [failure]})
   assert SMSModem(client=client).scan() is None
+
+
+@pytest.mark.parametrize("failed_storage", ["SM", "ME"])
+@pytest.mark.parametrize("failed_operation", ["select", "list"])
+@pytest.mark.parametrize("failure", [None, ATResult(False, ())])
+def test_scan_keeps_messages_when_other_storage_is_unavailable(failed_storage, failed_operation, failure) -> None:
+  pdu = sms_deliver_pdu("available message")
+  available_storage = "ME" if failed_storage == "SM" else "SM"
+  responses = {"AT+CMGF=0": [ATResult(True, ())], "AT+CMGL=4": []}
+  expected_commands = ["AT+CMGF=0"]
+  for storage in ("SM", "ME"):
+    select = f'AT+CPMS="{storage}"'
+    expected_commands.append(select)
+    if storage == failed_storage and failed_operation == "select":
+      responses[select] = [failure]
+    else:
+      responses[select] = [ATResult(True, ())]
+      responses["AT+CMGL=4"].append(failure if storage == failed_storage else ATResult(True, ("+CMGL: 7,1,,23", pdu)))
+      expected_commands.append("AT+CMGL=4")
+  client = FakeClient(responses)
+
+  assert SMSModem(client=client).scan() == [StoredPDU(available_storage, 7, pdu, pdu_digest(pdu))]
+  assert client.commands == expected_commands
+
+
+@pytest.mark.parametrize("failed_operation", ["select", "list"])
+@pytest.mark.parametrize("failure", [None, ATResult(False, ())])
+def test_scan_retries_when_neither_storage_can_be_listed(failed_operation, failure) -> None:
+  client = FakeClient({
+    "AT+CMGF=0": [ATResult(True, ())],
+    'AT+CPMS="SM"': [failure if failed_operation == "select" else ATResult(True, ())],
+    'AT+CPMS="ME"': [failure if failed_operation == "select" else ATResult(True, ())],
+    "AT+CMGL=4": [failure, failure],
+  })
+
+  assert SMSModem(client=client).scan() is None
+  assert 'AT+CPMS="ME"' in client.commands
+
+
+@pytest.mark.parametrize("failed_storage", ["SM", "ME"])
+def test_scan_returns_empty_list_when_available_storage_is_empty(failed_storage) -> None:
+  client = FakeClient({
+    "AT+CMGF=0": [ATResult(True, ())],
+    'AT+CPMS="SM"': [ATResult(True, ())],
+    'AT+CPMS="ME"': [ATResult(True, ())],
+    "AT+CMGL=4": [None if storage == failed_storage else ATResult(True, ()) for storage in ("SM", "ME")],
+  })
+
+  assert SMSModem(client=client).scan() == []
 
 
 def test_read_and_delete_slot() -> None:
@@ -52,6 +104,18 @@ def test_read_and_delete_slot() -> None:
   modem = SMSModem(client=client)
   assert modem.read("SM", 3) == PDURead("found", pdu)
   assert modem.delete("SM", 3)
+
+
+@pytest.mark.parametrize("failed_operation", ["select", "delete"])
+@pytest.mark.parametrize("failure, expected", [(None, None), (ATResult(False, ()), False)])
+def test_delete_distinguishes_busy_modem_from_explicit_error(failed_operation, failure, expected) -> None:
+  client = FakeClient({
+    'AT+CPMS="SM"': [failure if failed_operation == "select" else ATResult(True, ())],
+    "AT+CMGD=3": [failure],
+  })
+
+  assert SMSModem(client=client).delete("SM", 3) is expected
+  assert client.commands == (['AT+CPMS="SM"'] if failed_operation == "select" else ['AT+CPMS="SM"', "AT+CMGD=3"])
 
 
 def test_iccid_is_read_from_shared_modem_state(tmp_path) -> None:

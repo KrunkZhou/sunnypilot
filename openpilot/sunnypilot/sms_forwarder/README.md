@@ -6,6 +6,8 @@ Uploads use the same primary device key as normal API registration: RSA (`RS256`
 
 The service deliberately does not modify the main modem implementation or enable unsolicited modem notifications. It shares `/dev/shm/modem.lock`, polls `SM` and `ME` storage in PDU mode, and keeps both the modem slot and its SQLite copy until RTZ acknowledges the normalized message. The queue is stored at `/data/rtzs/sms_forwarder/queue.sqlite3`.
 
+Storage is polled every 15 seconds. If either storage is busy or fails, readable messages from the other storage are still queued and eligible for upload; the failed storage is retried on the next poll. Due uploads run before acknowledged-message cleanup. Cleanup defers a busy or timed-out storage until the next poll while continuing with the other storage, avoiding repeated waits across its backlog. An explicit deletion error preserves that slot for retry without blocking later slots. Failed uploads retain their exponential retry delay, from 30 seconds plus jitter up to 15 minutes.
+
 Only SMS-DELIVER text using GSM 7-bit or UCS-2 is forwarded. Binary, MMS, provisioning, status reports, malformed PDUs, and incomplete multipart messages stay on the modem and are never uploaded or deleted.
 
 ## Migrating to a new Sunnypilot release
