@@ -88,6 +88,7 @@ class TestNavigationUI(unittest.TestCase):
     self.drawn, self.rectangles, self.dialogs = [], [], []
     self.settings_root = Path(self.context.enter_context(tempfile.TemporaryDirectory()))
     self.context.enter_context(patch.dict('os.environ', {'RTZS_NAVIGATION_ROOT': str(self.settings_root)}))
+    self.context.enter_context(patch.object(navigation_settings, 'revision_path', return_value=self.settings_root / 'network-revision'))
     self.assertTrue(navigation_settings.write_mode(1))
     self.nav = SimpleNamespace(connected=True, available=True, sourceFresh=True, distanceAgeMs=100,
                                receiveMonoTime=self.now, status='current', instruction='Turn right',
@@ -260,6 +261,7 @@ class TestAutomaticWifiOperations(unittest.TestCase):
     self.addCleanup(context.close)
     root = context.enter_context(tempfile.TemporaryDirectory())
     context.enter_context(patch.dict('os.environ', {'RTZS_NAVIGATION_ROOT': root}))
+    context.enter_context(patch.object(navigation_settings, 'revision_path', return_value=Path(root) / 'network-revision'))
     self.before = navigation_settings.read_network_revision()
     self.assertIsNotNone(self.before)
     self.pending, self.calls = [], []
