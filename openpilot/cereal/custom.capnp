@@ -462,6 +462,9 @@ struct ModelDataV2SP @0xa1680744031fdb2d {
   laneTurnDirection @0 :TurnDirection;
   leftLaneChangeEdgeBlock @1 :Bool;
   rightLaneChangeEdgeBlock @2 :Bool;
+  navigationHint @3 :UInt8;
+  navigationHintStatus @4 :Text;
+  navigationAssisted @5 :Bool;
 
   enum TurnDirection {
     none @0;
@@ -470,7 +473,56 @@ struct ModelDataV2SP @0xa1680744031fdb2d {
   }
 }
 
-struct CustomReserved10 @0xcb9fd56c7057593a {
+struct ExternalNavigationSP @0xcb9fd56c7057593a {
+  connected @0 :Bool;
+  available @1 :Bool;
+  sourceFresh @2 :Bool;
+  receiveMonoTime @3 :UInt64;
+  publisherSession @4 :Data;
+  cacheEpoch @5 :UInt64;
+  streamId @6 :UInt64;
+  generation @7 :UInt64;
+  maneuverId @8 :UInt64;
+  hasManeuverId @9 :Bool;
+  token @10 :UInt32;
+  snapshotSequence @11 :UInt32;
+  distanceObservation @12 :UInt32;
+  maneuverObservation @13 :UInt32;
+  distanceAgeMs @14 :UInt32;
+  maneuverAgeMs @15 :UInt32;
+  sourceAgeMs @16 :UInt32;
+  routeState @17 :UInt8;
+  maneuverType @18 :UInt8;
+  hasNextDistance @19 :Bool;
+  nextDistance @20 :UInt32; # metres; never total remaining distance
+  instruction @21 :Text;
+  road @22 :Text;
+  destination @23 :Text;
+  laneDescription @24 :Text;
+  branchRight @25 :Bool;
+  status @26 :Text;
+  rejectionReason @27 :Text;
+  relayId @28 :Data;
+  hasTripDistance @29 :Bool;
+  tripDistance @30 :UInt32;
+  hasTripSeconds @31 :Bool;
+  tripSeconds @32 :UInt64;
+  lanes @33 :List(Lane);
+  nextDisplay @34 :Text;
+  tripDisplay @35 :Text;
+  currentRoad @36 :Text;
+  transportRttMs @37 :UInt32;
+  hasManeuver @38 :Bool;
+  hasNextUnits @39 :Bool;
+  nextUnits @40 :UInt8;
+  hasTripUnits @41 :Bool;
+  tripUnits @42 :UInt8;
+  receiverSession @43 :Data;
+  struct Lane {
+    status @0 :UInt8;
+    highlighted @1 :UInt8;
+    angles @2 :List(Int16);
+  }
 }
 
 struct CustomReserved11 @0xc2243c65e0340384 {
