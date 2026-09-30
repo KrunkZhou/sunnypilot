@@ -10,8 +10,11 @@ import importlib.util
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch
+
+from openpilot.sunnypilot.external_navigation import settings as navigation_settings
 
 try:
   from PIL import ImageFont
@@ -30,19 +33,6 @@ class Rectangle:
   y: float
   width: float
   height: float
-
-
-class Params:
-  def __init__(self):
-    self.values = {'ExternalNavigationMode': 1, 'ExternalNavigationNetworkRevision': 'before'}
-    self.writes = []
-
-  def get(self, key):
-    return self.values.get(key)
-
-  def put(self, key, value):
-    self.values[key] = value
-    self.writes.append((key, value))
 
 
 class Button:
@@ -96,7 +86,9 @@ class TestNavigationUI(unittest.TestCase):
     self.addCleanup(self.context.close)
     self.now = 10_000_000_000
     self.drawn, self.rectangles, self.dialogs = [], [], []
-    self.params = Params()
+    self.settings_root = Path(self.context.enter_context(tempfile.TemporaryDirectory()))
+    self.context.enter_context(patch.dict('os.environ', {'RTZS_NAVIGATION_ROOT': str(self.settings_root)}))
+    self.assertTrue(navigation_settings.write_mode(1))
     self.nav = SimpleNamespace(connected=True, available=True, sourceFresh=True, distanceAgeMs=100,
                                receiveMonoTime=self.now, status='current', instruction='Turn right',
                                road='Rue Saint-Paul', nextDistance=35, hasNextDistance=True, branchRight=False)
@@ -108,7 +100,7 @@ class TestNavigationUI(unittest.TestCase):
     self.messages.alive = {'externalNavigationSP': True, 'modelDataV2SP': True}
     self.messages.valid = dict(self.messages.alive)
     self.offroad = True
-    self.state = SimpleNamespace(params=self.params, sm=self.messages, is_offroad=lambda: self.offroad)
+    self.state = SimpleNamespace(sm=self.messages, is_offroad=lambda: self.offroad)
     self.fonts = {}
     def measure(font, text, size):
       if ImageFont is not None:
@@ -127,11 +119,6 @@ class TestNavigationUI(unittest.TestCase):
     self.gui = SimpleNamespace(font=lambda weight: str(FONT_PATH), push_widget=self.dialogs.append)
     dependencies = {
       'pyray': self.rl,
-      'openpilot.sunnypilot.external_navigation.settings': module('nav_settings',
-        read_mode=lambda: self.params.values.get('ExternalNavigationMode') or 0,
-        write_mode=lambda value: self.params.put('ExternalNavigationMode', value),
-        read_network_revision=lambda: self.params.get('ExternalNavigationNetworkRevision') or '',
-        record_network_action=lambda: self.params.put('ExternalNavigationNetworkRevision', 'manual')),
       'openpilot.selfdrive.ui.ui_state': module('ui_state', ui_state=self.state),
       'openpilot.system.ui.lib.application': module('application', gui_app=self.gui, FontWeight=SimpleNamespace(MEDIUM='medium')),
       'openpilot.system.ui.lib.text_measure': module('text_measure', measure_text_cached=measure),
@@ -154,9 +141,9 @@ class TestNavigationUI(unittest.TestCase):
   def test_only_off_and_assisted_modes_are_present(self):
     self.assertEqual(self.ui.MODE_LABELS, ('Off', 'Assisted turns'))
     for value in (None, 0, 2, -1, 999):
-      self.params.values['ExternalNavigationMode'] = value
+      (self.settings_root / 'config/mode').write_text(str(value))
       self.assertEqual(self.ui.mode(), 0)
-    self.params.values['ExternalNavigationMode'] = 1
+    self.assertTrue(navigation_settings.write_mode(1))
     self.assertEqual(self.ui.mode(), 1)
     self.assertNotIn('shadow', ' '.join(self.ui.MODE_LABELS).lower())
 
@@ -190,10 +177,10 @@ class TestNavigationUI(unittest.TestCase):
     self.render()
     self.assertFalse(self.drawn)
     self.alert.alertSize = 0
-    self.params.values['ExternalNavigationMode'] = 0
+    self.assertTrue(navigation_settings.write_mode(0))
     self.render()
     self.assertFalse(self.drawn)
-    self.params.values['ExternalNavigationMode'] = 1
+    self.assertTrue(navigation_settings.write_mode(1))
     self.nav.available = False
     self.render()
     self.assertFalse(self.drawn)
@@ -242,12 +229,12 @@ class TestNavigationUI(unittest.TestCase):
     panel = layout_module.NavigationLayoutMici()
     self.assertEqual(panel._mode.options, ['Off', 'Assisted turns'])
     panel._select_mode('Off')
-    self.assertEqual(self.params.writes, [('ExternalNavigationMode', 0)])
+    self.assertEqual((self.settings_root / 'config/mode').read_bytes(), b'0\n')
     panel._select_mode('Assisted turns')
-    self.assertEqual(self.params.values['ExternalNavigationMode'], 1)
+    self.assertEqual(navigation_settings.read_mode(), 1)
     self.offroad = False
     panel._select_mode('Off')
-    self.assertEqual(self.params.values['ExternalNavigationMode'], 1)
+    self.assertEqual(navigation_settings.read_mode(), 1)
     panel._update_state()
     self.assertFalse(panel._mode.enabled)
     self.assertEqual(panel._mode.value, 'Assisted turns')
@@ -257,26 +244,31 @@ class TestNavigationUI(unittest.TestCase):
   def test_standard_mode_callback_cannot_change_onroad(self):
     cycle = method(OPENPILOT / 'selfdrive/ui/sunnypilot/layouts/settings/models.py', '_cycle_navigation_mode',
                    {'ui_state': self.state, 'navigation_mode': self.ui.mode, 'MODE_LABELS': self.ui.MODE_LABELS,
-                    'write_mode': lambda value: self.params.put('ExternalNavigationMode', value)})
+                    'write_mode': navigation_settings.write_mode})
     cycle(None)
-    self.assertEqual(self.params.values['ExternalNavigationMode'], 0)
+    self.assertEqual(navigation_settings.read_mode(), 0)
     cycle(None)
-    self.assertEqual(self.params.values['ExternalNavigationMode'], 1)
+    self.assertEqual(navigation_settings.read_mode(), 1)
     self.offroad = False
     cycle(None)
-    self.assertEqual(self.params.values['ExternalNavigationMode'], 1)
+    self.assertEqual(navigation_settings.read_mode(), 1)
 
 
 class TestAutomaticWifiOperations(unittest.TestCase):
   def setUp(self):
-    self.params, self.pending, self.calls = Params(), [], []
+    context = ExitStack()
+    self.addCleanup(context.close)
+    root = context.enter_context(tempfile.TemporaryDirectory())
+    context.enter_context(patch.dict('os.environ', {'RTZS_NAVIGATION_ROOT': root}))
+    self.before = navigation_settings.read_network_revision()
+    self.assertIsNotNone(self.before)
+    self.pending, self.calls = [], []
     source = OPENPILOT / 'system/ui/lib/wifi_manager.py'
     def thread(*, target, daemon):
       return SimpleNamespace(start=lambda: self.pending.append(target))
     namespace = {
-      'Params': lambda: self.params,
-      'read_network_revision': lambda: self.params.get('ExternalNavigationNetworkRevision') or '',
-      'record_network_action': lambda: self.params.put('ExternalNavigationNetworkRevision', 'manual'),
+      'read_network_revision': navigation_settings.read_network_revision,
+      'record_network_action': navigation_settings.record_network_action,
       'threading': SimpleNamespace(Thread=thread),
       'cloudlog': SimpleNamespace(warning=lambda *args: None),
       'new_method_call': lambda *args: args,
@@ -292,7 +284,7 @@ class TestAutomaticWifiOperations(unittest.TestCase):
     self.manager._set_connecting = lambda ssid: self.calls.append(('connecting', ssid))
     self.manager._deactivate_connection = lambda ssid: self.calls.append(('deactivate', ssid))
     self.manager._init_wifi_state = lambda: None
-    self.manager._record_manual_network_action = lambda: self.params.put('ExternalNavigationNetworkRevision', 'manual')
+    self.manager._record_manual_network_action = navigation_settings.record_network_action
     def reply(call):
       self.calls.append(('dbus', call))
       return SimpleNamespace(header=SimpleNamespace(message_type='reply'))
@@ -313,33 +305,33 @@ class TestAutomaticWifiOperations(unittest.TestCase):
     self.assertFalse(descriptor.fget(manager))
 
   def test_queued_auto_connection_cannot_steal_manual_target(self):
-    self.manager.activate_connection('weedle-test', manual=False, expected_revision='before')
+    self.manager.activate_connection('weedle-test', manual=False, expected_revision=self.before)
     self.assertEqual(self.calls, [])
-    self.params.put('ExternalNavigationNetworkRevision', 'manual')
+    navigation_settings.record_network_action()
     self.pending.pop()()
     self.assertEqual(self.calls, [])
 
   def test_current_owned_activation_uses_saved_profile(self):
-    self.manager.activate_connection('weedle-test', manual=False, block=True, expected_revision='before')
+    self.manager.activate_connection('weedle-test', manual=False, block=True, expected_revision=self.before)
     self.assertEqual(self.calls[0], ('connecting', 'weedle-test'))
     self.assertEqual(self.calls[1][1][-1], ('/saved/ap', '/device/wlan0', '/'))
     self.assertFalse(self.pending)
-    self.assertFalse(self.params.writes)
+    self.assertEqual(navigation_settings.read_network_revision(), self.before)
 
   def test_close_deactivation_finishes_before_manager_teardown(self):
-    self.manager.set_tethering_active(False, manual=False, block=True, expected_revision='before')
+    self.manager.set_tethering_active(False, manual=False, block=True, expected_revision=self.before)
     self.assertEqual(self.calls, [('deactivate', 'weedle-test')])
     self.assertFalse(self.pending)
-    self.params.put('ExternalNavigationNetworkRevision', 'manual')
+    navigation_settings.record_network_action()
     self.calls.clear()
-    self.manager.set_tethering_active(False, manual=False, block=True, expected_revision='before')
+    self.manager.set_tethering_active(False, manual=False, block=True, expected_revision=self.before)
     self.assertFalse(self.calls)
 
   def test_worker_restores_owned_ap_before_stopping_manager(self):
     from openpilot.sunnypilot.external_navigation import hotspot
     HotspotWorker = hotspot.HotspotWorker
     worker = HotspotWorker.__new__(HotspotWorker)
-    worker.params = self.params
+    worker.params = SimpleNamespace()
     worker._wanted, worker._enabled, worker._closed, worker._ap_ready = False, False, False, False
     calls = []
     class Network:
@@ -366,20 +358,19 @@ class TestAutomaticWifiOperations(unittest.TestCase):
         worker._wanted, worker._enabled, worker._closed = next(states)
     worker._condition = Condition()
     fake = module('wifi_manager', WifiManager=Network)
-    with (patch.dict(sys.modules, {'openpilot.system.ui.lib.wifi_manager': fake}),
-          patch.object(hotspot, 'read_network_revision', lambda: self.params.get('ExternalNavigationNetworkRevision'), create=True)):
+    with patch.dict(sys.modules, {'openpilot.system.ui.lib.wifi_manager': fake}):
       worker._run()
     self.assertEqual([item[0] for item in calls], ['scan', 'activate', 'deactivate', 'stop'])
     for item in calls[1:3]:
       self.assertTrue(item[1]['block'])
       self.assertFalse(item[1]['manual'])
-      self.assertEqual(item[1]['expected_revision'], 'before')
+      self.assertEqual(item[1]['expected_revision'], self.before)
     self.assertFalse(worker._ap_ready)
 
   def test_manual_default_remains_async_and_revokes_automatic_ownership(self):
     self.manager.set_tethering_active(False)
     self.assertFalse(self.calls)
-    self.assertEqual(self.params.get('ExternalNavigationNetworkRevision'), 'manual')
+    self.assertNotEqual(navigation_settings.read_network_revision(), self.before)
     self.pending.pop()()
     self.assertEqual(self.calls, [('deactivate', 'weedle-test')])
 
