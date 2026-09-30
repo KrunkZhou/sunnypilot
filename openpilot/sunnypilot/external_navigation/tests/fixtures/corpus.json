@@ -1,0 +1,32 @@
+{
+  "description": "Synthetic relay-v1 interoperability corpus; PUBLIC TEST KEY, never provision it",
+  "key_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+  "relay_id_hex": "00112233445566778899aabbccddeeff",
+  "boot_hex": "101112131415161718191a1b1c1d1e1f",
+  "challenge_hex": "202122232425262728292a2b2c2d2e2f",
+  "sequence": 7,
+  "expected": {
+    "maneuver_id": 42,
+    "distance_observation": 8,
+    "distance_age_ms": 123,
+    "maneuver_observation": 3,
+    "maneuver_age_ms": 456,
+    "snapshot_dwell_ms": 20,
+    "heartbeat_age_ms": 30,
+    "distance_m": 0,
+    "instruction": "Turn left"
+  },
+  "sha256": {
+    "hello.bin": "78c3e6f6136107cb7373e0b18e499b50ce7eac2788f3b786f49ec205be36de52",
+    "challenge.bin": "3a76d66f8dff3e7d8099fddabf34ab657a8b02524cf756c38cde295a2eb0f77c",
+    "snapshot.bin": "ab78bd41cad1984d18abbe601249d40195843d4476c8a5f3dbe60de563bf8120",
+    "legacy-snapshot.bin": "e9f0f8215f871ee8f76c0ee78ea2db3cba8d17060524c412ad8002d0b4c6e7c6",
+    "disconnected.bin": "679c578c26c7281c3909ba8b29e98f6aa9d0132320460ac292ad7d4386dcf185",
+    "bad-hmac.bin": "00a4b541878cac634e438bb803fd646d7382b2df8bc18ee01212354b2dac0ef3",
+    "bad-reserved.bin": "88b3dd866ba7d9ffacd4d8831d80f45e36330f2ec06162429cf74ae754a48696",
+    "bad-crc.bin": "3412d166a73356461a0f3f4128014e6f7a87cf1dff8cca4d288d37cd4d799dad",
+    "oversized.bin": "2470dab781eb0f76754e7776a23253c8a5ab6b9862845960b3af7df5ef8ca506",
+    "truncated.bin": "fc7bf13fc98fbafe20d8e6202be5fb86440fb273ae95ade909d359f03920fb82",
+    "extended-navigation.bin": "21cbad4f65da88c2b30e78f6ede5409c52b6651c5d9c30d0da87d32db554e4f5"
+  }
+}

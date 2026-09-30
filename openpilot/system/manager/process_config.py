@@ -11,6 +11,7 @@ from openpilot.common.hardware.hw import Paths
 
 from openpilot.sunnypilot.mapd.mapd_manager import MAPD_PATH
 from openpilot.sunnypilot.sms_forwarder import is_supported_device
+from openpilot.sunnypilot.external_navigation.process import ExternalNavigationProcess
 
 from openpilot.sunnypilot.models.helpers import get_active_model_runner
 from openpilot.sunnypilot.sunnylink.utils import sunnylink_need_register, sunnylink_ready, use_sunnylink_uploader
@@ -192,6 +193,8 @@ procs += [
 
   # Backup
   PythonProcess("backup_manager", "openpilot.sunnypilot.sunnylink.backups.manager", and_(only_offroad, sunnylink_ready_shim)),
+
+  ExternalNavigationProcess("external_navigationd", "openpilot.sunnypilot.external_navigation.receiver", always_run),
 
   # mapd
   NativeProcess("mapd", Paths.mapd_root(), ["bash", "-c", f"{MAPD_PATH} > /dev/null 2>&1"], mapd_ready),
