@@ -2,11 +2,16 @@
 
 The receiver never waits on D-Bus. NetworkManager work runs on a separate,
 bounded worker; a manual network action revokes ownership for this road session.
+Ownership and the prior SSID are process-local: after a crash, an already-active
+hotspot is deliberately not adopted, so off-road restoration may require the user.
 """
 import threading
 import time
 from dataclasses import dataclass
 from openpilot.sunnypilot.external_navigation.settings import read_network_revision
+
+# Manager grants 5s before SIGKILL; leave 1s for diagnostic drain and 1s margin.
+CLOSE_TIMEOUT_SECONDS = 3.
 
 
 @dataclass
@@ -87,12 +92,17 @@ class HotspotWorker:
   def is_hotspot_active(self) -> bool:
     return self._ap_ready
 
-  def close(self):
+  def close(self) -> bool:
     with self._condition:
       self._wanted = False
       self._closed = True
       self._condition.notify()
-    self._thread.join(timeout=1)
+    self._thread.join(timeout=CLOSE_TIMEOUT_SECONDS)
+    complete = not self._thread.is_alive()
+    if not complete:
+      from openpilot.common.swaglog import cloudlog
+      cloudlog.warning("External navigation hotspot cleanup timed out; previous Wi-Fi may not be restored")
+    return complete
 
   def _run(self):
     manager = None
@@ -100,7 +110,8 @@ class HotspotWorker:
     try:
       while True:
         with self._condition:
-          self._condition.wait(timeout=0.5)
+          if not self._closed:
+            self._condition.wait(timeout=0.5)
           wanted, enabled, closed = self._wanted, self._enabled, self._closed
         if manager is None and enabled and not closed:
           from openpilot.system.ui.lib.wifi_manager import WifiManager
