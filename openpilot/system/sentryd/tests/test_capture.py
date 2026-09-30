@@ -250,7 +250,32 @@ def test_repeated_session_expires_without_extending_camera_lease(monkeypatch) ->
   )
   capture.capture_repeated(results.append, next_capture=lambda: False)
   assert len(results) == 1
-  assert now[0] == capture_module.MAX_CAPTURE_LEASE_SECONDS
+  assert 0 < capture_module.MAX_CAPTURE_LEASE_SECONDS - now[0] <= capture_module.MIN_REPEAT_CAPTURE_SECONDS
+  assert "SentryCaptureLease" not in params.values
+
+
+def test_near_expired_session_does_not_consume_next_capture(monkeypatch) -> None:
+  import openpilot.system.sentryd.capture as capture_module
+  now = [0.0]
+  monkeypatch.setattr(capture_module.time, "sleep", lambda seconds: now.__setitem__(0, now[0] + seconds))
+  params = FakeParams()
+  results, requests = [], []
+
+  class Encoder:
+    def encode(self, _frame, _timeout, _abort):
+      return MediaData(b"\xff\xd8frame\xff\xd9", 4, 2)
+
+  def completed(result):
+    results.append(result)
+    now[0] = capture_module.MAX_CAPTURE_LEASE_SECONDS - 0.1
+
+  capture = SentryCapture(
+    params=params, volatile_params=params, encoder=Encoder(), clock=lambda: now[0], lock_factory=Lock,
+    client_factory=lambda *_args: Client(), available_streams=lambda *_args, **_kwargs: CAMERA_STREAMS_FOR_TEST,
+  )
+  capture.capture_repeated(completed, next_capture=lambda: requests.append(True) or True)
+  assert len(results) == 1 and set(results[0].media) == {"wide", "cabin"}
+  assert not requests  # The daemon keeps the unconsumed revision for a fresh lease.
   assert "SentryCaptureLease" not in params.values
 
 

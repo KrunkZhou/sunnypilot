@@ -7,7 +7,7 @@ import pytest
 from openpilot.common.swaglog import cloudlog
 from openpilot.system.sentryd import capture as capture_module
 from openpilot.system.sentryd.diagnostics import bounded_diagnostic, log_capture_diagnostic
-from openpilot.system.sentryd.store import MediaData
+from openpilot.system.sentryd.store import MediaData, SentryStore
 from openpilot.system.sentryd.tests.test_capture import Client, FakeParams, Lock
 
 
@@ -17,6 +17,7 @@ def setup(monkeypatch):
   records = []
   params = FakeParams()
   monkeypatch.setattr(capture_module, "MAX_CAPTURE_LEASE_SECONDS", 0.5)
+  monkeypatch.setattr(capture_module, "MIN_REPEAT_CAPTURE_SECONDS", 0.05)
   monkeypatch.setattr(capture_module, "CAMERA_WARMUP_SECONDS", 0.0)
   monkeypatch.setattr(capture_module.time, "sleep", lambda seconds: now.__setitem__(0, now[0] + seconds))
   monkeypatch.setattr(cloudlog, "event", lambda event, **fields: records.append((event, fields, cloudlog.get_ctx())))
@@ -62,7 +63,7 @@ def test_capture_timeout_reports_last_reached_stage_without_poll_spam(setup, mon
   assert "SentryCaptureLease" not in setup.params.values
 
 
-def test_wide_encoder_timeout_preserves_cabin_capture_budget(setup):
+def test_wide_encoder_timeout_retries_without_replacing_cabin(setup):
   timeouts = []
 
   class Encoder:
@@ -75,13 +76,15 @@ def test_wide_encoder_timeout_preserves_cabin_capture_budget(setup):
 
   result = setup.make(encoder=Encoder()).capture()
   details = summary(setup)
-  assert result.omissions == {"wide": "capture_timeout"}
-  assert set(result.media) == {"cabin"}
-  assert timeouts == [0.25, 0.25]
+  assert not result.omissions
+  assert set(result.media) == {"wide", "cabin"}
+  assert timeouts == pytest.approx([0.25, 0.125, 0.20])
   assert details["encoder_timeout_role"] == "wide"
-  assert details["cameras"]["wide"]["stage"] == "jpeg_encode"
+  assert details["cameras"]["wide"]["stage"] == "complete"
   assert details["cameras"]["wide"]["frame_received"] is True
-  assert details["cameras"]["wide"]["error"]["exception_type"] == "TimeoutExpired"
+  assert details["cameras"]["wide"]["error"] is None
+  assert details["cameras"]["wide"]["capture_failures"] == 1
+  assert details["cameras"]["wide"]["receive_attempts"] == 2
   assert details["cameras"]["cabin"]["receive_attempts"] == 1
   assert details["cameras"]["cabin"]["frame_received"] is True
   assert details["cameras"]["cabin"]["outcome"] == "complete"
@@ -283,7 +286,7 @@ def test_both_encoder_timeouts_still_attempt_both_cameras_within_lease(setup):
 
   result = setup.make(encoder=Encoder()).capture()
   assert result.omissions == {"wide": "capture_timeout", "cabin": "capture_timeout"}
-  assert timeouts == [0.25, 0.25]
+  assert len(timeouts) >= 2 and max(timeouts) <= 0.25
   assert all(details["frame_received"] for details in summary(setup)["cameras"].values())
   assert setup.now[0] == 0.5 and "SentryCaptureLease" not in setup.params.values
 
@@ -340,6 +343,121 @@ def test_connection_health_failure_preserves_completed_sibling(setup):
   assert connections == {wide: 2, capture_module.CAMERA_STREAMS["cabin"]: 1}
   assert summary(setup)["cameras"]["cabin"]["receive_attempts"] == 1
   assert "SentryCaptureLease" not in setup.params.values
+
+
+@pytest.mark.parametrize("failure_stage", ["receive", "encode"])
+@pytest.mark.parametrize("failures", [1, 5, 6])
+def test_capture_retries_at_most_five_times_and_keeps_successful_sibling(setup, failure_stage, failures):
+  wide = capture_module.CAMERA_STREAMS["wide"]
+  received = dict.fromkeys(capture_module.CAMERA_STREAMS.values(), 0)
+  encoded = dict.fromkeys(capture_module.CAMERA_STREAMS.values(), 0)
+
+  class Camera(Client):
+    def __init__(self, stream):
+      self.stream = stream
+
+    def recv(self, _timeout):
+      received[self.stream] += 1
+      if failure_stage == "receive" and self.stream == wide and received[wide] <= failures:
+        raise OSError("transient receive failure")
+      return self.stream
+
+  class Encoder:
+    def encode(self, stream, _timeout, _abort):
+      encoded[stream] += 1
+      if failure_stage == "encode" and stream == wide and encoded[wide] <= failures:
+        raise RuntimeError("transient encode failure")
+      return MediaData(b"\xff\xd8image\xff\xd9", 4, 2)
+
+  result = setup.make(client_factory=lambda _name, stream, _conflate: Camera(stream), encoder=Encoder()).capture()
+  assert received[wide] == min(failures + 1, 6)
+  assert encoded[capture_module.CAMERA_STREAMS["cabin"]] == 1
+  assert set(result.media) == ({"wide", "cabin"} if failures < 6 else {"cabin"})
+  assert result.omissions == ({} if failures < 6 else {"wide": "capture_failed"})
+  assert sum(event == "sentry_capture_retry" for event, *_ in setup.records) == min(failures, 5)
+  assert setup.now[0] < 0.5 and "SentryCaptureLease" not in setup.params.values
+
+
+def test_stalled_encodes_are_bounded_without_extending_lease(setup, monkeypatch):
+  monkeypatch.setattr(capture_module, "MAX_CAPTURE_LEASE_SECONDS", 20.0)
+  attempts = []
+
+  class Encoder:
+    def encode(self, _frame, timeout, _abort):
+      attempts.append(timeout)
+      setup.now[0] += timeout
+      raise subprocess.TimeoutExpired("ffmpeg", timeout)
+
+  result = setup.make(encoder=Encoder()).capture()
+  assert not result.media
+  assert result.omissions == {"wide": "capture_timeout", "cabin": "capture_timeout"}
+  assert max(attempts) == capture_module.MAX_ENCODE_ATTEMPT_SECONDS
+  assert all(1 <= details["capture_failures"] <= 6 for details in summary(setup)["cameras"].values())
+  assert setup.now[0] <= 20.0 and "SentryCaptureLease" not in setup.params.values
+
+
+def test_retrying_revision_is_not_uploadable_until_final_capture_result(setup, tmp_path):
+  event_id = "bd05d864-dce9-4d8f-9f3a-e4f610d28370"
+  timestamp = "2026-09-29T12:00:00+00:00"
+  store = SentryStore(tmp_path / "outbox.sqlite3")
+  store.begin_revision(event_id=event_id, revision=1, kind="warning", source="motion",
+                       episode_started_at=timestamp, detected_at=timestamp, message="Motion detected")
+  attempts = []
+
+  class Encoder:
+    def encode(self, _frame, _timeout, _abort):
+      attempts.append(True)
+      assert store.revision_state(event_id, 1) == "capturing"
+      assert store.next_pending(0) is None
+      assert store.retry_terminal() == 0
+      assert store.next_pending(0) is None
+      if len(attempts) <= 3:
+        raise RuntimeError("transient encoder failure")
+      return MediaData(b"\xff\xd8image\xff\xd9", 4, 2)
+
+  def completed(result):
+    assert set(result.media) == {"wide", "cabin"} and not result.omissions
+    store.finish_capture(event_id, 1, result.media, result.omissions)
+
+  try:
+    setup.make(encoder=Encoder()).capture_repeated(completed)
+    queued = store.next_pending(0)
+    assert queued is not None and queued.metadata["capture_status"] == "complete"
+    assert queued.event_id == event_id and queued.revision == 1
+    assert {item.role for item in queued.media} == {"wide", "cabin"}
+    assert len(attempts) == 5
+  finally:
+    store.close()
+
+
+@pytest.mark.parametrize("reason", ["ignition_on", "stale_capture"])
+def test_retry_stops_on_cancellation_without_discarding_sibling(setup, reason):
+  wide = capture_module.CAMERA_STREAMS["wide"]
+  abort = [False]
+  attempts = []
+
+  class Camera(Client):
+    def __init__(self, stream):
+      self.stream = stream
+
+    def recv(self, _timeout):
+      return self.stream
+
+  class Encoder:
+    def encode(self, stream, _timeout, _abort):
+      attempts.append(stream)
+      if stream == wide:
+        raise RuntimeError("try again")
+      if reason == "ignition_on":
+        setup.params.values["IsOffroad"] = False
+      else:
+        abort[0] = True
+      return MediaData(b"\xff\xd8cabin\xff\xd9", 4, 2)
+
+  result = setup.make(client_factory=lambda _name, stream, _conflate: Camera(stream), encoder=Encoder()).capture(lambda: abort[0])
+  assert attempts == list(capture_module.CAMERA_STREAMS.values())
+  assert set(result.media) == {"cabin"} and result.omissions == {"wide": reason}
+  assert setup.now[0] < 0.5 and "SentryCaptureLease" not in setup.params.values
 
 
 def test_unavailable_cabin_does_not_shorten_wide_encoding_budget(setup):

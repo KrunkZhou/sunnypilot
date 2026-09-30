@@ -29,6 +29,9 @@ CAMERA_STREAMS = {
   "cabin": VisionStreamType.VISION_STREAM_CABIN,
 }
 CAMERA_WARMUP_SECONDS = 4.0
+MAX_CAMERA_RETRIES = 5
+MAX_ENCODE_ATTEMPT_SECONDS = 2.0
+MIN_REPEAT_CAPTURE_SECONDS = 2 * MAX_ENCODE_ATTEMPT_SECONDS
 
 
 @dataclass(frozen=True)
@@ -119,8 +122,9 @@ class SentryCapture:
         if next_capture is None:
           return
         # Keep cameras warm while the main loop waits for the next eligible
-        # motion capture. Never extend a lease: yield the lock after 20 seconds.
-        while self.clock() < deadline:
+        # motion capture. Yield before expiry if a new pair would have too
+        # little encoding time, leaving its request queued for a fresh lease.
+        while deadline - self.clock() >= MIN_REPEAT_CAPTURE_SECONDS:
           if abort_callback() or not self._is_offroad():
             return
           if next_capture():
@@ -142,6 +146,8 @@ class SentryCapture:
     stage_started_at: dict[str, float] = {}
     stage_seconds: dict[str, dict[str, float]] = {role: {} for role in CAMERA_STREAMS}
     receive_attempts = dict.fromkeys(CAMERA_STREAMS, 0)
+    capture_failures = dict.fromkeys(CAMERA_STREAMS, 0)
+    last_failure: dict[str, str] = {}
     frame_received = dict.fromkeys(CAMERA_STREAMS, False)
     connected_roles = set(clients)
     errors: dict[str, object] = {}
@@ -161,6 +167,18 @@ class SentryCapture:
 
     def record_error(role: str, exc: Exception) -> None:
       errors[role] = bounded_diagnostic({"exception_type": type(exc).__name__, "error_detail": str(exc)})
+
+    def failed_attempt(role: str, reason: str, exc: Exception) -> None:
+      record_error(role, exc)
+      capture_failures[role] += 1
+      last_failure[role] = reason
+      if capture_failures[role] > MAX_CAMERA_RETRIES:
+        omissions[role] = reason
+      else:
+        # Keep this revision private until the pair is complete or retries/the
+        # original lease are exhausted. A successful sibling is never retaken.
+        log_capture_diagnostic("sentry_capture_retry", role=role, reason=reason,
+                               retry=capture_failures[role], remaining_seconds=max(0.0, deadline - self.clock()))
 
     for role in CAMERA_STREAMS:
       set_stage(role, "warmup" if role in clients else "discovery")
@@ -224,8 +242,7 @@ class SentryCapture:
           receive_attempts[role] += 1
           frame = client.recv(max(0, min(100, int(receive_remaining * 1000))))
         except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as exc:
-          record_error(role, exc)
-          omissions[role] = "capture_failed"
+          failed_attempt(role, "capture_failed", exc)
           continue
         if frame is None:
           continue
@@ -238,10 +255,13 @@ class SentryCapture:
           # Leave each connected unfinished camera a share of the lease. Do
           # not reserve encoding time for a camera that never connected.
           pending_cameras = sum(pending_role not in media and pending_role not in omissions for pending_role in clients)
-          encode_timeout = remaining / pending_cameras
+          # A stuck child must not consume the entire role budget on its first
+          # try. Yield to the sibling, then retry using a fresh frame/encoder.
+          encode_timeout = min(MAX_ENCODE_ATTEMPT_SECONDS, remaining / pending_cameras)
           with cloudlog.ctx(sentry_camera_role=role):
             media[role] = self.encoder.encode(frame, encode_timeout, lambda: abort_callback() or not self._is_offroad())
           set_stage(role, "complete")
+          errors.pop(role, None)
         except CaptureAborted as exc:
           record_error(role, exc)
           reason = "ignition_on" if not self._is_offroad() else "stale_capture"
@@ -250,19 +270,17 @@ class SentryCapture:
               omissions[pending_role] = reason
           break
         except subprocess.TimeoutExpired as exc:
-          record_error(role, exc)
           encoder_timeout_role = role
-          omissions[role] = "capture_timeout"
+          failed_attempt(role, "capture_timeout", exc)
         except (OSError, RuntimeError, ValueError) as exc:
-          record_error(role, exc)
-          omissions[role] = "capture_failed"
+          failed_attempt(role, "capture_failed", exc)
       sleep_remaining = deadline - self.clock()
       if sleep_remaining > 0:
         time.sleep(min(0.05, sleep_remaining))
 
     for role in CAMERA_STREAMS:
       if role not in media and role not in omissions:
-        omissions[role] = "capture_timeout" if role in connected_roles else "camera_unavailable"
+        omissions[role] = last_failure.get(role, "capture_timeout" if role in connected_roles else "camera_unavailable")
     diagnostic_finished_at = time.monotonic()
     for role in CAMERA_STREAMS:
       stage = stages[role]
@@ -271,6 +289,7 @@ class SentryCapture:
                            encoder_timeout_role=encoder_timeout_role, cameras={role: {
                              "stage": stages[role], "stage_seconds": stage_seconds[role],
                              "receive_attempts": receive_attempts[role], "frame_received": frame_received[role],
+                             "capture_failures": capture_failures[role],
                              "outcome": "complete" if role in media else omissions[role],
                              "error": errors.get(role),
                            } for role in CAMERA_STREAMS})
