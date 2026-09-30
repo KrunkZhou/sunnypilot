@@ -4,7 +4,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 
-PROFILE = 'external-turn-v1-40m-15m-1000ms'
 LEFT, RIGHT = 1, 2  # cereal.Desire turnLeft / turnRight (never laneChange/keepRight)
 TURN_TYPES = {1: LEFT, 2: RIGHT, 20: LEFT, 21: RIGHT}
 RIGHT_BRANCH_TYPES = (14, 23, 53)
@@ -46,7 +45,7 @@ class TurnPolicy:
     self.observation = self.distance = None
     self.armed = False
 
-  def update(self, sample: Sample | None, *, mode: int, verified: bool, lateral_active: bool,
+  def update(self, sample: Sample | None, *, mode: int, lateral_active: bool,
              speed: float, speed_limit: float, manual: bool = False) -> Decision:
     reason = None
     if mode != 1:
@@ -73,8 +72,8 @@ class TurnPolicy:
       return self.status
 
     assert sample is not None
-    assisted = mode == 1 and verified
-    prefix = 'assisted' if assisted else 'guidance_only_unvalidated_model'
+    assisted = True  # Mode and all runtime eligibility checks passed above.
+    prefix = 'assisted'
     if sample.identity in self.consumed:
       self.status = Decision(reason=f'{prefix}_already_consumed', assisted=assisted)
       return self.status
@@ -98,7 +97,7 @@ class TurnPolicy:
       self.consumed.add(sample.identity)
       self.armed = False
       proposal = TURN_TYPES[sample.maneuver_type]
-      self.status = Decision(proposal, proposal if assisted else 0, f'{prefix}_turn_proposed', assisted)
+      self.status = Decision(proposal, proposal, f'{prefix}_turn_proposed', assisted)
       return self.status
     else:
       self.armed = False

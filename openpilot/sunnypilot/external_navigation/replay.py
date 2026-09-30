@@ -1,4 +1,4 @@
-"""Development tools. Reports never grant on-road model validation automatically."""
+"""Offline policy and recorded-camera model comparison tools."""
 from __future__ import annotations
 
 import argparse
@@ -18,8 +18,9 @@ def replay_policy(rows):
       sample_data = dict(sample_data)
       sample_data['identity'] = tuple(sample_data['identity'])
     decision = policy.update(Sample(**sample_data) if sample_data else None,
-                             mode=1, verified=False, **row['vehicle'])
-    yield {'timestamp': row.get('timestamp'), **asdict(decision)}
+                             mode=1, **row['vehicle'])
+    # Report proposed policy outputs; this offline tool never drives a model.
+    yield {'timestamp': row.get('timestamp'), **asdict(decision), 'desire': 0, 'assisted': False}
 
 
 def compare_outputs(neutral, hinted):

@@ -43,7 +43,7 @@ def status_text():
   if sm.alive["modelDataV2SP"]:
     hint = sm["modelDataV2SP"]
     if hint.navigationAssisted:
-      return "Assisted turns · validated profile"
+      return "Assisted turns · available"
     if hint.navigationHintStatus:
       return hint.navigationHintStatus.replace("_", " ")
   return "Guidance only · assistance unavailable"

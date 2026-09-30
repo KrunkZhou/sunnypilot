@@ -17,7 +17,7 @@ class NavigationLayoutMici(NavScroller):
       self._mode, self._status,
       GreyBigButton("Waveshare relay", "CarPlay → BLE → Wi-Fi"),
       GreyBigButton("hotspot", "Automatic on-road; manual changes respected"),
-      GreyBigButton("assisted turns", "Requires a validated vehicle and model"),
+      GreyBigButton("assisted turns", "Fresh low-speed turns while lateral control is active"),
       GreyBigButton("highway exits", "Guidance only · no automatic lane changes"),
     ])
 

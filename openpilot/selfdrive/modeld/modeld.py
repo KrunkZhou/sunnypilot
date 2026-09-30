@@ -26,7 +26,7 @@ from openpilot.common.transformations.camera import DEVICE_CAMERAS
 from openpilot.system.camerad.cameras.nv12_info import get_nv12_info
 from openpilot.common.transformations.model import get_warp_matrix
 from openpilot.selfdrive.controls.lib.desire_helper import DesireHelper
-from openpilot.sunnypilot.external_navigation.model_adapter import ExternalNavigationHints, load_with_identity
+from openpilot.sunnypilot.external_navigation.model_adapter import ExternalNavigationHints
 from openpilot.selfdrive.controls.lib.drive_helpers import get_accel_from_plan, should_stop, smooth_value, get_curvature_from_plan
 from openpilot.selfdrive.modeld.parse_model_outputs import Parser
 from openpilot.selfdrive.modeld.compile_modeld import make_input_queues, nv12_copy_size, MODELD_INPUTS
@@ -181,7 +181,8 @@ class ModelState(ModelStateBase):
 
   def __init__(self, cam_w: int, cam_h: int, chestnut: bool):
     ModelStateBase.__init__(self)
-    jits, self.navigation_model_sha256 = load_with_identity(load_oob, open_file_chunked(modeld_pkl_path(chestnut)))
+    with open_file_chunked(modeld_pkl_path(chestnut)) as model_file:
+      jits = load_oob(model_file)
     input_devices = jits['input_devices']
     self.model_device = input_devices['model']
     metadata = jits['metadata']
@@ -352,7 +353,7 @@ def main(demo=False):
   prev_action = log.ModelDataV2.Action()
 
   DH = DesireHelper()
-  navigation_hints = ExternalNavigationHints(CP, "stock")
+  navigation_hints = ExternalNavigationHints()
   RELC = RoadEdgeLaneChangeController()
 
   while True:

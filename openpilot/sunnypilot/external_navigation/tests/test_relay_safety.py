@@ -1,4 +1,4 @@
-"""Independent reconnect/driver-priority regressions; no activation evidence is supplied."""
+"""Independent reconnect, freshness and driver-priority regressions."""
 from pathlib import Path
 import struct
 from types import SimpleNamespace
@@ -114,22 +114,20 @@ class AdapterSafetyTests(unittest.TestCase):
     self.hints = ExternalNavigationHints.__new__(ExternalNavigationHints)
     self.hints.sm = Subscriber(externalNavigationSP=self.nav)
     self.hints.policy = TurnPolicy()
-    self.hints.pipeline, self.hints.car_sha256, self.hints.code_sha256 = 'stock', 'car', 'code'
-    self.hints.records = []  # Never enable a model using invented closed-course records.
     self.hints.mode, self.hints.next_parameter_read = 0, 0
     self.hints.last_model = self.hints.last_transport = None
     self.car = SimpleNamespace(steeringPressed=False, brakePressed=False, leftBlinker=False, rightBlinker=False,
                                leftBlindspot=False, rightBlindspot=False, vEgo=4.)
     self.sm = Subscriber(carState=self.car, carControl=SimpleNamespace(latActive=True))
     self.dh = SimpleNamespace(lane_change_state=0, desire=0, lane_turn_controller=SimpleNamespace(lane_turn_value=8.))
-    self.model = SimpleNamespace(navigation_model_sha256='unvalidated-model')
+    self.model = object()
 
   def update(self, distance=None):
     if distance is not None:
       self.nav.nextDistance = distance
       self.nav.distanceObservation += 1
     desire = self.hints.update(self.sm, self.dh, self.model)
-    self.assertEqual(desire, self.dh.desire)  # With no validation, navigation never affects the model.
+    self.assertEqual(desire, self.dh.desire or self.hints.decision.desire)
     return self.hints.decision
 
   def test_new_ble_token_or_receiver_restart_discards_armed_state(self):

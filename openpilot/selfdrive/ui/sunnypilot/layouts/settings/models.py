@@ -99,7 +99,7 @@ class ModelsLayout(Widget):
                                                   param="LaneTurnDesire")
 
     self.navigation_item = button_item("External navigation", lambda: MODE_LABELS[navigation_mode()],
-                                       lambda: navigation_status() + ". Assisted turns require a validated vehicle/model; highway exits are guidance only.",
+                                       lambda: navigation_status() + ". Low-speed turns with active lateral control; highway exits are guidance only.",
                                        self._cycle_navigation_mode)
     self.navigation_item.set_enabled(lambda: ui_state.is_offroad())
 

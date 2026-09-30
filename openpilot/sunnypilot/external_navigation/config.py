@@ -51,12 +51,3 @@ def load_config(path: Path | None = None) -> tuple[bytes, bytes]:
   if key == bytes(range(32)):
     raise ValueError('public_test_key')
   return relay, key
-
-
-def validation_records(path: Path | None = None) -> list[dict]:
-  try:
-    data = read_private_json(path or navigation_root() / 'private/validation.json')
-    records = data.get('closed_course_validations', [])
-    return records if isinstance(records, list) and len(records) <= 32 else []
-  except (OSError, ValueError, TypeError):
-    return []

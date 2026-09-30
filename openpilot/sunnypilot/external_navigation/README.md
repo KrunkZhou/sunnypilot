@@ -2,7 +2,7 @@
 
 The Waveshare relays complete CarPlay BLE navigation snapshots over authenticated UDP to the Comma hotspot. The receiver publishes `externalNavigationSP` at 5 Hz, using Event's existing reserved ordinal 136. This is optional input: neither model pipeline includes its subscriber in normal model health checks.
 
-The settings choices are **Off** and **Assisted turns**. Selecting Assisted turns enables guidance reception and on-road hotspot ownership. Automatic model turn inputs remain unavailable unless the exact local vehicle/model/implementation profile has closed-course validation. There is no live Shadow mode. Highway right-branch intent is advisory only; no navigation lane-change input is generated. The separate PC-only replay launcher can compare `keepRight` offline.
+The settings choices are **Off** and **Assisted turns**. Selecting Assisted turns enables guidance reception and on-road hotspot ownership. Selecting Assisted turns allows eligible low-speed model turn inputs without a vehicle/model approval file. There is no live Shadow mode. Highway right-branch intent is advisory only; no navigation lane-change input is generated. The separate PC-only replay launcher can compare `keepRight` offline.
 
 ## Storage and installation
 
@@ -10,7 +10,6 @@ All persistent files live under `/data/rtzs/navigation/` on AGNOS. Development h
 
 - `config/schema_version`: plain `1` plus newline; `config/mode`: plain `0` (Off) or `1` (Assisted turns) plus newline. A fixed `config.lock` protects readers and atomic field replacement. Missing, malformed, unsupported or insecure settings fail Off.
 - `private/relay.json`: `relay_id` (32 hex characters) and `key` (64 hex characters). Use the same independently generated key on the Waveshare. The public fixture key is explicitly rejected. The Wi-Fi password is not a relay authentication key.
-- `private/validation.json`: optional `closed_course_validations` list. No approved entries are shipped. Every entry must match `car_sha256`, `model_sha256`, `pipeline`, `implementation_sha256`, `profile`, and have `closed_course_passed: true`. Evidence must establish the exact vehicle/model's behavior before such an entry is installed; replay output never creates one.
 - `logs/navigation-*.jsonl`: private, bounded receive diagnostics, at most 20 files of approximately 2 MiB each. Keys and raw authenticated packets are excluded. A four-record replaceable queue keeps file IO outside the receiver.
 
 Navigation directories must be owned by the running user with mode 0700; files are 0600. Manual Wi-Fi ownership revisions are transient in `/dev/shm/rtzs-navigation-revision` (host `runtime/network-revision`). Failed revision tracking disables automatic Wi-Fi ownership.
@@ -31,7 +30,7 @@ A captured authenticated old HELLO can interrupt relay availability by changing 
 
 ## Validation and development replay
 
-Run `python -m unittest discover -s openpilot/sunnypilot/external_navigation/tests -v`. The portable tests cover the shared Java/C++ packet corpus, real localhost UDP, malformed/authentication/reset cases, age progression, manual priority, both pipeline call sites, exact activation identity, private files, hotspot ownership and UI geometry. Install pycapnp 2.1.0 to include the source-schema round-trip test.
+Run `python -m unittest discover -s openpilot/sunnypilot/external_navigation/tests -v`. The portable tests cover the shared Java/C++ packet corpus, real localhost UDP, malformed/authentication/reset cases, age progression, manual priority, both pipeline call sites, approval-independent turn eligibility, private files, hotspot ownership and UI geometry. Install pycapnp 2.1.0 to include the source-schema round-trip test.
 
 Policy-only replay accepts JSONL with `sample` fields matching `policy.Sample`, and `vehicle` containing `lateral_active`, `speed`, `speed_limit`, and optional `manual`. It never emits active desires:
 
@@ -49,4 +48,4 @@ python -m openpilot.sunnypilot.external_navigation.replay camera \
 
 The tool runs neutral and hinted modeld in separate existing replay namespaces. It writes paired frame outputs and differences in lateral position, predicted velocity and desired acceleration. `--pipeline tinygrad`, `--hint turnLeft`, and `--hint turnRight` are also supported. `replay compare neutral.jsonl hinted.jsonl` compares existing exports. Exact frame IDs and trajectory shapes must match. The research launcher refuses vehicle hardware and non-replay invocation; it is not registered with manager.
 
-Host tests and schema checks do not validate physical Wi-Fi/BLE coexistence, live end-to-end latency, recorded-camera model behavior, closed-course turns or a one-hour soak. Until those measurements exist the validation registry stays empty and installed behavior is guidance-only.
+Host tests and schema checks do not validate physical Wi-Fi/BLE coexistence, live end-to-end latency, recorded-camera model behavior, closed-course turns or a one-hour soak. Assisted turns uses the runtime checks above; replay and host checks do not establish actual driving behavior.

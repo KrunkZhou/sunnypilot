@@ -10,7 +10,7 @@ class PolicyTests(unittest.TestCase):
     return replace(sample, **changes)
 
   def step(self, policy, sample, **changes):
-    args = {'mode': 1, 'verified': True, 'lateral_active': True, 'speed': 4., 'speed_limit': 8.}
+    args = {'mode': 1, 'lateral_active': True, 'speed': 4., 'speed_limit': 8.}
     args.update(changes)
     return policy.update(sample, **args)
 
@@ -54,14 +54,14 @@ class PolicyTests(unittest.TestCase):
       self.step(policy, sample)
       self.assertEqual(self.step(policy, self.sample(10, 3)).desire, 0)
 
-  def test_unvalidated_is_guidance_only(self):
+  def test_assisted_mode_emits_turn_without_approval(self):
     policy = TurnPolicy()
-    self.step(policy, self.sample(), verified=False)
-    result = self.step(policy, self.sample(10, 2), verified=False)
+    self.step(policy, self.sample())
+    result = self.step(policy, self.sample(10, 2))
     self.assertEqual(result.proposal, 1)
-    self.assertEqual(result.desire, 0)
-    self.assertIn('unvalidated_model', result.reason)
-    self.assertNotIn('shadow', result.reason)
+    self.assertEqual(result.desire, 1)
+    self.assertTrue(result.assisted)
+    self.assertEqual(result.reason, 'assisted_turn_proposed')
 
   def test_no_highway_lanechange_or_other_desires(self):
     for maneuver in range(256):

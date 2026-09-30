@@ -35,7 +35,7 @@ from openpilot.common.transformations.model import get_warp_matrix
 from openpilot.system import sentry
 from openpilot.system.camerad.cameras.nv12_info import get_nv12_info
 from openpilot.selfdrive.controls.lib.desire_helper import DesireHelper
-from openpilot.sunnypilot.external_navigation.model_adapter import ExternalNavigationHints, load_with_identity
+from openpilot.sunnypilot.external_navigation.model_adapter import ExternalNavigationHints
 from openpilot.selfdrive.controls.lib.drive_helpers import get_accel_from_plan, smooth_value
 from openpilot.selfdrive.modeld.modeld import ChestnutState
 
@@ -118,7 +118,8 @@ class ModelState(ModelStateBase):
 
   def _init_combined(self, pkl_path, cam_w, cam_h, bundle):
     cloudlog.warning(f"loading combined pkl: {pkl_path}")
-    jits, self.navigation_model_sha256 = load_with_identity(load_oob, open_file_chunked(pkl_path))
+    with open_file_chunked(pkl_path) as model_file:
+      jits = load_oob(model_file)
 
     metadata = jits['metadata']
     self.WARP_DEV = metadata.get('warp_dev', 'QCOM') if COMMA_HARDWARE else 'CPU'
@@ -421,7 +422,7 @@ def main(demo=False):
   prev_action = log.ModelDataV2.Action()
 
   DH = DesireHelper()
-  navigation_hints = ExternalNavigationHints(CP, "tinygrad")
+  navigation_hints = ExternalNavigationHints()
   meta_constants = load_meta_constants()
   RELC = RoadEdgeLaneChangeController()
 

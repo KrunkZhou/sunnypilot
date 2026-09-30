@@ -171,7 +171,7 @@ class TestNavigationUI(unittest.TestCase):
     self.nav.distanceAgeMs = 800
     self.render()
     self.assertIn('35 m', self.drawn[0][0])
-    self.assertIn('validated', self.ui.status_text())
+    self.assertEqual(self.ui.status_text(), 'Assisted turns · available')
 
   def test_alerts_off_and_unavailable_navigation_have_priority(self):
     self.alert.alertSize = 1

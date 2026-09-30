@@ -3,7 +3,7 @@ import os
 
 
 class ReplayHints:
-  def __init__(self, CP, pipeline):
+  def __init__(self):
     self.frame = int(os.environ['EXTERNAL_NAV_REPLAY_FRAME'])
     self.hint = int(os.environ['EXTERNAL_NAV_REPLAY_HINT'])
     if self.hint not in (0, 1, 2, 6):
