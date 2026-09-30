@@ -65,15 +65,18 @@ class SMSForwarder:
     current_iccid = self.modem.current_iccid()
     if not current_iccid:
       return
+    unavailable_storage = set()
     for message in self.store.cleanup_messages():
       if message.sim_iccid != current_iccid:
         continue
-      retry = False
       for location in message.locations:
+        if location.storage in unavailable_storage:
+          continue
         read = self.modem.read(location.storage, location.index)
         if read.status == "retry":
-          retry = True
-          break
+          # Retry each unavailable storage next poll without blocking the other storage.
+          unavailable_storage.add(location.storage)
+          continue
         if read.status == "missing":
           self.store.discard_location(location)
           continue
@@ -84,12 +87,13 @@ class SMSForwarder:
         if not matches:
           # The slot was reused. Forget our stale reference but never delete the new message.
           self.store.discard_location(location)
-        elif self.modem.delete(location.storage, location.index):
-          self.store.discard_location(location)
         else:
-          retry = True
-          break
-      if not retry and self.store.finish_cleanup(message.message_id):
+          deleted = self.modem.delete(location.storage, location.index)
+          if deleted:
+            self.store.discard_location(location)
+          elif deleted is None:
+            unavailable_storage.add(location.storage)
+      if self.store.finish_cleanup(message.message_id):
         cloudlog.info("Removed acknowledged SIM message from the local queue")
 
   def run(self, stop_event: threading.Event) -> None:
@@ -102,9 +106,6 @@ class SMSForwarder:
       if now >= next_scan:
         self.scan()
         next_scan = now + POLL_INTERVAL
-      if now >= next_cleanup:
-        self.cleanup()
-        next_cleanup = now + POLL_INTERVAL
       if now >= next_upload:
         success = self.uploader.upload_once()
         if success is False:
@@ -112,6 +113,9 @@ class SMSForwarder:
         else:
           retry_backoff.reset()
           next_upload = now + (1.0 if success else POLL_INTERVAL)
+      if now >= next_cleanup:
+        self.cleanup()
+        next_cleanup = now + POLL_INTERVAL
       deadline = min(next_scan, next_cleanup, next_upload)
       stop_event.wait(max(0.1, min(1.0, deadline - time.monotonic())))
 

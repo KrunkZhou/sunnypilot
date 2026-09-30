@@ -97,20 +97,23 @@ class SMSModem:
       return ""
 
   def scan(self) -> list[StoredPDU] | None:
+    """Return messages from available storage, or None if no storage could be listed."""
     mode = self.client.command("AT+CMGF=0")
     if mode is None or not mode.ok:
       return None
     messages = []
+    listed_storage = False
     for storage in ("SM", "ME"):
       selected = self.client.command(f'AT+CPMS="{storage}"')
       if selected is None or not selected.ok:
         continue
       response = self.client.command("AT+CMGL=4")
-      if response is None:
-        return None
-      if response.ok:
-        messages.extend(_parse_cmgl(storage, response.lines))
-    return messages
+      if response is None or not response.ok:
+        # A busy or unavailable storage must not discard reads from the other storage.
+        continue
+      listed_storage = True
+      messages.extend(_parse_cmgl(storage, response.lines))
+    return messages if listed_storage else None
 
   def read(self, storage: str, index: int) -> PDURead:
     if storage not in ("SM", "ME") or index < 0:
@@ -129,14 +132,17 @@ class SMSModem:
     raw_pdu = _find_pdu(response.lines)
     return PDURead("found", raw_pdu) if raw_pdu else PDURead("missing")
 
-  def delete(self, storage: str, index: int) -> bool:
+  def delete(self, storage: str, index: int) -> bool | None:
+    """Return success, False for an explicit error, or None when the modem is unavailable."""
     if storage not in ("SM", "ME") or index < 0:
       return False
     selected = self.client.command(f'AT+CPMS="{storage}"')
-    if selected is None or not selected.ok:
+    if selected is None:
+      return None
+    if not selected.ok:
       return False
     response = self.client.command(f"AT+CMGD={index}")
-    return response is not None and response.ok
+    return response.ok if response is not None else None
 
 
 def pdu_digest(raw_pdu: str) -> str:
