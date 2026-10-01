@@ -5,7 +5,7 @@ import json
 from email.utils import parsedate_to_datetime
 import time
 
-from openpilot.system.vehicle_telemetry.clock import boot_ns
+from openpilot.system.vehicle_telemetry.clock import NANO, boot_ns
 from openpilot.system.vehicle_telemetry.store import Outbox
 
 RECOVERED = threading.Event()
@@ -13,6 +13,63 @@ RECOVERED = threading.Event()
 
 def connection_recovered():
   RECOVERED.set()
+
+
+def read_ordering():
+  import requests
+  from openpilot.common.api import Api
+  from openpilot.common.params import Params
+
+  dongle_id = Params().get("DongleId")
+  if not dongle_id or dongle_id == "UnregisteredDevice":
+    return 401, {}
+  api = Api(dongle_id)
+  with requests.get(f"{api.service.api_host}/v1/devices/{dongle_id}/vehicle-telemetry/ordering",
+                    headers={"Authorization": "JWT " + api.get_token(), "Cache-Control": "no-cache"},
+                    timeout=(5, 5), stream=True, allow_redirects=False) as response:
+    raw = bytearray()
+    if response.status_code == 200:
+      for chunk in response.iter_content(1024):
+        raw.extend(chunk)
+        if len(raw) > 4096:
+          raise ValueError("Telemetry ordering response exceeds limit")
+    return response.status_code, json.loads(raw) if raw else {}
+
+
+class OrderingSync:
+  """Recover counters even when parked or the historical outbox is empty."""
+  def __init__(self, store, read=read_ordering, clock=boot_ns, random_factor=lambda: random.uniform(0.8, 1.2)):
+    self.store, self.read, self.clock, self.random_factor = store, read, clock, random_factor
+    self.failures = 0
+    self.next_attempt = 0
+    self.slow_retry = False
+
+  def reconnect(self):
+    # Re-established time/auth can repair a JWT failure. Old servers without
+    # the endpoint are still probed only hourly through reconnects.
+    if not self.slow_retry:
+      self.next_attempt = 0
+      self.failures = 0
+
+  def step(self):
+    if self.clock() < self.next_attempt:
+      return False
+    status = 0
+    try:
+      status, result = self.read()
+      if status == 200 and isinstance(result, dict):
+        changed = self.store.reconcile_order(result.get("collector_epoch"), result.get("snapshot_seq"))
+        self.failures, self.slow_retry = 0, False
+        self.next_attempt = self.clock() + 300 * NANO
+        return changed
+    except Exception:
+      # Transport failures do not stop collection or acknowledged batch delivery.
+      pass
+    self.failures = min(self.failures + 1, 11)
+    self.slow_retry = status in (404, 405, 410)
+    delay = 3600 if status in (401, 403, 404, 405, 410) else min(3600, max(5, 5 * 2 ** (self.failures - 1) * self.random_factor()))
+    self.next_attempt = self.clock() + int(delay * NANO)
+    return False
 
 
 def send_batch(body):
@@ -85,11 +142,14 @@ def upload_loop(path, boot, stopped: threading.Event):
     try:
       store = Outbox(path, boot)
       uploader = Uploader(store)
+      ordering = OrderingSync(store)
       while not stopped.is_set():
         if RECOVERED.is_set():
           RECOVERED.clear()
           store.db.execute("UPDATE records SET retry_at=0,attempts=0 WHERE state='pending'")
           uploader.failures = 0
+          ordering.reconnect()
+        ordering.step()
         if not uploader.step():
           stopped.wait(1)
     except Exception:

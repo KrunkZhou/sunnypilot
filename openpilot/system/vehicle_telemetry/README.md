@@ -44,6 +44,23 @@ mark and cached readings; existing metadata is preserved when it is reopened.
 Epochs and sequences are persistent counters independent of UTC. Fresh databases
 start their counters at zero; preserve the existing database when relocating data.
 
+The upload worker reads the device-authenticated server ordering watermark at
+startup, every five minutes, and after reconnecting. If local counters fell
+behind (for example after recreating or relocating the database), one SQLite
+transaction advances the epoch above the server's watermark. Only subsequent
+observations use the recovered order: cached readings, staged/checkpointed
+records, queued payloads and their digests/timestamps are never rewritten. The
+probe runs even with an empty queue. Transient failures retry with boot-relative
+backoff; older servers without this endpoint and authentication failures retry
+hourly while normal batch delivery continues. Restored clock trust or Athena
+connectivity also wakes an authentication retry.
+
+Deploy RTZS's `GET /v1/devices/:dongle_id/vehicle-telemetry/ordering` support before
+this firmware. Home recovers after the next valid snapshot is published and
+refreshed or uploaded. A worker restarted while parked retains last-known
+readings until current-trip selection and clock synchronization permit a new
+snapshot; advancing the counter alone does not invent a fresh measurement.
+
 ## Delivery
 
 `POST /v1/devices/:dongle_id/vehicle-telemetry/batch` uses the primary device JWT.

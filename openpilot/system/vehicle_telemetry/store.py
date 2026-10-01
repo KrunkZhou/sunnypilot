@@ -88,6 +88,29 @@ class Outbox:
       self.db.execute("ROLLBACK")
       raise
 
+  def reconcile_order(self, epoch, seq):
+    """Move future observations past the server watermark after a local reset.
+
+    Queued records, checkpoints and cached readings remain immutable. Sharing
+    this transaction with next_order/new_epoch also handles a running collector.
+    """
+    if (type(epoch) is not int or type(seq) is not int or not 0 <= epoch <= MAX_ORDER or not 0 <= seq <= MAX_ORDER
+        or (epoch == 0) != (seq == 0)):
+      raise ValueError("Invalid server telemetry ordering")
+    self.db.execute("BEGIN IMMEDIATE")
+    try:
+      changed = (self.meta("epoch"), self.meta("seq")) < (epoch, seq)
+      if changed:
+        if epoch >= MAX_ORDER:
+          raise ValueError("Telemetry ordering exhausted")
+        self.set_meta("epoch", epoch + 1)
+        self.set_meta("seq", 0)
+      self.db.execute("COMMIT")
+      return changed
+    except Exception:
+      self.db.execute("ROLLBACK")
+      raise
+
   def save_latest(self, snapshot):
     previous = self.meta("latest")
     if previous is None or (snapshot["collector_epoch"], snapshot["snapshot_seq"]) > (previous["collector_epoch"], previous["snapshot_seq"]):
