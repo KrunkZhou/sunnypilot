@@ -8,9 +8,10 @@ See the LICENSE.md file in the root directory for more details.
 from openpilot.cereal import messaging, custom
 from opendbc.car import structs
 from openpilot.common.constants import CV
-from openpilot.selfdrive.car.cruise import V_CRUISE_MAX
+from openpilot.selfdrive.car.cruise import V_CRUISE_MAX, V_CRUISE_UNSET
 from openpilot.selfdrive.controls.lib.accel_boost import AccelBoost
 from openpilot.sunnypilot.selfdrive.controls.lib.accel_boost import AccelBoostSP
+from openpilot.sunnypilot.external_navigation.speed_adapter import ExternalNavigationSpeed
 from openpilot.sunnypilot.selfdrive.controls.lib.e2e_alerts_helper import E2EAlertsHelper
 from openpilot.sunnypilot.selfdrive.controls.lib.smart_cruise_control.smart_cruise_control import SmartCruiseControl
 from openpilot.sunnypilot.selfdrive.controls.lib.speed_limit.speed_limit_assist import SpeedLimitAssist
@@ -33,6 +34,9 @@ class LongitudinalPlannerSP:
     self.e2e_alerts_helper = E2EAlertsHelper()
     self.accel_boost_sp = AccelBoostSP()
     self.openpilot_longitudinal = CP.openpilotLongitudinalControl
+    self.navigation_speed = ExternalNavigationSpeed(CP, cruise_unset=V_CRUISE_UNSET)
+    self.baseline_source = self.source
+    self.baseline_v_target = 0.
 
     self.output_v_target = 0.
     self.output_a_target = 0.
@@ -65,6 +69,12 @@ class LongitudinalPlannerSP:
 
     self.source = min(targets, key=lambda k: targets[k][0])
     self.output_v_target, self.output_a_target = targets[self.source]
+    self.baseline_source, self.baseline_v_target = self.source, self.output_v_target
+    navigation = self.navigation_speed.update(sm, baseline_target=self.output_v_target)
+    if navigation.speed_cap is not None and navigation.speed_cap < self.output_v_target:
+      self.output_v_target = navigation.speed_cap
+      self.source = LongitudinalPlanSource.externalNavigation
+    # Preserve the baseline acceleration seed; navigation has only a speed output.
     return self.output_v_target, self.output_a_target
 
   def update(self, sm: messaging.SubMaster) -> None:
@@ -84,6 +94,9 @@ class LongitudinalPlannerSP:
     longitudinalPlanSP.vTarget = float(self.output_v_target)
     longitudinalPlanSP.aTarget = float(self.output_a_target)
     longitudinalPlanSP.events = self.events_sp.to_msg()
+    self.navigation_speed.fill(longitudinalPlanSP.navigationSpeedControl,
+                               baseline_source=self.baseline_source, baseline_target=self.baseline_v_target,
+                               cruise_selected=self.mpc.source == 'cruise')
 
     # Smart Cruise Control
     smartCruiseControl = longitudinalPlanSP.smartCruiseControl

@@ -45,6 +45,17 @@ def read_mode() -> int:
     return 0
 
 
+def read_turn_speed_control() -> bool:
+  """Read the saved preference; runtime eligibility is checked by the consumer."""
+  try:
+    with _lock(create=False) as config:
+      if read_private_bytes(config / 'schema_version', 16) not in (b'1', b'1\n'):
+        return False
+      return read_private_bytes(config / 'turn_speed_control', 16) in (b'1', b'1\n')
+  except (OSError, ValueError, TypeError):
+    return False
+
+
 def _write_field(path: Path, value: bytes) -> None:
   if path.is_symlink() or (path.exists() and not path.is_file()):
     raise ValueError('configuration_field_type')
@@ -71,6 +82,16 @@ def _write_field(path: Path, value: bytes) -> None:
 def write_mode(value: int) -> bool:
   if type(value) is not int or value not in (0, 1):
     return False
+  return _write_setting('mode', str(value).encode('ascii') + b'\n')
+
+
+def write_turn_speed_control(value: bool) -> bool:
+  if type(value) is not bool:
+    return False
+  return _write_setting('turn_speed_control', b'1\n' if value else b'0\n')
+
+
+def _write_setting(name: str, value: bytes) -> bool:
   try:
     with _lock(create=True) as config:
       ensure_private_directory(config, create=True)
@@ -81,7 +102,7 @@ def write_mode(value: int) -> bool:
       else:
         _write_field(config / 'mode', b'0\n')
         _write_field(schema, b'1\n')
-      _write_field(config / 'mode', str(value).encode('ascii') + b'\n')
+      _write_field(config / name, value)
     return True
   except (OSError, ValueError):
     return False
