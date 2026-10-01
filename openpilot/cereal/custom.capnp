@@ -465,6 +465,13 @@ struct ModelDataV2SP @0xa1680744031fdb2d {
   navigationHint @3 :UInt8;
   navigationHintStatus @4 :Text;
   navigationAssisted @5 :Bool;
+  navigationTurnEvent @6 :UInt8; # Last confirmed model-input pulse: 1 left, 2 right.
+  navigationTurnEventMonoTime @7 :UInt64; # Latched event identity and expiry, not proposal/eligibility.
+  navigationInputDistanceAgeMs @8 :UInt32;
+  navigationInputReceiveAgeMs @9 :UInt32;
+  navigationInputMonoTime @10 :UInt64;
+  navigationDistanceObservation @11 :UInt32;
+  navigationTransportToken @12 :UInt32;
 
   enum TurnDirection {
     none @0;

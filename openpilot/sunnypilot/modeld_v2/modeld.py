@@ -535,6 +535,7 @@ def main(demo=False):
     model_execution_time = mt2 - mt1
 
     if model_output is not None:
+      navigation_hints.model_completed(desire, model.numpy_inputs[model.desire_key].reshape(-1))
       modelv2_send = messaging.new_message('modelV2')
       drivingdata_send = messaging.new_message('drivingModelData')
       posenet_send = messaging.new_message('cameraOdometry')

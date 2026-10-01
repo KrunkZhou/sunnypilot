@@ -1,4 +1,4 @@
-"""Small optional navigation HUD and settings status shared by both displays."""
+"""Optional navigation activity indicator and silent model-pulse notices."""
 import time
 import pyray as rl
 
@@ -21,6 +21,20 @@ def receive_age_ms(nav):
 
 def fresh_distance(nav, age_ms):
   return nav.sourceFresh and 0 <= age_ms <= 1000 and nav.distanceAgeMs + age_ms <= 1000
+
+
+def navigation_turn_notice(sm):
+  # The model latches this event across subsequent publications, so a UI frame
+  # can miss the original 20 Hz pulse without losing the notice. Its timestamp
+  # never renews just because a newer model message repeats it.
+  if mode() == 0 or not sm.alive['modelDataV2SP'] or not sm.valid['modelDataV2SP']:
+    return None
+  hint = sm['modelDataV2SP']
+  timestamp = getattr(hint, 'navigationTurnEventMonoTime', 0)
+  direction = getattr(hint, 'navigationTurnEvent', 0)
+  if timestamp <= 0 or not 0 <= time.monotonic_ns() - timestamp < 2_000_000_000:
+    return None
+  return {1: 'Turn left', 2: 'Turn right'}.get(direction)
 
 
 def status_text():
@@ -55,30 +69,23 @@ class NavigationHud:
 
   def render(self, rect):
     sm = ui_state.sm
-    if mode() == 0 or not sm.alive["externalNavigationSP"]:
+    if mode() == 0 or not sm.alive["externalNavigationSP"] or not sm.valid["externalNavigationSP"]:
       return
     # Alerts own the entire HUD priority, including informational prompts.
-    if sm["selfdriveState"].alertSize != 0:
+    if sm["selfdriveState"].alertSize != 0 or navigation_turn_notice(sm):
       return
     nav = sm["externalNavigationSP"]
     age_ms = receive_age_ms(nav)
-    if not nav.connected or not nav.available or not 0 <= age_ms <= 1000:
+    if not nav.connected or not nav.available or nav.routeState != 1 or not 0 <= age_ms <= 1000:
       return
     scale = 1 if rect.width < 800 else 2
-    width = min(300 * scale, rect.width - 190 * scale)
+    width = min(180 * scale, rect.width - 190 * scale)
     if width < 100:
       return
     right_margin = 12 if scale == 1 else 246  # Keep the existing 192px engagement button uncovered.
-    box = rl.Rectangle(rect.x + rect.width - width - right_margin, rect.y + 8 * scale, width, 62 * scale)
-    text = nav.instruction or nav.road or "Navigation"
-    distance = ""
-    if nav.hasNextDistance and fresh_distance(nav, age_ms):
-      distance = f"{nav.nextDistance} m" if nav.nextDistance < 1000 else f"{nav.nextDistance / 1000:.1f} km"
-    title = f"{distance}  {text}".strip()
-    detail = "Right branch · driver selects lane" if nav.branchRight else status_text()
+    box = rl.Rectangle(rect.x + rect.width - width - right_margin, rect.y + 8 * scale, width, 34 * scale)
     rl.draw_rectangle_rec(box, rl.Color(0, 0, 0, 185))
-    for line, size, offset, color in ((title, 21, 6, rl.WHITE), (detail, 14, 36, rl.Color(180, 180, 180, 255))):
-      line = line.replace("\n", " ")
-      while line and measure_text_cached(self.font, line, size * scale).x > width - 16 * scale:
-        line = line[:-2].rstrip("…") + "…" if len(line) > 2 else ""
-      rl.draw_text_ex(self.font, line, rl.Vector2(box.x + 8 * scale, box.y + offset * scale), size * scale, 0, color)
+    title, size = 'Navigation running', 18 * scale
+    while size > 10 and measure_text_cached(self.font, title, size).x > width - 16 * scale:
+      size -= 1
+    rl.draw_text_ex(self.font, title, rl.Vector2(box.x + 8 * scale, box.y + 7 * scale), size, 0, rl.WHITE)

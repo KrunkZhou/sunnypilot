@@ -92,8 +92,9 @@ class TestNavigationUI(unittest.TestCase):
     self.assertTrue(navigation_settings.write_mode(1))
     self.nav = SimpleNamespace(connected=True, available=True, sourceFresh=True, distanceAgeMs=100,
                                receiveMonoTime=self.now, status='current', instruction='Turn right',
-                               road='Rue Saint-Paul', nextDistance=35, hasNextDistance=True, branchRight=False)
-    self.hint = SimpleNamespace(navigationAssisted=True, navigationHintStatus='assisted_turn_proposed')
+                               road='Rue Saint-Paul', nextDistance=35, hasNextDistance=True, branchRight=False, routeState=1)
+    self.hint = SimpleNamespace(navigationAssisted=True, navigationHintStatus='assisted_turn_proposed',
+                                navigationTurnEvent=0, navigationTurnEventMonoTime=0)
     self.alert = SimpleNamespace(alertSize=0)
     class Messages(dict):
       pass
@@ -166,11 +167,11 @@ class TestNavigationUI(unittest.TestCase):
     self.nav.receiveMonoTime = self.now - 200_000_000
     self.render()
     self.assertTrue(self.drawn)
-    self.assertNotIn('35 m', self.drawn[0][0])
+    self.assertEqual(self.drawn[0][0], 'Navigation running')
     self.assertEqual(self.ui.status_text(), 'Guidance only · awaiting fresh distance')
     self.nav.distanceAgeMs = 800
     self.render()
-    self.assertIn('35 m', self.drawn[0][0])
+    self.assertEqual(self.drawn[0][0], 'Navigation running')
     self.assertEqual(self.ui.status_text(), 'Assisted turns · available')
 
   def test_alerts_off_and_unavailable_navigation_have_priority(self):
@@ -199,7 +200,8 @@ class TestNavigationUI(unittest.TestCase):
         self.assertGreaterEqual(box.y, rect.y)
         self.assertLessEqual(box.x + box.width, rect.x + rect.width)
         self.assertLessEqual(box.y + box.height, rect.y + rect.height)
-        self.assertEqual(len(self.drawn), 2)
+        self.assertEqual(len(self.drawn), 1)
+        self.assertEqual(self.drawn[0][0], 'Navigation running')
         for line, pos, size in self.drawn:
           self.assertNotIn('\n', line)
           self.assertGreaterEqual(pos.x, box.x)
@@ -208,8 +210,55 @@ class TestNavigationUI(unittest.TestCase):
           self.assertLessEqual(pos.y + size, box.y + box.height)
       self.nav.branchRight = True
       self.render(width, height)
-      self.assertIn('Right branch', self.drawn[1][0])
+      self.assertEqual(self.drawn[0][0], 'Navigation running')
       self.nav.branchRight = False
+
+  def test_turn_notice_uses_latched_model_event_and_never_eligibility(self):
+    self.assertIsNone(self.ui.navigation_turn_notice(self.messages))
+    self.hint.navigationTurnEvent, self.hint.navigationTurnEventMonoTime = 2, self.now
+    self.assertEqual(self.ui.navigation_turn_notice(self.messages), 'Turn right')
+    self.hint.navigationAssisted = False  # UI skipped the pulse and receives a later model frame.
+    self.hint.navigationHintStatus = 'assisted_already_consumed'
+    self.now += 1_900_000_000
+    self.assertEqual(self.ui.navigation_turn_notice(self.messages), 'Turn right')
+    self.now += 100_000_000
+    self.assertIsNone(self.ui.navigation_turn_notice(self.messages))
+    self.hint.navigationTurnEvent, self.hint.navigationTurnEventMonoTime = 1, self.now
+    self.assertEqual(self.ui.navigation_turn_notice(self.messages), 'Turn left')
+    self.hint.navigationTurnEventMonoTime = self.now + 1
+    self.assertIsNone(self.ui.navigation_turn_notice(self.messages))
+    self.hint.navigationTurnEventMonoTime = self.now
+    self.messages.valid['modelDataV2SP'] = False
+    self.assertIsNone(self.ui.navigation_turn_notice(self.messages))
+    self.messages.valid['modelDataV2SP'] = True
+    self.messages.alive['modelDataV2SP'] = False
+    self.assertIsNone(self.ui.navigation_turn_notice(self.messages))
+
+  def test_both_existing_alert_renderers_show_silent_notice_below_other_alerts(self):
+    self.hint.navigationTurnEvent, self.hint.navigationTurnEventMonoTime = 1, self.now
+    self.messages.updated = {'selfdriveState': True}
+    self.messages.recv_frame = {'selfdriveState': 20}
+    self.state.started_frame = 1
+    class EnumValue(int):
+      @property
+      def raw(self):
+        return int(self)
+    self.alert.alertSize, self.alert.alertStatus = EnumValue(0), EnumValue(0)
+    self.alert.alertText1, self.alert.alertText2 = 'Take control', ''
+    self.alert.alertHudVisual, self.alert.alertType = 0, 'warning'
+    namespace = {'messaging': SimpleNamespace(SubMaster=object), 'Alert': SimpleNamespace,
+                 'AlertSize': SimpleNamespace(small=1), 'AlertStatus': SimpleNamespace(normal=0),
+                 'navigation_turn_notice': self.ui.navigation_turn_notice, 'ui_state': self.state}
+    for relative in ('selfdrive/ui/onroad/alert_renderer.py', 'selfdrive/ui/mici/onroad/alert_renderer.py'):
+      get_alert = method(OPENPILOT / relative, 'get_alert', namespace)
+      renderer = SimpleNamespace(_prev_alert=None)
+      self.alert.alertSize = EnumValue(0)
+      alert = get_alert(renderer, self.messages)
+      self.assertEqual((alert.text1, alert.size, alert.status), ('Turn left', 1, 0))
+      self.assertNotIn('audible', vars(alert))  # Visual-only; selfdriveState/audio service is untouched.
+      self.assertEqual(self.alert.alertText1, 'Take control')
+      self.alert.alertSize = EnumValue(1)
+      self.assertEqual(get_alert(renderer, self.messages).text1, 'Take control')
 
   def test_hud_preserves_existing_control_regions(self):
     for width, height in ((536, 240), (2160, 1080)):

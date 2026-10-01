@@ -11,6 +11,36 @@ from openpilot.sunnypilot.external_navigation.protocol import Receiver
 
 @unittest.skipUnless(importlib.util.find_spec('capnp'), 'pycapnp is required for schema serialization')
 class SchemaTests(unittest.TestCase):
+  def test_latched_turn_event_and_input_age_roundtrip(self):
+    import capnp
+    root = Path(__file__).resolve().parents[4]
+    schema = capnp.load(str(root / 'openpilot/cereal/log.capnp'), imports=[str(root / 'opendbc_repo/opendbc/car')])
+    message = schema.Event.new_message()
+    out = message.init('modelDataV2SP')
+    out.navigationHint = 0  # Later frame after the original pulse.
+    out.navigationTurnEvent = 2
+    out.navigationTurnEventMonoTime = 10_000_000_000
+    out.navigationInputDistanceAgeMs = 1001
+    out.navigationInputReceiveAgeMs = 201
+    out.navigationInputMonoTime = 10_201_000_000
+    out.navigationDistanceObservation = 123
+    out.navigationTransportToken = 98
+    with schema.Event.from_bytes(message.to_bytes()) as decoded:
+      hint = decoded.modelDataV2SP
+      self.assertEqual(hint.navigationHint, 0)
+      self.assertEqual(hint.navigationTurnEvent, 2)
+      self.assertEqual(hint.navigationTurnEventMonoTime, 10_000_000_000)
+      self.assertEqual(hint.navigationInputDistanceAgeMs, 1001)
+      self.assertEqual(hint.navigationInputReceiveAgeMs, 201)
+      self.assertEqual(hint.navigationInputMonoTime, 10_201_000_000)
+      self.assertEqual(hint.navigationDistanceObservation, 123)
+      self.assertEqual(hint.navigationTransportToken, 98)
+    empty = schema.Event.new_message()
+    old = empty.init('modelDataV2SP')
+    old.navigationAssisted = True  # Legacy eligibility fields cannot fabricate a new event.
+    self.assertEqual(old.navigationTurnEvent, 0)
+    self.assertEqual(old.navigationTurnEventMonoTime, 0)
+
   def test_registered_reserved_slot_and_publication(self):
     import capnp
     root = Path(__file__).resolve().parents[4]
