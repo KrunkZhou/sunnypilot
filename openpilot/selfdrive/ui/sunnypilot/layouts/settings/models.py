@@ -10,7 +10,7 @@ import pyray as rl
 
 from openpilot.cereal import custom
 from openpilot.selfdrive.ui.sunnypilot.external_navigation import MODE_LABELS, mode as navigation_mode, status_text as navigation_status
-from openpilot.sunnypilot.external_navigation.settings import write_mode
+from openpilot.sunnypilot.external_navigation.settings import read_turn_speed_control, write_mode, write_turn_speed_control
 from openpilot.sunnypilot.models.helpers import ACTIVE_BUNDLE_KEYS, get_selected_bundle, resolve_bundle_by_ref
 from openpilot.common.constants import CV
 from openpilot.selfdrive.ui.ui_state import device, ui_state
@@ -103,6 +103,11 @@ class ModelsLayout(Widget):
                                        self._cycle_navigation_mode)
     self.navigation_item.set_enabled(lambda: ui_state.is_offroad())
 
+    self.navigation_speed_item = button_item("Navigation turn speed control", self._navigation_speed_label,
+                                             self._navigation_speed_description, self._cycle_navigation_speed)
+    self.navigation_speed_item.set_enabled(lambda: ui_state.is_offroad() and
+                                            (read_turn_speed_control() or self._navigation_speed_available()))
+
     self.delay_control = option_item_sp(tr("Adjust Software Delay"), "LagdToggleDelay", 5, 50,
                                         tr("Adjust the software delay when Live Learning Steer Delay is toggled off. The default software delay value is 0.2"),
                                         1, None, True, "", style.BUTTON_ACTION_WIDTH, None, True, lambda v: f"{v / 100:.2f}s")
@@ -115,11 +120,33 @@ class ModelsLayout(Widget):
                                         lambda v: f"{v / 100:.2f} m")
 
     self.items = [self.small_model_item, self.big_model_item, self.cancel_download_item, self.download_item, self.refresh_item, self.clear_cache_item,
-                  self.navigation_item, self.lane_turn_desire_toggle, self.lane_turn_value_control, self.lagd_toggle, self.delay_control, self.camera_offset]
+                  self.navigation_item, self.navigation_speed_item, self.lane_turn_desire_toggle, self.lane_turn_value_control,
+                  self.lagd_toggle, self.delay_control, self.camera_offset]
 
   def _cycle_navigation_mode(self):
     if ui_state.is_offroad():
       write_mode((navigation_mode() + 1) % len(MODE_LABELS))
+
+  def _navigation_speed_available(self):
+    return navigation_mode() == 1 and ui_state.CP is not None and ui_state.CP.openpilotLongitudinalControl
+
+  def _navigation_speed_label(self):
+    if not read_turn_speed_control():
+      return "Off"
+    return "On" if self._navigation_speed_available() else "On · inactive"
+
+  def _navigation_speed_description(self):
+    description = "Reduce the speed target before supported navigation turns. Does not handle traffic lights, stop signs or right of way."
+    if navigation_mode() != 1:
+      return "Requires Assisted turns. " + description
+    if ui_state.CP is None or not ui_state.CP.openpilotLongitudinalControl:
+      return "Requires sunnypilot longitudinal control. " + description
+    return description
+
+  def _cycle_navigation_speed(self):
+    enabled = read_turn_speed_control()
+    if ui_state.is_offroad() and (enabled or self._navigation_speed_available()):
+      write_turn_speed_control(not enabled)
 
   def _update_lagd_description(self, lagd_toggle: bool):
     desc = tr("Enable this for the car to learn and adapt its steering response time. Disable to use a fixed steering response time. " +

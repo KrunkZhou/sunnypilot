@@ -204,6 +204,47 @@ struct LongitudinalPlanSP @0xf35cc4560bbf6ec2 {
   aTarget @5 :Float32;
   events @6 :List(OnroadEventSP.Event);
   e2eAlerts @7 :E2eAlerts;
+  navigationSpeedControl @8 :NavigationSpeedControl;
+
+  struct NavigationSpeedControl {
+    enabled @0 :Bool;
+    eligible @1 :Bool;
+    state @2 :Text;
+    reason @3 :Text;
+    releaseReason @4 :Text;
+    inputMonoTime @5 :UInt64;
+    publisherSession @6 :Data;
+    cacheEpoch @7 :UInt64;
+    streamId @8 :UInt64;
+    generation @9 :UInt64;
+    maneuverId @10 :UInt64;
+    receiverSession @11 :Data;
+    transportToken @12 :UInt32;
+    routeState @13 :UInt8;
+    hasManeuver @14 :Bool;
+    maneuverType @15 :UInt8;
+    hasDistance @16 :Bool;
+    distance @17 :Float32; # Observed metres, not extrapolated.
+    hasAcceptedDistance @18 :Bool;
+    acceptedDistance @19 :Float32;
+    distanceObservation @20 :UInt32;
+    maneuverObservation @21 :UInt32;
+    distanceAgeMs @22 :UInt32; # Effective source + delivery age; unknown = 0xffffffff.
+    maneuverAgeMs @23 :UInt32; # Selection observation age, not type validity TTL.
+    deliveryAgeMs @24 :UInt32;
+    nominalTurnSpeed @25 :Float32; # m/s
+    rawCap @26 :Float32; # m/s; only meaningful when capAvailable.
+    appliedCap @27 :Float32; # m/s; only meaningful when speedSelected.
+    baselineSource @28 :LongitudinalPlanSource;
+    baselineTarget @29 :Float32;
+    capAvailable @30 :Bool;
+    speedSelected @31 :Bool;
+    cruiseCandidateSelected @32 :Bool; # Navigation wins speed AND cruise wins final acceleration.
+    receiveMonoTime @33 :UInt64;
+    sourceAgeMs @34 :UInt32;
+    transportRttMs @35 :UInt32; # Already included in effective observation age.
+    snapshotSequence @36 :UInt32;
+  }
 
   struct DynamicExperimentalControl {
     state @0 :DynamicExperimentalControlState;
@@ -300,6 +341,7 @@ struct LongitudinalPlanSP @0xf35cc4560bbf6ec2 {
     sccVision @1;
     sccMap @2;
     speedLimitAssist @3;
+    externalNavigation @4;
   }
 
   struct E2eAlerts {

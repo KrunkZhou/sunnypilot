@@ -8,6 +8,7 @@ import math
 from pathlib import Path
 
 from openpilot.sunnypilot.external_navigation.policy import Sample, TurnPolicy
+from openpilot.sunnypilot.external_navigation.speed_control import NavigationSpeedController, NavigationSpeedSample
 
 
 def replay_policy(rows):
@@ -21,6 +22,36 @@ def replay_policy(rows):
                              mode=1, **row['vehicle'])
     # Report proposed policy outputs; this offline tool never drives a model.
     yield {'timestamp': row.get('timestamp'), **asdict(decision), 'desire': 0, 'assisted': False}
+
+
+def replay_speed(rows):
+  """Deterministic speed-cap evaluation; never opens messaging or controls a car.
+
+  Each row supplies its monotonic evaluation time in nanoseconds. Observation
+  ages are already effective at that time, including receiver delivery delay.
+  JSON identity/transport lists are opaque keys, not clocks or credentials.
+  """
+  controller = NavigationSpeedController()
+  previous_time = None
+  for row in rows:
+    now_ns = row['now_ns']
+    if not isinstance(now_ns, int) or isinstance(now_ns, bool) or now_ns < 0 or (previous_time is not None and now_ns < previous_time):
+      raise ValueError('Speed replay requires nonnegative, monotonic integer now_ns')
+    previous_time = now_ns
+    sample_data = row.get('sample')
+    if sample_data is not None:
+      sample_data = dict(sample_data)
+      for key in ('identity', 'transport'):
+        if sample_data.get(key) is not None:
+          parts = list(sample_data[key])
+          if parts and isinstance(parts[0], str):
+            parts[0] = bytes.fromhex(parts[0])
+          sample_data[key] = tuple(parts)
+    decision = controller.update(NavigationSpeedSample(**sample_data) if sample_data is not None else None,
+                                 now_ns=now_ns, **row['vehicle'])
+    yield {'now_ns': now_ns, 'speed_cap': decision.speed_cap, 'raw_cap': decision.raw_cap,
+           'state': decision.state, 'reason': decision.reason, 'release_reason': decision.release_reason,
+           'eligible': decision.eligible, 'activation_approved': False}
 
 
 def compare_outputs(neutral, hinted):
@@ -106,6 +137,12 @@ def main():
   sub = parser.add_subparsers(dest='command', required=True)
   policy = sub.add_parser('policy', help='Replay recorded guidance + vehicle state; proposals only')
   policy.add_argument('trace', type=Path)
+  speed = sub.add_parser('speed', help='Replay navigation speed caps with recorded monotonic times; no actuation')
+  speed.add_argument('trace', type=Path)
+  planner = sub.add_parser('planner', help='Replay recorded planner inputs on a development PC using recorded evaluation times')
+  planner.add_argument('--log', type=Path, required=True)
+  planner.add_argument('--output', type=Path, required=True)
+  planner.add_argument('--disabled', action='store_true', help='Run the baseline with navigation speed control disabled')
   compare = sub.add_parser('compare', help='Compare paired exported model outputs')
   compare.add_argument('neutral', type=Path)
   compare.add_argument('hinted', type=Path)
@@ -124,8 +161,14 @@ def main():
   if args.command == 'policy':
     for result in replay_policy(rows(args.trace)):
       print(json.dumps(result))
+  elif args.command == 'speed':
+    for result in replay_speed(rows(args.trace)):
+      print(json.dumps(result, allow_nan=False))
   elif args.command == 'compare':
     print(json.dumps(compare_outputs(rows(args.neutral), rows(args.hinted)), indent=2))
+  elif args.command == 'planner':
+    from openpilot.sunnypilot.external_navigation.replay_planner import run_planner_replay
+    print(json.dumps(run_planner_replay(args), indent=2))
   else:
     print(json.dumps(camera_replay(args), indent=2))
 

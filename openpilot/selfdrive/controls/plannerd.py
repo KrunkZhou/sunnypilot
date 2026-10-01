@@ -23,13 +23,13 @@ def main():
   cloudlog.info("plannerd got CarParamsSP")
 
   gps_location_service = get_gps_location_service(params)
-  ignore_services = ["liveMapDataSP", "carStateSP", "selfdriveStateSP", gps_location_service]
+  ignore_services = ["liveMapDataSP", "carStateSP", "selfdriveStateSP", gps_location_service, "externalNavigationSP"]
 
   ldw = LaneDepartureWarning()
   longitudinal_planner = LongitudinalPlanner(CP, CP_SP)
   pm = messaging.PubMaster(['longitudinalPlan', 'driverAssistance', 'longitudinalPlanSP'])
   sm = messaging.SubMaster(['carControl', 'carState', 'controlsState', 'vehicleParameters', 'radarState', 'modelV2', 'selfdriveState',
-                            'liveMapDataSP', 'carStateSP', 'selfdriveStateSP', gps_location_service],
+                            'liveMapDataSP', 'carStateSP', 'selfdriveStateSP', gps_location_service, 'externalNavigationSP'],
                            poll='modelV2', ignore_alive=ignore_services, ignore_avg_freq=ignore_services, ignore_valid=ignore_services)
 
   while True:
