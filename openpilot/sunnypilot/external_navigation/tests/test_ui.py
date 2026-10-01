@@ -8,7 +8,7 @@ from contextlib import ExitStack
 from dataclasses import dataclass
 import importlib.util
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
+from types import MethodType, ModuleType, SimpleNamespace
 import sys
 import tempfile
 import unittest
@@ -102,7 +102,7 @@ class TestNavigationUI(unittest.TestCase):
     self.messages.alive = {'externalNavigationSP': True, 'modelDataV2SP': True}
     self.messages.valid = dict(self.messages.alive)
     self.offroad = True
-    self.state = SimpleNamespace(sm=self.messages, is_offroad=lambda: self.offroad)
+    self.state = SimpleNamespace(sm=self.messages, is_offroad=lambda: self.offroad, CP=SimpleNamespace(openpilotLongitudinalControl=True))
     self.fonts = {}
     def measure(font, text, size):
       if ImageFont is not None:
@@ -302,6 +302,87 @@ class TestNavigationUI(unittest.TestCase):
     self.offroad = False
     cycle(None)
     self.assertEqual(navigation_settings.read_mode(), 1)
+
+  def test_mici_speed_control_prerequisites_and_retained_preference(self):
+    layout_module = load('navigation_speed_layout_test', OPENPILOT / 'selfdrive/ui/sunnypilot/mici/layouts/navigation.py')
+    panel = layout_module.NavigationLayoutMici()
+    panel._update_state()
+    self.assertEqual(panel._speed_control.value, 'Off')
+    self.assertTrue(panel._speed_control.enabled)
+    for cp in (None, SimpleNamespace(openpilotLongitudinalControl=False)):
+      self.state.CP = cp
+      self.state.has_icbm = self.state.has_longitudinal_control = True
+      panel._update_state()
+      self.assertFalse(panel._speed_control.enabled)
+      panel._toggle_speed_control()
+      self.assertFalse(navigation_settings.read_turn_speed_control())
+    self.state.CP = SimpleNamespace(openpilotLongitudinalControl=True)
+    panel._select_mode('Off')
+    panel._update_state()
+    self.assertFalse(panel._speed_control.enabled)
+    panel._toggle_speed_control()
+    self.assertFalse(navigation_settings.read_turn_speed_control())
+    panel._select_mode('Assisted turns')
+    self.offroad = False
+    panel._toggle_speed_control()
+    self.assertFalse(navigation_settings.read_turn_speed_control())
+    self.offroad = True
+    panel._speed_control.callback()
+    self.assertTrue(navigation_settings.read_turn_speed_control())
+    panel._select_mode('Off')
+    panel._update_state()
+    self.assertTrue(navigation_settings.read_turn_speed_control())
+    self.assertEqual(panel._speed_control.value, 'On · inactive')
+    self.assertTrue(panel._speed_control.enabled)
+    self.assertEqual(panel._speed_status.value, 'Select Assisted turns')
+    self.offroad = False
+    panel._update_state()
+    self.assertFalse(panel._speed_control.enabled)
+    panel._toggle_speed_control()
+    self.assertTrue(navigation_settings.read_turn_speed_control())
+    self.offroad = True
+    self.state.CP = None
+    panel._speed_control.callback()
+    self.assertFalse(navigation_settings.read_turn_speed_control())
+
+  def test_standard_speed_control_callbacks_enforce_actual_longitudinal_capability(self):
+    namespace = {'ui_state': self.state, 'navigation_mode': self.ui.mode,
+                 'read_turn_speed_control': navigation_settings.read_turn_speed_control,
+                 'write_turn_speed_control': navigation_settings.write_turn_speed_control}
+    panel = SimpleNamespace()
+    for name in ('_navigation_speed_available', '_navigation_speed_label', '_navigation_speed_description', '_cycle_navigation_speed'):
+      callback = method(OPENPILOT / 'selfdrive/ui/sunnypilot/layouts/settings/models.py', name, namespace)
+      setattr(panel, name, MethodType(callback, panel))
+    self.assertEqual(panel._navigation_speed_label(), 'Off')
+    for cp in (None, SimpleNamespace(openpilotLongitudinalControl=False)):
+      self.state.CP = cp
+      self.state.has_icbm = self.state.has_longitudinal_control = True
+      panel._cycle_navigation_speed()
+      self.assertFalse(navigation_settings.read_turn_speed_control())
+      self.assertIn('Requires sunnypilot longitudinal control', panel._navigation_speed_description())
+    self.state.CP = SimpleNamespace(openpilotLongitudinalControl=True)
+    navigation_settings.write_mode(0)
+    panel._cycle_navigation_speed()
+    self.assertFalse(navigation_settings.read_turn_speed_control())
+    self.assertIn('Requires Assisted turns', panel._navigation_speed_description())
+    navigation_settings.write_mode(1)
+    self.offroad = False
+    panel._cycle_navigation_speed()
+    self.assertFalse(navigation_settings.read_turn_speed_control())
+    self.offroad = True
+    panel._cycle_navigation_speed()
+    self.assertTrue(navigation_settings.read_turn_speed_control())
+    self.assertEqual(panel._navigation_speed_label(), 'On')
+    navigation_settings.write_mode(0)
+    self.assertEqual(panel._navigation_speed_label(), 'On · inactive')
+    self.assertTrue(navigation_settings.read_turn_speed_control())
+    self.state.CP = None
+    self.offroad = False
+    panel._cycle_navigation_speed()
+    self.assertTrue(navigation_settings.read_turn_speed_control())
+    self.offroad = True
+    panel._cycle_navigation_speed()
+    self.assertFalse(navigation_settings.read_turn_speed_control())
 
 
 class TestAutomaticWifiOperations(unittest.TestCase):
