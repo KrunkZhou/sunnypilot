@@ -2,6 +2,7 @@
 import json
 from pathlib import Path
 import queue
+import re
 import threading
 import time
 
@@ -10,6 +11,8 @@ from openpilot.sunnypilot.external_navigation.config import navigation_root, ens
 
 class DiagnosticsWriter:
   def __init__(self, directory: Path | None = None, max_bytes: int = 2 * 1024 * 1024, files: int = 20):
+    if max_bytes < 1 or files < 1:
+      raise ValueError('diagnostic limits must be positive')
     self.directory, self.max_bytes, self.files = directory or navigation_root() / 'logs', max_bytes, files
     self.queue = queue.Queue(maxsize=4)
     self.dropped = 0
@@ -37,13 +40,23 @@ class DiagnosticsWriter:
 
   def _rotate(self):
     ensure_private_directory(self.directory, create=True)
-    paths = sorted(self.directory.glob('navigation-*.jsonl'))
-    for path in paths[:max(0, len(paths) - self.files + 1)]:
-      path.unlink()
-    path = self.directory / f'navigation-{time.time_ns():020d}.jsonl'
+    # Names are a persistent ordering sequence, not necessarily wall-clock time.
+    # A boot before clock sync must not make the newest capture the next victim.
+    paths = sorted(path for path in self.directory.glob('navigation-*.jsonl')
+                   if re.fullmatch(r'navigation-\d{20}\.jsonl', path.name))
+    previous = int(paths[-1].stem.split('-')[1]) if paths else 0
+    ordinal = max(time.time_ns(), previous + 1)
+    path = self.directory / f'navigation-{ordinal:020d}.jsonl'
     output = path.open('x', encoding='utf-8')
-    path.chmod(0o600)
-    return output
+    try:
+      path.chmod(0o600)
+      # Only prune after creating the new file successfully, and never prune it.
+      for old in paths[:max(0, len(paths) - self.files + 1)]:
+        old.unlink()
+      return output
+    except BaseException:
+      output.close()
+      raise
 
   def _run(self):
     output, size = None, 0
@@ -54,7 +67,8 @@ class DiagnosticsWriter:
         except queue.Empty:
           continue
         try:
-          line = json.dumps({**record, 'capture_dropped': self.dropped}, ensure_ascii=False, separators=(',', ':')) + '\n'
+          line = json.dumps({**record, 'capture_wall_time_ns': time.time_ns(), 'capture_dropped': self.dropped},
+                            ensure_ascii=False, separators=(',', ':')) + '\n'
           length = len(line.encode('utf-8'))
           if length > 8192:
             self.dropped += 1

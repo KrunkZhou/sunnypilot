@@ -10,7 +10,7 @@ All persistent files live under `/data/rtzs/navigation/` on AGNOS. Development h
 
 - `config/schema_version`: plain `1` plus newline; `config/mode`: plain `0` (Off) or `1` (Assisted turns) plus newline. A fixed `config.lock` protects readers and atomic field replacement. Missing, malformed, unsupported or insecure settings fail Off.
 - `private/relay.json`: `relay_id` (32 hex characters) and `key` (64 hex characters). Use the same independently generated key on the Waveshare. The public fixture key is explicitly rejected. The Wi-Fi password is not a relay authentication key.
-- `logs/navigation-*.jsonl`: private, bounded receive diagnostics, at most 20 files of approximately 2 MiB each. Keys and raw authenticated packets are excluded. A four-record replaceable queue keeps file IO outside the receiver.
+- `logs/navigation-*.jsonl`: private, bounded receive diagnostics, at most 20 files of approximately 2 MiB each. File names retain a strictly increasing sequence even if the clock rolls backward; use each record's `capture_wall_time_ns` and `monotonic_ms` for timing, not the file name. Keys and raw authenticated packets are excluded. A four-record replaceable queue keeps file IO outside the receiver.
 
 Navigation directories must be owned by the running user with mode 0700; files are 0600. Manual Wi-Fi ownership revisions are transient in `/dev/shm/rtzs-navigation-revision` (host `runtime/network-revision`). Failed revision tracking disables automatic Wi-Fi ownership.
 
