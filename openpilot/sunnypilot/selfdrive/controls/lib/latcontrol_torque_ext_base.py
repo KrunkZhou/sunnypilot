@@ -61,7 +61,9 @@ class LatControlTorqueExtBase:
     self.torque_params = lac_torque.torque_params
 
     self._ff = 0.0
-    self._pid = PIDController(KP, KI)
+    # Extension errors and feedforward are normalized torque, not m/s^2.
+    self._pid = PIDController(KP, KI, rate=1 / lac_torque.dt,
+                              pos_limit=lac_torque.steer_max, neg_limit=-lac_torque.steer_max)
     self._pid_log = None
     self._setpoint = 0.0
     self._measurement = 0.0
@@ -96,6 +98,15 @@ class LatControlTorqueExtBase:
     # precompute time differences between ModelConstants.T_IDXS
     self.t_diffs = np.diff(ModelConstants.T_IDXS)
     self.desired_lat_jerk_time = CP.steerActuatorDelay + LATERAL_LAG_MOD
+
+  def reset(self):
+    self._pid.reset()
+    self._ff = 0.0
+    self._output_torque = 0.0
+    self.actual_lateral_jerk = 0.0
+    self.lateral_jerk_setpoint = 0.0
+    self.lateral_jerk_measurement = 0.0
+    self.lookahead_lateral_jerk = 0.0
 
   def update_model_v2(self, model_v2):
     self.model_v2 = model_v2

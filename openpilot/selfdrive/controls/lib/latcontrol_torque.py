@@ -50,6 +50,11 @@ class LatControlTorque(LatControl):
 
     self.extension = LatControlTorqueExt(self, CP, CP_SP, CI)
 
+  def reset(self):
+    super().reset()
+    self.pid.reset()
+    self.extension.reset()
+
   def update_torque_parameters(self, latAccelFactor, latAccelOffset, friction):
     self.torque_params.latAccelFactor = latAccelFactor
     self.torque_params.latAccelOffset = latAccelOffset
@@ -97,21 +102,24 @@ class LatControlTorque(LatControl):
       # do error correction in lateral acceleration space, convert at end to handle non-linear torque responses correctly
       pid_log.error = float(error)
 
-      freeze_integrator = steer_limited_by_safety or CS.steeringPressed or CS.vEgo < 5
-      output_lataccel = self.pid.update(pid_log.error, speed=CS.vEgo, feedforward=ff, freeze_integrator=freeze_integrator)
-      output_torque = self.torque_from_lateral_accel(output_lataccel, self.torque_params)
+      active_pid = self.extension.select_pid(self.pid)
+      output_torque = 0.0
+      if active_pid is self.pid:
+        freeze_integrator = steer_limited_by_safety or CS.steeringPressed or CS.vEgo < 5
+        output_lataccel = self.pid.update(pid_log.error, speed=CS.vEgo, feedforward=ff, freeze_integrator=freeze_integrator)
+        output_torque = self.torque_from_lateral_accel(output_lataccel, self.torque_params)
 
       # Lateral acceleration torque controller extension updates
       # Overrides pid_log.error and output_torque
-      pid_log, output_torque = self.extension.update(CS, VM, self.pid, params, ff, pid_log, setpoint, measurement, calibrated_pose, roll_compensation,
+      pid_log, output_torque = self.extension.update(CS, VM, params, ff, pid_log, setpoint, measurement, calibrated_pose, roll_compensation,
                                                      future_desired_lateral_accel, measurement, lateral_accel_deadzone, gravity_adjusted_future_lateral_accel,
                                                      desired_curvature, measured_curvature, steer_limited_by_safety, output_torque)
 
       pid_log.active = True
-      pid_log.p = float(self.pid.p)
-      pid_log.i = float(self.pid.i)
-      pid_log.d = float(self.pid.d)
-      pid_log.f = float(self.pid.f)
+      pid_log.p = float(active_pid.p)
+      pid_log.i = float(active_pid.i)
+      pid_log.d = float(active_pid.d)
+      pid_log.f = float(active_pid.f)
       pid_log.output = float(-output_torque) # TODO: log lat accel?
       pid_log.actualLateralAccel = float(measurement)
       pid_log.desiredLateralAccel = float(setpoint)
