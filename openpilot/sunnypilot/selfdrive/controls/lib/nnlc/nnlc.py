@@ -8,7 +8,7 @@ from collections import deque
 import math
 import numpy as np
 
-from opendbc.car.lateral import FRICTION_THRESHOLD, get_friction
+from opendbc.car.lateral import FRICTION_THRESHOLD
 from opendbc.sunnypilot.car.interfaces import LatControlInputs
 from opendbc.sunnypilot.car.lateral_ext import get_friction as get_friction_in_torque_space
 from openpilot.common.filter_simple import FirstOrderFilter
@@ -60,6 +60,12 @@ class NeuralNetworkLateralControl(LatControlTorqueJerkAware):
     self.roll_deque = deque(maxlen=history_check_frames[0])
     self.error_deque = deque(maxlen=history_check_frames[0])
     self.past_future_len = len(self.past_times) + len(self.nn_future_times)
+
+  def reset(self):
+    super().reset()
+    self.lateral_accel_desired_deque.clear()
+    self.roll_deque.clear()
+    self.error_deque.clear()
 
   @property
   def _nnlc_enabled(self):
@@ -155,6 +161,7 @@ class NeuralNetworkLateralControl(LatControlTorqueJerkAware):
 
     # apply friction override for cars with low NN friction response
     if self.model.friction_override:
-      self._pid_log.error += get_friction(friction_input, self._lateral_accel_deadzone, FRICTION_THRESHOLD, self.torque_params)
+      self._pid_log.error += get_friction_in_torque_space(friction_input, self._lateral_accel_deadzone,
+                                                        FRICTION_THRESHOLD, self.torque_params)
 
     self.update_output_torque(CS)

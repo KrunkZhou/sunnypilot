@@ -13,12 +13,24 @@ class LatControlTorqueExt(NeuralNetworkLateralControl, LatControlTorqueExtOverri
   def __init__(self, lac_torque, CP, CP_SP, CI):
     NeuralNetworkLateralControl.__init__(self, lac_torque, CP, CP_SP, CI)
     LatControlTorqueExtOverride.__init__(self, CP)
+    self._controller_mode = None
 
-  def update(self, CS, VM, pid, params, ff, pid_log, setpoint, measurement, calibrated_pose, roll_compensation,
+  def select_pid(self, base_pid):
+    mode = "nnlc" if self._nnlc_enabled else "jerk" if self._jerk_aware_enabled else "base"
+    if mode != self._controller_mode:
+      # Never transfer an integral between acceleration-space and torque-space control.
+      self.reset()
+      base_pid.reset()
+      self._controller_mode = mode
+    self._pid.set_limits(self.lac_torque.steer_max, -self.lac_torque.steer_max)
+    return base_pid if mode == "base" else self._pid
+
+  def update(self, CS, VM, params, ff, pid_log, setpoint, measurement, calibrated_pose, roll_compensation,
              desired_lateral_accel, actual_lateral_accel, lateral_accel_deadzone, gravity_adjusted_lateral_accel,
              desired_curvature, actual_curvature, steer_limited_by_safety, output_torque):
+    if not (self._nnlc_enabled or self._jerk_aware_enabled):
+      return pid_log, output_torque
     self._ff = ff
-    self._pid = pid
     self._pid_log = pid_log
     self._setpoint = setpoint
     self._measurement = measurement
@@ -33,7 +45,10 @@ class LatControlTorqueExt(NeuralNetworkLateralControl, LatControlTorqueExtOverri
     self._output_torque = output_torque
 
     self.update_calculations(CS, VM, desired_lateral_accel)
-    self.update_jerk_aware_torque_control(CS, roll_compensation, gravity_adjusted_lateral_accel)
-    self.update_neural_network_feedforward(CS, params, calibrated_pose)
+    # NNLC supersedes jerk-aware torque control; integrate exactly once per tick.
+    if self._nnlc_enabled:
+      self.update_neural_network_feedforward(CS, params, calibrated_pose)
+    else:
+      self.update_jerk_aware_torque_control(CS, roll_compensation, gravity_adjusted_lateral_accel)
 
     return self._pid_log, self._output_torque
