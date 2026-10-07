@@ -18,6 +18,9 @@ class ReplayHints:
       self.consumed = True
     return self.output
 
+  def model_completed(self, desire: int, effective_pulse) -> None:
+    """Accept the model runner callback without reporting live navigation assistance."""
+
   def fill(self, message):
     message.navigationHint = self.output
     message.navigationHintStatus = 'offline_recorded_camera_research'
