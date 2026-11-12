@@ -770,10 +770,16 @@ def cancelUpload(upload_id: str | list[str]) -> dict[str, int | str]:
   return {"success": 1}
 
 @dispatcher.add_method
-def setNavDestination(latitude: float, longitude: float) -> dict[str, int | str]:
+def setNavDestination(latitude: float, longitude: float, place_name: str | None = None,
+                      place_details: str | None = None) -> dict[str, int | str]:
   if not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
     return {"success": 0, "error": "Invalid destination coordinates"}
-  Params().put("NavDestination", {"latitude": latitude, "longitude": longitude}, block=True)
+  destination: dict[str, float | str] = {"latitude": latitude, "longitude": longitude}
+  if place_name is not None:
+    destination["place_name"] = place_name
+  if place_details is not None:
+    destination["place_details"] = place_details
+  Params().put("NavDestination", destination, block=True)
   return {"success": 1}
 
 

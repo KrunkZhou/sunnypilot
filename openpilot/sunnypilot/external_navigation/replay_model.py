@@ -4,6 +4,7 @@ import os
 
 class ReplayHints:
   def __init__(self):
+    self.mode = 1  # Keep Blendful disabled for neutral and hinted navigation comparisons.
     self.frame = int(os.environ['EXTERNAL_NAV_REPLAY_FRAME'])
     self.hint = int(os.environ['EXTERNAL_NAV_REPLAY_HINT'])
     if self.hint not in (0, 1, 2, 6):

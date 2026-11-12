@@ -15,6 +15,7 @@ import numpy as np
 import requests
 
 import openpilot.cereal.messaging as messaging
+from openpilot.common.api import Api
 from openpilot.common.prefix import OpenpilotPrefix
 from openpilot.selfdrive.navigation.mapsd import MapsD
 from openpilot.selfdrive.navigation.navd import REROUTE_COUNTER_MIN, ROUTE_RESEND_PERIOD, RouteEngine, set_banner
@@ -136,11 +137,13 @@ class TileServerCase(unittest.TestCase):
     threading.Thread(target=self.server.serve_forever, kwargs={'poll_interval': 0.01}, daemon=True).start()
     self.addCleanup(self.server.server_close)
     self.addCleanup(self.server.shutdown)
-    self.api = MagicMock(dongle_id='test-dongle')
+    self.api = MagicMock(spec_set=Api)
     self.api.get_token.return_value = 'device-token'
     self.url = f'http://127.0.0.1:{self.server.server_port}/planet.pmtiles?sig=secret'
     self.api.get.return_value.json.return_value = {'url': self.url, 'expires': time.time() + 86400}  # noqa: TID251
-    for name, value in [('Api', MagicMock(return_value=self.api)), ('Params', MagicMock()), ('PC', True)]:
+    params = MagicMock()
+    params.get.return_value = 'test-dongle'
+    for name, value in [('Api', MagicMock(return_value=self.api)), ('Params', MagicMock(return_value=params)), ('PC', True)]:
       self.enterContext(patch(f'openpilot.selfdrive.navigation.tiles.{name}', value))
     self.enterContext(patch('openpilot.selfdrive.navigation.tiles.Paths.comma_home', return_value=self.directory.name))
 
@@ -212,6 +215,7 @@ class TestRemoteTiles(TileServerCase):
       self.assertEqual(archive.get(0, 0, 0), road_tile())
       self.assertEqual(archive.get(0, 0, 0), road_tile())
       self.assertEqual(self.api.get.call_count, 2)
+      self.api.get.assert_called_with('v1/test-dongle/nav/tiles', access_token='device-token', timeout=10)
     count = len(self.server.requests)
     with closing(PMTiles(RemoteTiles())) as archive:
       self.assertEqual(archive.get(0, 0, 0), road_tile())
