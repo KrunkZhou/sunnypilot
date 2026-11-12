@@ -31,7 +31,7 @@ _BLOCKED = {"AdbEnabled", "SshEnabled", "GithubUsername", "GithubSshKeys", "Onro
 _EXCLUSIVE = {
   "JoystickDebugMode": ("LongitudinalManeuverMode", "LateralManeuverMode"),
   "LongitudinalManeuverMode": ("JoystickDebugMode", "LateralManeuverMode"),
-  "LateralManeuverMode": ("ExperimentalMode", "JoystickDebugMode", "LongitudinalManeuverMode"),
+  "LateralManeuverMode": ("JoystickDebugMode", "LongitudinalManeuverMode"),
 }
 
 
