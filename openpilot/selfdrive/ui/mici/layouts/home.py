@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime
 import math
+import time
 
 from openpilot.cereal import log
 import pyray as rl

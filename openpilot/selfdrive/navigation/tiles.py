@@ -20,7 +20,8 @@ class RemoteTiles:
     self.cache = Path(Paths.comma_home() if PC else '/data') / 'navigation' / 'tiles'
     self.cache.mkdir(parents=True, exist_ok=True, mode=0o700)
     self.session = requests.Session()
-    self.api = Api(Params().get('DongleId'))
+    self.dongle_id = Params().get('DongleId')
+    self.api = Api(self.dongle_id)
     self.url = ''
     self.expires = 0
     self.etag = None
@@ -40,7 +41,7 @@ class RemoteTiles:
   def _fetch(self, offset: int, length: int) -> bytes:
     try:
       if time.time() >= self.expires - 60:  # noqa: TID251 - SAS expiry is a Unix timestamp
-        response = self.api.get(f'v1/{self.api.dongle_id}/nav/tiles', access_token=self.api.get_token(), timeout=10)
+        response = self.api.get(f'v1/{self.dongle_id}/nav/tiles', access_token=self.api.get_token(), timeout=10)
         response.raise_for_status()
         metadata = response.json()
         self.url, self.expires = metadata['url'], metadata['expires']

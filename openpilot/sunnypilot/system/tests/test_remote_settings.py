@@ -229,12 +229,30 @@ class TestRemoteSettings(unittest.TestCase):
     self.assertEqual(service.set_setting("TestMode", False, True)["status"], "rejected")
 
   def test_maneuver_companions_are_cleared_before_target(self):
-    values = {"LateralManeuverMode": False, "LongitudinalManeuverMode": True, "JoystickDebugMode": True, "ExperimentalMode": True}
-    service, params = self.service([toggle(key) for key in values], values)
-    result = service.set_setting("LateralManeuverMode", True, False)
-    self.assertEqual(result["status"], "saved")
-    self.assertEqual(params.writes, [("ExperimentalMode", False), ("JoystickDebugMode", False),
-                                   ("LongitudinalManeuverMode", False), ("LateralManeuverMode", True)])
+    source = Path(__file__).resolve().parents[3]
+    registered = set(re.findall(r'\{"([^"\n]+)", \{', (source / "common/params_keys.h").read_text()))
+    self.assertNotIn("ExperimentalMode", registered)
+    for target, companions in (("LateralManeuverMode", ("JoystickDebugMode", "LongitudinalManeuverMode")),
+                                ("LongitudinalManeuverMode", ("JoystickDebugMode", "LateralManeuverMode")),
+                                ("JoystickDebugMode", ("LongitudinalManeuverMode", "LateralManeuverMode"))):
+      with self.subTest(target=target):
+        values = {target: False, **dict.fromkeys(companions, True)}
+        self.assertTrue(set(values) <= registered)
+        service, params = self.service([toggle(key) for key in values], values)
+        self.assertNotIn("ExperimentalMode", params.kinds)
+        result = service.set_setting(target, True, False)
+        self.assertEqual(result["status"], "saved")
+        self.assertEqual(params.writes, [(key, False) for key in companions] + [(target, True)])
+
+  def test_unreadable_maneuver_companion_prevents_all_writes(self):
+    for unreadable in ("JoystickDebugMode", "LongitudinalManeuverMode"):
+      with self.subTest(unreadable=unreadable):
+        values = {"LateralManeuverMode": False, "LongitudinalManeuverMode": True, "JoystickDebugMode": True}
+        service, params = self.service([toggle(key) for key in values], values)
+        params.unreadable.add(unreadable)
+        result = service.set_setting("LateralManeuverMode", True, False)
+        self.assertEqual(result["status"], "rejected")
+        self.assertEqual(params.writes, [])
 
   def test_toyota_companions_and_next_cycle_only(self):
     values = {"ToyotaEnforceStockLongitudinal": False, "AlphaLongitudinalEnabled": True, "ToyotaStopAndGoHack": True}
@@ -325,7 +343,9 @@ class TestRemoteSettings(unittest.TestCase):
     service = remote.RemoteSettings(params, definition, lambda: {"brand": "toyota"}, lambda: remote.DeviceState(False, False))
     snapshot = service.snapshot()
     self.assertEqual(snapshot["version"], 1)
-    self.assertEqual(len(rows(snapshot)), 88)
+    self.assertEqual(len(rows(snapshot)), 89)
+    self.assertIn("NavigationEnabled", rows(snapshot))
+    self.assertNotIn("ExperimentalMode", rows(snapshot))
     self.assertLess(len(json.dumps(snapshot, allow_nan=False)), 1024 * 1024)
     self.assertIn("models", {panel["id"] for panel in snapshot["panels"]})
     allowed = {"key", "title", "description", "section", "widget", "type", "value", "visible", "editable", "reason", "options",

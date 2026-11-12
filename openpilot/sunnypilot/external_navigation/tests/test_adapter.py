@@ -8,26 +8,116 @@ from openpilot.sunnypilot.external_navigation.config import load_config
 
 
 class AdapterTests(unittest.TestCase):
-  def test_actual_oob_loaders_with_pickle_buffers(self):
+  def test_stock_path_oob_loader_and_device_context(self):
+    from contextlib import contextmanager
+    import pathlib
     import pickle
     import struct
-    from openpilot.sunnypilot.modeld_v2.helpers import load_oob as tinygrad_loader
-    buffers = []
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock, patch
+
     data = b'weights' * 1024
-    opcodes = pickle.dumps({'weights': pickle.PickleBuffer(bytearray(data))}, protocol=5, buffer_callback=buffers.append)
-    payload = struct.pack('<q', len(opcodes)) + opcodes
-    for buffer in buffers:
-      value = buffer.raw()
-      payload += struct.pack('<q', len(value)) + value
-    source = (Path(__file__).resolve().parents[3] / 'selfdrive/modeld/helpers.py').read_text()
-    tree = ast.parse(source)
-    function = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == 'load_oob')
-    namespace = {'io': io, 'pickle': pickle, 'struct': struct}
-    exec(compile(ast.Module(body=[function], type_ignores=[]), '<stock load_oob>', 'exec'), namespace)
-    for loader in (namespace['load_oob'], tinygrad_loader):
-      with io.BytesIO(payload) as model_file:
-        model = loader(model_file)
-      self.assertEqual(bytes(model['weights']), data)
+    marker, stream = object(), io.BytesIO()
+    pickler = pickle.Pickler(stream, protocol=5)
+    pickler.persistent_id = lambda value: (len(data), 0) if value is marker else None
+    pickler.dump({'weights': marker})
+    opcodes = stream.getvalue()
+    opened, contexts = [], []
+
+    def tracked_open(*args, **kwargs):
+      file = open(*args, **kwargs)
+      opened.append(file)
+      return file
+
+    @contextmanager
+    def context(**settings):
+      contexts.append(settings)
+      try:
+        yield
+      finally:
+        contexts.pop()
+
+    def view(size, offset):
+      self.assertTrue(opened[-1].closed)
+      self.assertEqual(len(contexts), 1)
+      return memoryview(data)[offset:offset + size]
+
+    # Execute both real loader functions, isolating only the native Tensor/device boundary.
+    tensor = MagicMock()
+    tensor.return_value.__getitem__.return_value.to.return_value.realize.return_value.uop.buffer = SimpleNamespace(view=view)
+    device = SimpleNamespace(DEFAULT='test-device')
+    namespace = {'io': io, 'pickle': pickle, 'struct': struct, 'pathlib': pathlib, 'Tensor': tensor,
+                 'Device': device, 'open': tracked_open, 'sys': SimpleNamespace(platform='darwin'), 'AGNOS': False}
+    repo = Path(__file__).resolve().parents[4]
+    for relative, name in (('tinygrad_repo/examples/openpilot/helpers.py', 'load_pickle'),
+                           ('openpilot/selfdrive/modeld/helpers.py', 'load_oob')):
+      tree = ast.parse((repo / relative).read_text())
+      function = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == name)
+      exec(compile(ast.Module(body=[function], type_ignores=[]), relative, 'exec'), namespace)
+
+    def load_pickle(path, **kwargs):
+      self.assertEqual(contexts, [{'DEV': expected_device}])
+      return namespace['load_pickle'](path, **kwargs)
+
+    modules = {'tinygrad': SimpleNamespace(Context=context),
+               'tinygrad_repo.examples.openpilot.helpers': SimpleNamespace(load_pickle=load_pickle)}
+    with tempfile.TemporaryDirectory() as temporary, patch.dict('sys.modules', modules):
+      path = Path(temporary) / 'model.pkl'
+      path.write_bytes(struct.pack('<q', len(opcodes)) + opcodes + data)
+      for chestnut, agnos, platform, expected_device in ((True, True, 'linux', 'USB+AMD:LLVM'),
+                                                       (False, True, 'linux', 'QCOM'),
+                                                       (False, False, 'darwin', 'METAL'),
+                                                       (False, False, 'linux', 'CPU:LLVM')):
+        with self.subTest(device=expected_device):
+          namespace['AGNOS'], namespace['sys'].platform = agnos, platform
+          model = namespace['load_oob'](path, chestnut)
+          tensor.assert_called_with(path)
+          tensor.return_value.__getitem__.assert_called_with(slice(8 + len(opcodes), None))
+          tensor.return_value.__getitem__.return_value.to.assert_called_with(device.DEFAULT)
+          self.assertEqual(contexts, [])
+          self.assertEqual(bytes(model['weights']), data)
+    self.assertTrue(all(file.closed for file in opened))
+    self.assertEqual(bytes(model['weights']), data)
+
+  def test_plain_bundle_loader_preserves_extension_and_mapped_data(self):
+    from unittest.mock import Mock, patch
+    from openpilot.sunnypilot.modeld_v2 import helpers
+
+    data, added = b'weights' * 1024, b'warp'
+    extras = {'metadata': {'input_shapes': {'image': (1, 3, 8, 8)}}}
+    opened = []
+
+    def tracked_open(*args, **kwargs):
+      file = open(*args, **kwargs)
+      opened.append(file)
+      return file
+
+    def extend(parts, metadata):
+      self.assertEqual(set(parts), {'vision'})
+      self.assertEqual(metadata, extras)
+      header, blob = parts['vision']
+      self.assertEqual(bytes(blob[slice(*header['data'])]), data)
+      return {'warp': ({'data': [0, len(added)], 'calls': []}, memoryview(added))}
+
+    def compile_part(header, blob, device_map, verify, shared):
+      self.assertTrue(all(file.closed for file in opened))
+      return blob[slice(*header['data'])]
+
+    extension = Mock(side_effect=extend)
+    with tempfile.TemporaryDirectory() as temporary:
+      path = Path(temporary) / 'model.pkl'
+      helpers.write_bundle(path, {'vision': ({'data': [0, len(data)], 'calls': []}, data)}, extras)
+      # Parse the real bundle and run its extension callback; native compilation is out of scope.
+      with patch.object(helpers, 'open', tracked_open, create=True), patch.object(helpers, 'PlainJit', side_effect=compile_part) as jit:
+        model = helpers.load_model(path, device_map={'QCOM': 'CPU'}, verify=True, cache=False, extend=extension)
+      extension.assert_called_once()
+      self.assertEqual(jit.call_count, 2)
+      self.assertEqual(jit.call_args_list[0].args[2:4], ({'QCOM': 'CPU'}, True))
+      self.assertIs(jit.call_args_list[0].args[4], jit.call_args_list[1].args[4])
+    self.assertEqual(model['metadata'], extras['metadata'])
+    self.assertEqual(bytes(model['vision']), data)
+    self.assertEqual(bytes(model['warp']), added)
+    self.assertTrue(opened and all(file.closed for file in opened))
 
   def test_private_configuration(self):
     import json

@@ -83,7 +83,7 @@ class MiciMainLayout(Scroller):
 
   def _setup_callbacks(self):
     self._alerts_layout.set_enabled(lambda: self.enabled)
-    self._alerts_layout.set_pairing_callback(self._settings_layout.show_pairing)
+    self._alerts_layout.set_pairing_callback(self._open_pairing)
     self._home_layout.set_callbacks(
       on_settings=self._open_settings,
       on_alerts=lambda: self._scroll_to(self._alerts_layout),
@@ -101,6 +101,12 @@ class MiciMainLayout(Scroller):
       self._ui_lock.request_pin()
     else:
       gui_app.push_widget(self._settings_layout)
+
+  def _open_pairing(self):
+    if self._ui_lock.locked:
+      self._ui_lock.request_pin()
+    else:
+      self._settings_layout.show_pairing()
 
   def _handle_ui_lock(self):
     self._ui_lock.tick()
