@@ -1,12 +1,14 @@
 import re
 import unittest
 
-from opendbc.car import gen_empty_fingerprint
-from opendbc.car.structs import CarParams
+from opendbc.can import CANPacker
+from opendbc.car import Bus, gen_empty_fingerprint
+from opendbc.car.structs import CarParams, CarParamsSP
+from opendbc.car.tesla.carstate import CarState
 from opendbc.car.tesla.interface import CarInterface
 from opendbc.car.tesla.fingerprints import FW_VERSIONS
 from opendbc.car.tesla.radar_interface import RADAR_START_ADDR
-from opendbc.car.tesla.values import CAR
+from opendbc.car.tesla.values import CANBUS, CAR, DBC
 
 Ecu = CarParams.Ecu
 
@@ -75,3 +77,47 @@ class TestTeslaFingerprint(unittest.TestCase):
         fingerprint[1][RADAR_START_ADDR] = 8
       CP = CarInterface.get_params(CAR.TESLA_MODEL_X, fingerprint, [], False, False, False)
       assert CP.radarUnavailable  # Always unavailable since no radar DBC
+
+
+class TestTeslaCarState(unittest.TestCase):
+  def setUp(self):
+    CP = CarInterface.get_params(CAR.TESLA_MODEL_3, gen_empty_fingerprint(), [], False, False, False)
+    CP_SP = CarParamsSP()
+    self.car_state = CarState(CP, CP_SP)
+    self.can_parsers = CarState.get_can_parsers(CP, CP_SP)
+    self.packer = CANPacker(DBC[CP.carFingerprint][Bus.party])
+    self.frame = 0
+    # CarState registers the messages it reads with the parsers on the first update.
+    self.car_state.update(self.can_parsers)
+
+  def update_blindspots(self, left: int, right: int):
+    msg = self.packer.make_can_msg("DAS_status", CANBUS.autopilot_party, {
+      "DAS_blindSpotRearLeft": left,
+      "DAS_blindSpotRearRight": right,
+    })
+    self.frame += 1
+    updated = self.can_parsers[Bus.ap_party].update([self.frame * 500_000_000, [msg]])
+    self.assertIn(msg[0], updated)
+    return self.car_state.update(self.can_parsers)[0]
+
+  def test_blindspot_warning_levels(self):
+    # DBC: NO_WARNING=0, WARNING_LEVEL_1=1, WARNING_LEVEL_2=2, SNA=3.
+    expected = (False, True, True, False)
+    for left, left_warning in enumerate(expected):
+      for right, right_warning in enumerate(expected):
+        with self.subTest(left=left, right=right):
+          state = self.update_blindspots(left, right)
+          self.assertEqual((state.leftBlindspot, state.rightBlindspot), (left_warning, right_warning))
+
+  def test_blindspot_unavailable_clears_previous_warning(self):
+    for left, right, expected in (
+      (1, 2, (True, True)),
+      (3, 2, (False, True)),
+      (3, 3, (False, False)),
+      (2, 1, (True, True)),
+      (2, 3, (True, False)),
+      (3, 3, (False, False)),
+    ):
+      with self.subTest(left=left, right=right):
+        state = self.update_blindspots(left, right)
+        self.assertEqual((state.leftBlindspot, state.rightBlindspot), expected)
