@@ -61,8 +61,12 @@ class CarInterface(CarInterfaceBase):
     if candidate == CAR.TESLA_MODEL_X:
       stock_cp.dashcamOnly = False
 
-    if 0x3DF in fingerprint[1]:
+    vehicle_fingerprint = fingerprint[CANBUS.vehicle]
+    if 0x3DF in vehicle_fingerprint:
       ret.flags |= TeslaFlagsSP.HAS_VEHICLE_BUS.value
       ret.safetyParam |= TeslaSafetyFlagsSP.HAS_VEHICLE_BUS
+      # The AP PARTY copy can stop on HW2.5. Use the original SCCM stream when the legacy harness exposes it.
+      if candidate == CAR.TESLA_MODEL_3 and (stock_cp.flags & TeslaFlags.MISSING_DAS_SETTINGS) and vehicle_fingerprint.get(0x129) == 8:
+        ret.flags |= TeslaFlagsSP.STEERING_RATE_ON_VEHICLE_BUS.value
 
     return ret

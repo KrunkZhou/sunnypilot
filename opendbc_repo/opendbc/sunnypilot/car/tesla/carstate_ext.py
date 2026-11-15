@@ -56,9 +56,7 @@ class CarStateExt:
 
   @staticmethod
   def get_parser(CP: structs.CarParams, CP_SP: structs.CarParamsSP) -> dict[StrEnum, CANParser]:
-    messages = {}
-
     if CP_SP.flags & TeslaFlagsSP.HAS_VEHICLE_BUS:
-      messages[Bus.adas] = CANParser(DBC[CP.carFingerprint][Bus.adas], [], CANBUS.vehicle)
-
-    return messages
+      messages = [("SCCM_steeringAngleSensor", 100)] if CP_SP.flags & TeslaFlagsSP.STEERING_RATE_ON_VEHICLE_BUS else []
+      return {Bus.adas: CANParser(DBC[CP.carFingerprint][Bus.adas], messages, CANBUS.vehicle)}
+    return {}
