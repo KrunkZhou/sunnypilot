@@ -6,6 +6,7 @@ from opendbc.car.interfaces import CarStateBase
 from opendbc.car.tesla.values import DBC, CANBUS, GEAR_MAP, STEER_THRESHOLD, TeslaFlags
 
 from opendbc.sunnypilot.car.tesla.carstate_ext import CarStateExt
+from opendbc.sunnypilot.car.tesla.values import TeslaFlagsSP
 
 ButtonType = structs.CarState.ButtonEvent.Type
 
@@ -23,6 +24,7 @@ class CarState(CarStateBase, CarStateExt):
 
     self.hands_on_level = 0
     self.das_control = None
+    self.steering_rate_bus = Bus.adas if CP_SP.flags & TeslaFlagsSP.STEERING_RATE_ON_VEHICLE_BUS else Bus.ap_party
 
   def update_autopark_state(self, autopark_state: str, cruise_enabled: bool):
     autopark_now = autopark_state in ("ACTIVE", "COMPLETE", "SELFPARK_STARTED")
@@ -53,7 +55,7 @@ class CarState(CarStateBase, CarStateExt):
     epas_status = cp_party.vl["EPAS3S_sysStatus"]
     self.hands_on_level = epas_status["EPAS3S_handsOnLevel"]
     ret.steeringAngleDeg = -epas_status["EPAS3S_internalSAS"]
-    ret.steeringRateDeg = -cp_ap_party.vl["SCCM_steeringAngleSensor"]["SCCM_steeringAngleSpeed"]
+    ret.steeringRateDeg = -can_parsers[self.steering_rate_bus].vl["SCCM_steeringAngleSensor"]["SCCM_steeringAngleSpeed"]
     ret.steeringTorque = -epas_status["EPAS3S_torsionBarTorque"]
 
     # stock handsOnLevel uses >0.5 for 0.25s, but is too slow
