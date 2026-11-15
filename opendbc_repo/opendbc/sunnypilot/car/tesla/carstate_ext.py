@@ -13,6 +13,8 @@ from opendbc.car.tesla.values import DBC, CANBUS
 from opendbc.sunnypilot.car.tesla.values import TeslaFlagsSP
 
 ButtonType = structs.CarState.ButtonEvent.Type
+STEERING_RATE_FREQUENCY = 100
+STEERING_RATE_TIMEOUT_PACKETS = 150
 
 
 class CarStateExt:
@@ -57,6 +59,10 @@ class CarStateExt:
   @staticmethod
   def get_parser(CP: structs.CarParams, CP_SP: structs.CarParamsSP) -> dict[StrEnum, CANParser]:
     if CP_SP.flags & TeslaFlagsSP.HAS_VEHICLE_BUS:
-      messages = [("SCCM_steeringAngleSensor", 100)] if CP_SP.flags & TeslaFlagsSP.STEERING_RATE_ON_VEHICLE_BUS else []
-      return {Bus.adas: CANParser(DBC[CP.carFingerprint][Bus.adas], messages, CANBUS.vehicle)}
+      vehicle_steering_rate = CP_SP.flags & TeslaFlagsSP.STEERING_RATE_ON_VEHICLE_BUS
+      messages = [("SCCM_steeringAngleSensor", STEERING_RATE_FREQUENCY)] if vehicle_steering_rate else []
+      parser = CANParser(DBC[CP.carFingerprint][Bus.adas], messages, CANBUS.vehicle)
+      if vehicle_steering_rate:
+        parser.message_states[0x129].timeout_override_nanos = int(1e9 * STEERING_RATE_TIMEOUT_PACKETS / STEERING_RATE_FREQUENCY)
+      return {Bus.adas: parser}
     return {}

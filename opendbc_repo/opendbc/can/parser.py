@@ -22,6 +22,7 @@ class MessageState:
   ignore_counter: bool = False
   frequency: float = 0.0
   timeout_threshold: float = 1e5  # default to 1Hz threshold
+  timeout_override_nanos: int | None = None  # message freshness only; bus timeout keeps its nominal threshold
   vals: list[float] = field(default_factory=list)
   all_vals: list[list[float]] = field(default_factory=list)
   timestamps: deque[int] = field(default_factory=lambda: deque(maxlen=500))
@@ -94,7 +95,8 @@ class MessageState:
       return True
     if not self.timestamps:
       return False
-    if (current_nanos - self.timestamps[-1]) > self.timeout_threshold:
+    timeout = self.timeout_threshold if self.timeout_override_nanos is None else self.timeout_override_nanos
+    if (current_nanos - self.timestamps[-1]) > timeout:
       return False
     return True
 

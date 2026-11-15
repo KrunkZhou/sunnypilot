@@ -145,23 +145,74 @@ class TestTeslaCarState(unittest.TestCase):
         ap = self.packer.make_can_msg(msg, CANBUS.autopilot_party, {signal: 20})
         state, _ = interface.update([(1_000_000_000, [vehicle, ap])])
         self.assertEqual(state.steeringRateDeg, expected_rate)
+        steering_parser = interface.can_parsers[interface.CS.steering_rate_bus]
+        self.assertEqual(steering_parser.message_states[0x129].timeout_override_nanos,
+                         1_500_000_000 if expected_rate == -10 else None)
 
-  def test_vehicle_steering_rate_must_stay_fresh(self):
+  def vehicle_steering_rate_parser(self):
     fingerprint = gen_empty_fingerprint()
     fingerprint[CANBUS.vehicle].update({0x3DF: 8, 0x129: 8})
     CP = CarInterface.get_params(CAR.TESLA_MODEL_3, fingerprint, [], False, False, False)
     CP_SP = CarInterface.get_params_sp(CP, CAR.TESLA_MODEL_3, fingerprint, [], False, False, False)
     interface = CarInterface(CP, CP_SP)
     interface.update([])
-    vehicle_parser = interface.can_parsers[Bus.adas]
     packer = CANPacker(DBC[CP.carFingerprint][Bus.adas])
+    return interface.can_parsers[Bus.adas], packer
+
+  def test_vehicle_steering_rate_allows_150_missing_packets(self):
+    vehicle_parser, packer = self.vehicle_steering_rate_parser()
     ui = packer.make_can_msg("UI_status2", CANBUS.vehicle, {})
     steering = packer.make_can_msg("SCCM_steeringAngleSensor", CANBUS.vehicle, {"SCCM_steeringAngleCounter": 1})
     vehicle_parser.update([(1_000_000_000, [ui, steering])])
     self.assertTrue(vehicle_parser.can_valid)
 
-    for frame in range(1, 21):
+    for frame in range(1, 156):
       vehicle_parser.update([(1_000_000_000 + frame * 10_000_000, [ui])])
-      valid = vehicle_parser.can_valid
-    self.assertFalse(vehicle_parser.bus_timeout)
-    self.assertFalse(valid)
+      # The normal five-invalid-check debounce follows the 150-packet allowance.
+      self.assertEqual(vehicle_parser.can_valid, frame < 155, frame)
+      self.assertFalse(vehicle_parser.bus_timeout)
+
+    steering = packer.make_can_msg("SCCM_steeringAngleSensor", CANBUS.vehicle, {"SCCM_steeringAngleCounter": 2})
+    vehicle_parser.update([(2_560_000_000, [ui, steering])])
+    self.assertTrue(vehicle_parser.can_valid)
+
+  def test_vehicle_steering_rate_still_requires_first_sample(self):
+    vehicle_parser, packer = self.vehicle_steering_rate_parser()
+    ui = packer.make_can_msg("UI_status2", CANBUS.vehicle, {})
+    for frame in range(1, 161):
+      vehicle_parser.update([(frame * 10_000_000, [ui])])
+      self.assertFalse(vehicle_parser.can_valid)
+
+  def test_vehicle_steering_rate_keeps_bus_timeout(self):
+    vehicle_parser, packer = self.vehicle_steering_rate_parser()
+    ui = packer.make_can_msg("UI_status2", CANBUS.vehicle, {})
+    steering = packer.make_can_msg("SCCM_steeringAngleSensor", CANBUS.vehicle, {"SCCM_steeringAngleCounter": 1})
+    vehicle_parser.update([(1_000_000_000, [ui, steering])])
+    self.assertTrue(vehicle_parser.can_valid)
+    for frame in range(1, 16):
+      vehicle_parser.update([(1_000_000_000 + frame * 10_000_000, [])])
+      self.assertEqual(vehicle_parser.bus_timeout, frame > 10, frame)
+
+  def test_vehicle_steering_rate_keeps_counter_check(self):
+    vehicle_parser, packer = self.vehicle_steering_rate_parser()
+    ui = packer.make_can_msg("UI_status2", CANBUS.vehicle, {})
+    steering = packer.make_can_msg("SCCM_steeringAngleSensor", CANBUS.vehicle, {"SCCM_steeringAngleCounter": 1})
+    vehicle_parser.update([(1_000_000_000, [ui, steering])])
+    self.assertTrue(vehicle_parser.can_valid)
+    for frame in range(1, 6):
+      vehicle_parser.update([(1_000_000_000 + frame * 10_000_000, [ui, steering])])
+      self.assertEqual(vehicle_parser.can_valid, frame < 5, frame)
+
+  def test_vehicle_steering_rate_does_not_extend_other_message_timeout(self):
+    vehicle_parser, packer = self.vehicle_steering_rate_parser()
+    ui = packer.make_can_msg("UI_status2", CANBUS.vehicle, {})
+    for frame in range(1, 121):
+      steering = packer.make_can_msg("SCCM_steeringAngleSensor", CANBUS.vehicle, {})
+      vehicle_parser.update([(frame * 10_000_000, [ui, steering])])
+      self.assertTrue(vehicle_parser.can_valid)
+
+    for frame in range(1, 16):
+      steering = packer.make_can_msg("SCCM_steeringAngleSensor", CANBUS.vehicle, {})
+      vehicle_parser.update([(1_200_000_000 + frame * 10_000_000, [steering])])
+      self.assertEqual(vehicle_parser.can_valid, frame < 15, frame)
+      self.assertFalse(vehicle_parser.bus_timeout)
