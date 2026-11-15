@@ -195,6 +195,9 @@ class DBC:
 # ***** checksum functions *****
 
 def tesla_setup_signal(sig: Signal, dbc_name: str, line_num: int) -> None:
+  # The vehicle DBC also names ordinary data fields "Counter", such as UI_falseTouchCounter.
+  if dbc_name == "tesla_model3_vehicle" and sig.name != "SCCM_steeringAngleCounter":
+    return
   if sig.name.endswith("Counter"):
     sig.type = SignalType.COUNTER
   elif sig.name.endswith("Checksum"):
@@ -239,7 +242,7 @@ def get_checksum_state(dbc_name: str) -> ChecksumState | None:
     return ChecksumState(SignalType.FCA_GIORGIO_CHECKSUM, fca_giorgio_checksum)
   elif dbc_name.startswith("comma_body"):
     return ChecksumState(SignalType.BODY_CHECKSUM, body_checksum)
-  elif dbc_name.startswith("tesla_model3_party"):
+  elif dbc_name.startswith("tesla_model3_party") or dbc_name == "tesla_model3_vehicle":
     return ChecksumState(SignalType.TESLA_CHECKSUM, tesla_checksum, tesla_setup_signal)
   elif dbc_name.startswith("psa_"):
     return ChecksumState(SignalType.PSA_CHECKSUM, psa_checksum)
