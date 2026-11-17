@@ -32,11 +32,9 @@ jobs:
         with:
           sparse-checkout: |
             openpilot/cereal
+            opendbc_repo/opendbc/car
             uv.lock
           submodules: false
-
-      - name: Init sunnypilot opendbc submodule
-        run: git submodule update --init --depth 1 opendbc_repo
 
       - name: Locate sunnypilot capnp import paths
         id: locate-sp-capnp
