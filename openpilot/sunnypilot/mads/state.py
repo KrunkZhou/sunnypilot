@@ -42,6 +42,13 @@ class StateMachine:
   def check_contains_in_list(self) -> bool:
     return bool(self._events.contains_in_list(GEARS_ALLOW_PAUSED) or self._events_sp.contains_in_list(GEARS_ALLOW_PAUSED_SILENT))
 
+  def check_lateral_immediate_disable(self) -> bool:
+    # A right-stalk timeout cancels cruise without interrupting existing MADS steering.
+    # Keep the shared event for cruise, alerts, and blocking new engagement.
+    core_events = self._events.get_events_mapping()
+    return any(ET.IMMEDIATE_DISABLE in core_events.get(event, {}) for event in self._events.names
+               if event != EventName.teslaRightStalkTimeout) or self._events_sp.contains(ET.IMMEDIATE_DISABLE)
+
   def update(self):
     # soft disable timer and current alert types are from the state machine of openpilot
     # decrement the soft disable timer at every step, as it's reset on
@@ -49,17 +56,17 @@ class StateMachine:
 
     # ENABLED, SOFT DISABLING, PAUSED, OVERRIDING
     if self.state != State.disabled:
-      # user and immediate disable always have priority in a non-disabled state
-      if self.check_contains(ET.USER_DISABLE):
+      # Lateral faults must fully disengage, even when a user event would silently pause MADS.
+      if self.check_lateral_immediate_disable():
+        self.state = State.disabled
+        self.add_current_alert_types(ET.IMMEDIATE_DISABLE)
+
+      elif self.check_contains(ET.USER_DISABLE):
         if self._events_sp.has(EventNameSP.silentLkasDisable):
           self.state = State.paused
         else:
           self.state = State.disabled
         self.ss_state_machine.current_alert_types.append(ET.USER_DISABLE)
-
-      elif self.check_contains(ET.IMMEDIATE_DISABLE):
-        self.state = State.disabled
-        self.add_current_alert_types(ET.IMMEDIATE_DISABLE)
 
       else:
         # ENABLED
@@ -115,7 +122,7 @@ class StateMachine:
     elif self.state == State.disabled:
       if self.check_contains(ET.ENABLE):
         if self.check_contains(ET.NO_ENTRY):
-          if self.check_contains_in_list():
+          if self.check_contains_in_list() and not self.check_contains(ET.IMMEDIATE_DISABLE):
             self.state = State.paused
           self.add_current_alert_types(ET.NO_ENTRY)
 

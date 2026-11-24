@@ -9,6 +9,7 @@ from opendbc.car.tesla.interface import CarInterface
 from opendbc.car.tesla.fingerprints import FW_VERSIONS
 from opendbc.car.tesla.radar_interface import RADAR_START_ADDR
 from opendbc.car.tesla.values import CANBUS, CAR, DBC
+from opendbc.sunnypilot.car.tesla.values import TeslaFlagsSP
 
 Ecu = CarParams.Ecu
 
@@ -154,6 +155,8 @@ class TestTeslaCarState(unittest.TestCase):
     fingerprint[CANBUS.vehicle].update({0x3DF: 8, 0x129: 8})
     CP = CarInterface.get_params(CAR.TESLA_MODEL_3, fingerprint, [], False, False, False)
     CP_SP = CarInterface.get_params_sp(CP, CAR.TESLA_MODEL_3, fingerprint, [], False, False, False)
+    # These tests isolate the steering-rate parser; right-stalk freshness is tested separately.
+    CP_SP.flags &= ~TeslaFlagsSP.RIGHT_STALK_ON_VEHICLE_BUS
     interface = CarInterface(CP, CP_SP)
     interface.update([])
     packer = CANPacker(DBC[CP.carFingerprint][Bus.adas])
@@ -216,3 +219,91 @@ class TestTeslaCarState(unittest.TestCase):
       vehicle_parser.update([(1_200_000_000 + frame * 10_000_000, [steering])])
       self.assertEqual(vehicle_parser.can_valid, frame < 15, frame)
       self.assertFalse(vehicle_parser.bus_timeout)
+
+
+class TestTeslaRightStalkTimeout(unittest.TestCase):
+  def setUp(self):
+    fingerprint = gen_empty_fingerprint()
+    fingerprint[CANBUS.vehicle].update({0x3DF: 8, 0x129: 8, 0x229: 3})
+    CP = CarInterface.get_params(CAR.TESLA_MODEL_3, fingerprint, [], False, False, False)
+    CP_SP = CarInterface.get_params_sp(CP, CAR.TESLA_MODEL_3, fingerprint, [], False, False, False)
+    self.car_state = CarState(CP, CP_SP)
+    self.parsers = CarState.get_can_parsers(CP, CP_SP)
+    self.packer = CANPacker(DBC[CP.carFingerprint][Bus.adas])
+    self.car_state.update(self.parsers)
+
+  def update(self, nanos, stalk_bus=None, steering=True):
+    frames = [self.packer.make_can_msg("UI_status2", CANBUS.vehicle, {})]
+    if steering:
+      frames.append(self.packer.make_can_msg("SCCM_steeringAngleSensor", CANBUS.vehicle, {}))
+    if stalk_bus is not None:
+      frames.append(self.packer.make_can_msg("SCCM_rightStalk", stalk_bus, {"SCCM_rightStalkCounter": 1}))
+    for parser in self.parsers.values():
+      parser.update([(nanos, frames)])
+    return self.car_state.update(self.parsers)[0]
+
+  def test_requires_first_right_stalk_sample(self):
+    self.assertTrue(self.update(1_000_000_000).teslaRightStalkTimeout)
+    self.assertFalse(self.update(1_010_000_000, CANBUS.vehicle).teslaRightStalkTimeout)
+
+  def test_timeout_at_700ms_without_can_valid_debounce(self):
+    self.assertFalse(self.update(1_000_000_000, CANBUS.vehicle).teslaRightStalkTimeout)
+    self.assertFalse(self.update(1_699_999_999).teslaRightStalkTimeout)
+    self.assertTrue(self.update(1_700_000_000).teslaRightStalkTimeout)
+    self.assertTrue(self.update(1_710_000_000).teslaRightStalkTimeout)
+    self.assertFalse(self.update(1_720_000_000, CANBUS.vehicle).teslaRightStalkTimeout)
+
+  def test_fresh_packets_restart_timeout(self):
+    for frame in range(10):
+      self.assertFalse(self.update(1_000_000_000 + frame * 100_000_000, CANBUS.vehicle).teslaRightStalkTimeout)
+    self.assertFalse(self.update(2_599_999_999).teslaRightStalkTimeout)
+    self.assertTrue(self.update(2_600_000_000).teslaRightStalkTimeout)
+
+  def test_other_buses_cannot_refresh_right_stalk(self):
+    self.update(1_000_000_000, CANBUS.vehicle)
+    self.assertTrue(self.update(1_700_000_000, CANBUS.party).teslaRightStalkTimeout)
+    self.assertTrue(self.update(1_800_000_000, CANBUS.autopilot_party).teslaRightStalkTimeout)
+    self.assertFalse(self.update(1_810_000_000, CANBUS.vehicle).teslaRightStalkTimeout)
+
+  def test_stalk_timeout_does_not_invalidate_other_vehicle_messages(self):
+    for initially_present in (False, True):
+      with self.subTest(initially_present=initially_present):
+        self.setUp()
+        # Exercise both startup without a stalk and a stream that stops after rate learning.
+        for frame in range(1, 401):
+          stalk_bus = CANBUS.vehicle if initially_present and frame <= 150 and frame % 10 == 0 else None
+          state = self.update(frame * 10_000_000, stalk_bus)
+          self.assertTrue(self.parsers[Bus.adas].can_valid)
+          self.assertFalse(self.parsers[Bus.adas].bus_timeout)
+        self.assertTrue(state.teslaRightStalkTimeout)
+
+  def test_stalk_timeout_does_not_mask_steering_timeout(self):
+    self.update(1_000_000_000, CANBUS.vehicle)
+    for frame in range(1, 156):
+      state = self.update(1_000_000_000 + frame * 10_000_000, steering=False)
+      self.assertEqual(self.parsers[Bus.adas].can_valid, frame < 155)
+    self.assertTrue(state.teslaRightStalkTimeout)
+    self.assertFalse(self.parsers[Bus.adas].bus_timeout)
+
+  def test_only_legacy_or_detected_model3_vehicle_stalk_is_monitored(self):
+    for candidate, vehicle_frames, ap_frames, expected in (
+      (CAR.TESLA_MODEL_3, {0x3DF: 8, 0x229: 3}, {}, True),
+      (CAR.TESLA_MODEL_3, {0x3DF: 8}, {}, True),
+      (CAR.TESLA_MODEL_3, {0x3DF: 8}, {0x293: 8}, False),
+      (CAR.TESLA_MODEL_3, {0x3DF: 8, 0x229: 3}, {0x293: 8}, True),
+      (CAR.TESLA_MODEL_3, {0x3DF: 8, 0x229: 4}, {0x293: 8}, False),
+      (CAR.TESLA_MODEL_3, {0x229: 3}, {}, False),
+      (CAR.TESLA_MODEL_3, {0x3DF: 8}, {0x293: 8, 0x229: 3}, False),
+      (CAR.TESLA_MODEL_Y, {0x3DF: 8, 0x229: 3}, {}, False),
+    ):
+      with self.subTest(candidate=candidate, vehicle_frames=vehicle_frames, ap_frames=ap_frames):
+        fingerprint = gen_empty_fingerprint()
+        fingerprint[CANBUS.vehicle].update(vehicle_frames)
+        fingerprint[CANBUS.autopilot_party].update(ap_frames)
+        CP = CarInterface.get_params(candidate, fingerprint, [], False, False, False)
+        CP_SP = CarInterface.get_params_sp(CP, candidate, fingerprint, [], False, False, False)
+        self.assertEqual(bool(CP_SP.flags & TeslaFlagsSP.RIGHT_STALK_ON_VEHICLE_BUS), expected)
+        cs = CarState(CP, CP_SP)
+        parsers = cs.get_can_parsers(CP, CP_SP)
+        self.assertEqual(0x229 in parsers[Bus.adas].message_states if Bus.adas in parsers else False, expected)
+        self.assertEqual(cs.update(parsers)[0].teslaRightStalkTimeout, expected)

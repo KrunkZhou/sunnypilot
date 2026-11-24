@@ -271,6 +271,10 @@ class SelfdriveD:
         self.dm_uncertain_alerted = True
       self.events_sp.add_from_msg(self.sm['longitudinalPlanSP'].events)
 
+    # Preserve this specific fault even when another CAN check is also invalid.
+    if CS.teslaRightStalkTimeout:
+      self.events.add(EventName.teslaRightStalkTimeout)
+
     # Add car events, ignore if CAN isn't valid
     if CS.canValid:
       car_events = self.car_events.update(CS, self.CS_prev, self.sm['carControl']).to_msg()

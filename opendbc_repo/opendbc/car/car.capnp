@@ -157,6 +157,7 @@ struct CarState {
   canValid @26 :Bool;       # invalid counter/checksums
   canTimeout @40 :Bool;     # CAN bus dropped out
   canErrorCounter @48 :UInt32;
+  teslaRightStalkTimeout @62 :Bool; # detected Vehicle-bus SCCM right stalk missing for 700 ms
 
   # process meta
   cumLagMs @50 :Float32;

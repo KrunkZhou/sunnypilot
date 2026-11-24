@@ -736,6 +736,16 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
     ET.NO_ENTRY: NoEntryAlert("Cruise Fault: Restart the Car"),
   },
 
+  EventName.teslaRightStalkTimeout: {
+    ET.IMMEDIATE_DISABLE: ImmediateDisableAlert("Right Stalk Communication Lost"),
+    ET.WARNING: Alert(
+      "Manual Speed Control Required", "Right Stalk Communication Lost",
+      AlertStatus.userPrompt, AlertSize.mid,
+      Priority.HIGH, VisualAlert.none, AudibleAlert.warningImmediate, 0.1),
+    ET.PERMANENT: NormalPermanentAlert("Right Stalk Communication Lost"),
+    ET.NO_ENTRY: NoEntryAlert("Right Stalk Communication Lost"),
+  },
+
   EventName.espActive: {
     ET.SOFT_DISABLE: soft_disable_alert("Electronic Stability Control Active"),
     ET.NO_ENTRY: NoEntryAlert("Electronic Stability Control Active"),
